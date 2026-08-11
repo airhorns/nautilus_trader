@@ -156,6 +156,21 @@ pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageCon
                 return;
             }
 
+            // The market channel replays every active subscription after a reconnect.
+            // Polymarket can deliver an incremental price_change before that token's
+            // replacement snapshot, even when the delta carries a later venue timestamp.
+            // Applying that delta and then the older snapshot regresses both the adapter
+            // book and the managed Cache book used by simulated execution. Reuse the
+            // existing book-epoch gate so each subscribed book resumes only after its
+            // authoritative reconnect snapshot has arrived.
+            let active_delta_subs = ctx.active_delta_subs.load();
+            for instrument_id in active_delta_subs.iter() {
+                ctx.order_books.remove(instrument_id);
+                ctx.pending_snapshot_after_tick_change
+                    .insert(*instrument_id);
+            }
+            drop(active_delta_subs);
+
             if !ctx.rtds_feed.needs_connection_recovery() {
                 log::debug!("Skipping RTDS recovery because RTDS connection is still healthy");
                 return;
@@ -3397,6 +3412,62 @@ mod tests {
                 .contains(&instrument_id)
         );
         assert!(ctx.order_books.contains_key(&instrument_id));
+    }
+
+    #[tokio::test]
+    async fn reconnect_gates_newer_delta_until_replacement_snapshot() {
+        let asset_id_str = "0xRECONNECT_TOKEN";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot(
+                market,
+                asset_id_str,
+                &[("0.45", "5"), ("0.49", "10"), ("0.51", "8"), ("0.55", "12")],
+            ),
+            &ctx,
+        );
+        assert!(ctx.order_books.contains_key(&instrument_id));
+        while data_rx.try_recv().is_ok() {}
+
+        handle_ws_message(PolymarketWsMessage::Reconnected, &ctx);
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+
+        handle_market_message(
+            make_price_change(market, asset_id_str, "0.50", "20"),
+            &ctx,
+        );
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        assert!(data_rx.try_recv().is_err());
+
+        handle_market_message(
+            make_snapshot(
+                market,
+                asset_id_str,
+                &[("0.45", "5"), ("0.49", "10"), ("0.51", "8"), ("0.55", "12")],
+            ),
+            &ctx,
+        );
+        assert!(ctx.order_books.contains_key(&instrument_id));
+        assert!(
+            !ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        assert!(matches!(data_rx.try_recv(), Ok(DataEvent::Data(_))));
     }
 
     #[rstest]
