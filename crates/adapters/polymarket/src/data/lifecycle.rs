@@ -455,6 +455,7 @@ mod tests {
         common::consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE, WS_DEFAULT_SUBSCRIPTIONS},
         config::PolymarketDataClientConfig,
         data::{instruments::cache_instrument, runtime::retire_local_instrument_state},
+        data_types::POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
         http::{
             clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
             gamma::PolymarketGammaHttpClient,
@@ -748,6 +749,26 @@ mod tests {
                 None,
             ))
             .expect("unsupported custom data subscribe should be ignored");
+
+        assert_eq!(client.rtds_feed.tracked_subscription_count(), 0);
+    }
+
+    #[rstest]
+    fn subscribe_internal_transport_reconnect_does_not_create_wire_subscription() {
+        let mut client = make_client_for_reset_test();
+        let data_type = DataType::new(POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, None, None);
+
+        client
+            .subscribe(SubscribeCustomData::new(
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                data_type,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .expect("internal reconnect subscription should be accepted");
 
         assert_eq!(client.rtds_feed.tracked_subscription_count(), 0);
     }

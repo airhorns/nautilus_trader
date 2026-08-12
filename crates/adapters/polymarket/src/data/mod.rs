@@ -78,6 +78,7 @@ use self::{
 use crate::{
     common::consts::POLYMARKET_VENUE,
     config::PolymarketDataClientConfig,
+    data_types::POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
@@ -442,6 +443,14 @@ impl DataClient for PolymarketDataClient {
     }
 
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
+        if cmd.data_type.type_name() == POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME {
+            log::debug!(
+                "Tracking internal Polymarket transport reconnect subscription: {}",
+                cmd.data_type
+            );
+            return Ok(());
+        }
+
         if !is_supported_rtds_data_type(&cmd.data_type) {
             log::debug!(
                 "Ignoring unsupported Polymarket custom data subscription: {}",
@@ -596,6 +605,14 @@ impl DataClient for PolymarketDataClient {
     }
 
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        if cmd.data_type.type_name() == POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME {
+            log::debug!(
+                "Tracking internal Polymarket transport reconnect unsubscription: {}",
+                cmd.data_type
+            );
+            return Ok(());
+        }
+
         if !is_supported_rtds_data_type(&cmd.data_type) {
             log::debug!(
                 "Ignoring unsupported Polymarket custom data unsubscription: {}",

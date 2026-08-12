@@ -31,7 +31,8 @@ use nautilus_common::{live::get_runtime, messages::DataEvent};
 use nautilus_core::{AtomicMap, AtomicSet, time::AtomicTime};
 use nautilus_model::{
     data::{
-        Data as NautilusData, InstrumentStatus, OrderBookDeltas, OrderBookDeltas_API, QuoteTick,
+        CustomData, Data as NautilusData, DataType, InstrumentStatus, OrderBookDeltas,
+        OrderBookDeltas_API, QuoteTick,
     },
     enums::{BookType, MarketStatusAction, RecordFlag},
     identifiers::InstrumentId,
@@ -46,6 +47,7 @@ use super::{
     instruments::{TokenMeta, cache_instrument_if_active},
 };
 use crate::{
+    data_types::{POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, PolymarketTransportReconnect},
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, gamma::PolymarketGammaHttpClient,
@@ -154,6 +156,23 @@ pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageCon
             if ctx.cancellation_token.is_cancelled() {
                 log::debug!("Skipping RTDS recovery because data client is cancelling");
                 return;
+            }
+
+            // This event is deliberately emitted before clearing the adapter books and before the
+            // message handler can consume any frame from the replacement socket. Application
+            // actors must invalidate their own cached books at this exact boundary; inferring a
+            // reconnect from later snapshots is unsafe because ordinary token-local refreshes use
+            // the same snapshot wire format.
+            let observed_at = ctx.clock.get_time_ns();
+            let reconnect = Arc::new(PolymarketTransportReconnect::new(observed_at, observed_at));
+            let data_type = DataType::new(POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, None, None);
+            if let Err(error) =
+                ctx.data_sender
+                    .send(DataEvent::Data(NautilusData::Custom(CustomData::new(
+                        reconnect, data_type,
+                    ))))
+            {
+                log::error!("Failed to emit Polymarket transport reconnect boundary: {error}");
             }
 
             // The market channel replays every active subscription after a reconnect.
@@ -3446,11 +3465,25 @@ mod tests {
             ctx.pending_snapshot_after_tick_change
                 .contains(&instrument_id)
         );
-
-        handle_market_message(
-            make_price_change(market, asset_id_str, "0.50", "20"),
-            &ctx,
+        let reconnect = data_rx
+            .try_recv()
+            .expect("reconnect boundary must precede replacement data");
+        let DataEvent::Data(NautilusData::Custom(reconnect)) = reconnect else {
+            panic!("expected typed reconnect custom data");
+        };
+        assert_eq!(
+            reconnect.data_type.type_name(),
+            POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME
         );
+        assert!(
+            reconnect
+                .data
+                .as_any()
+                .downcast_ref::<PolymarketTransportReconnect>()
+                .is_some()
+        );
+
+        handle_market_message(make_price_change(market, asset_id_str, "0.50", "20"), &ctx);
         assert!(!ctx.order_books.contains_key(&instrument_id));
         assert!(data_rx.try_recv().is_err());
 
