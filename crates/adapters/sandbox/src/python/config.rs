@@ -34,7 +34,7 @@ use crate::config::SandboxExecutionClientConfig;
 impl SandboxExecutionClientConfig {
     /// Configuration for `SandboxExecutionClient` instances.
     #[new]
-    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None))]
+    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, liquidity_consumption=false, queue_position=false, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         venue: Venue,
@@ -49,6 +49,8 @@ impl SandboxExecutionClientConfig {
         frozen_account: bool,
         bar_execution: bool,
         trade_execution: bool,
+        liquidity_consumption: bool,
+        queue_position: bool,
         reject_stop_orders: bool,
         support_gtd_orders: bool,
         support_contingent_orders: bool,
@@ -81,6 +83,8 @@ impl SandboxExecutionClientConfig {
             frozen_account,
             bar_execution,
             trade_execution,
+            liquidity_consumption,
+            queue_position,
             reject_stop_orders,
             support_gtd_orders,
             support_contingent_orders,
@@ -156,6 +160,16 @@ impl SandboxExecutionClientConfig {
     #[getter]
     fn trade_execution(&self) -> bool {
         self.trade_execution
+    }
+
+    #[getter]
+    fn liquidity_consumption(&self) -> bool {
+        self.liquidity_consumption
+    }
+
+    #[getter]
+    fn queue_position(&self) -> bool {
+        self.queue_position
     }
 
     #[getter]
