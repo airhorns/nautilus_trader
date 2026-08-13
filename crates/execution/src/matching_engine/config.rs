@@ -25,6 +25,8 @@ pub struct OrderMatchingEngineConfig {
     pub bar_adaptive_high_low_ordering: bool,
     #[builder(default = true)]
     pub trade_execution: bool,
+    #[builder(default = true)]
+    pub book_execution: bool,
     #[builder(default)]
     pub liquidity_consumption: bool,
     #[builder(default = true)]
@@ -68,6 +70,7 @@ mod tests {
         assert!(config.bar_execution);
         assert!(!config.bar_adaptive_high_low_ordering);
         assert!(config.trade_execution);
+        assert!(config.book_execution);
         assert!(!config.liquidity_consumption);
         assert!(config.reject_stop_orders);
         assert!(config.support_gtd_orders);

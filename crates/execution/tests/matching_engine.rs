@@ -38,8 +38,8 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     data::{
-        Bar, BarType, BookOrder, IndexPriceUpdate, InstrumentClose, OptionGreeks, QuoteTick,
-        TradeTick, stubs::OrderBookDeltaTestBuilder,
+        Bar, BarType, BookOrder, IndexPriceUpdate, InstrumentClose, OptionGreeks, OrderBookDelta,
+        OrderBookDeltas, QuoteTick, TradeTick, stubs::OrderBookDeltaTestBuilder,
     },
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
@@ -11082,6 +11082,100 @@ fn get_l2_queue_position_engine(
     );
 
     (engine, cache, handler)
+}
+
+fn get_trade_driven_l2_queue_position_engine(
+    instrument: InstrumentAny,
+) -> (
+    OrderMatchingEngine,
+    Rc<RefCell<Cache>>,
+    TypedIntoMessageSavingHandler<OrderEventAny>,
+) {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let handler = order_event_handler_with_cache(Rc::clone(&cache));
+    let config = OrderMatchingEngineConfig {
+        trade_execution: true,
+        book_execution: false,
+        liquidity_consumption: true,
+        queue_position: true,
+        ..Default::default()
+    };
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock,
+        Rc::clone(&cache),
+        config,
+    );
+
+    (engine, cache, handler)
+}
+
+#[rstest]
+fn test_l2_trade_driven_queue_preserves_snapshot_queue_and_requires_excess_trade(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let (mut engine, _cache, handler) =
+        get_trade_driven_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // A normal post-trade full snapshot can arrive before the corresponding trade tick. It
+    // replaces the book with a bid at our limit, but cannot itself consume our queue or fill us.
+    let snapshot = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::clear(instrument_id, 2, UnixNanos::from(2), UnixNanos::from(2)),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("100.00"),
+                    Quantity::from("10.000"),
+                    0,
+                ),
+                RecordFlag::F_SNAPSHOT as u8,
+                3,
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("101.00"),
+                    Quantity::from("10.000"),
+                    0,
+                ),
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                4,
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ),
+        ],
+    );
+    engine.process_order_book_deltas(&snapshot).unwrap();
+    assert!(get_fill_quantities(&handler).is_empty());
+
+    // Exactly exhausting the ten shares ahead still cannot fill our order.
+    process_buyer_trade(&mut engine, instrument_id, "10.000", "snapshot-trade", 3);
+    assert!(get_fill_quantities(&handler).is_empty());
+
+    // Only subsequent explicit excess trade volume reaches us.
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "excess-trade", 4);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
 }
 
 fn process_l2_ask_level_delta(

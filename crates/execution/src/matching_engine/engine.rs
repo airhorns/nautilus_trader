@@ -1319,7 +1319,9 @@ impl OrderMatchingEngine {
 
         // L1 books are driven by top-of-book data only, ignore deltas
         if self.book_type == BookType::L1_MBP {
-            self.iterate(delta.ts_init, AggressorSide::NoAggressor);
+            if self.config.book_execution {
+                self.iterate(delta.ts_init, AggressorSide::NoAggressor);
+            }
             return Ok(());
         }
 
@@ -1329,7 +1331,9 @@ impl OrderMatchingEngine {
 
         if self.config.queue_position {
             if delta_snapshot_or_clear {
-                self.clear_all_queue_positions();
+                if self.config.book_execution {
+                    self.clear_all_queue_positions();
+                }
             } else {
                 self.adjust_queue_for_delta(delta);
             }
@@ -1339,7 +1343,9 @@ impl OrderMatchingEngine {
             self.seed_tob_baseline();
         }
 
-        self.iterate(delta.ts_init, AggressorSide::NoAggressor);
+        if self.config.book_execution {
+            self.iterate(delta.ts_init, AggressorSide::NoAggressor);
+        }
         Ok(())
     }
 
@@ -1363,7 +1369,9 @@ impl OrderMatchingEngine {
 
         // L1 books are driven by top-of-book data only, ignore deltas
         if self.book_type == BookType::L1_MBP {
-            self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            if self.config.book_execution {
+                self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            }
             return Ok(());
         }
 
@@ -1374,8 +1382,10 @@ impl OrderMatchingEngine {
         if self.config.queue_position {
             for delta in &deltas.deltas {
                 if (delta.flags & 32) != 0 || delta.action == BookAction::Clear {
-                    self.clear_all_queue_positions();
                     has_snapshot_or_clear = true;
+                    if self.config.book_execution {
+                        self.clear_all_queue_positions();
+                    }
                     break;
                 }
                 self.adjust_queue_for_delta(delta);
@@ -1386,7 +1396,9 @@ impl OrderMatchingEngine {
             self.seed_tob_baseline();
         }
 
-        self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+        if self.config.book_execution {
+            self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+        }
         Ok(())
     }
 
@@ -1441,7 +1453,7 @@ impl OrderMatchingEngine {
         }
 
         // Depth10 always replaces the full book via apply_depth regardless of flags
-        if self.config.queue_position {
+        if self.config.queue_position && self.config.book_execution {
             self.clear_all_queue_positions();
             let bid_price_raw = top_bid.map_or(0, |order| order.price.raw);
             let bid_size_raw = top_bid.map_or(0, |order| order.size.raw);
@@ -1475,9 +1487,13 @@ impl OrderMatchingEngine {
             self.prev_ask_price_raw = ask_price_raw;
             self.prev_ask_size_raw = ask_size_raw;
             self.tob_initialized = true;
+        } else if self.config.queue_position {
+            self.seed_tob_baseline();
         }
 
-        self.iterate(depth.ts_init, AggressorSide::NoAggressor);
+        if self.config.book_execution {
+            self.iterate(depth.ts_init, AggressorSide::NoAggressor);
+        }
         Ok(())
     }
 
@@ -1531,7 +1547,9 @@ impl OrderMatchingEngine {
                     self.book.ts_last,
                     self.book.instrument_id,
                 );
-                self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+                if self.config.book_execution {
+                    self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+                }
                 return;
             }
 
@@ -1556,7 +1574,9 @@ impl OrderMatchingEngine {
             self.last_quote_ask = Some(quote.ask_price);
         }
 
-        self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        if self.config.book_execution {
+            self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        }
     }
 
     /// Processes a bar and simulates market dynamics by creating synthetic ticks.

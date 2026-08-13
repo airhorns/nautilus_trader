@@ -88,6 +88,14 @@ pub struct SandboxExecutionClientConfig {
     /// If trades should be processed by the matching engine (and move the market).
     #[builder(default = true)]
     pub trade_execution: bool,
+    /// If book updates should execute orders after updating the matching engine's market state.
+    ///
+    /// Disable this for conservative passive-fill simulation driven exclusively by explicit
+    /// trade ticks. With queue-position tracking enabled, full snapshots then preserve the
+    /// previously observed queue ahead rather than treating a replacement snapshot as traded
+    /// liquidity.
+    #[builder(default = true)]
+    pub book_execution: bool,
     /// If market liquidity should be consumed across matching orders.
     #[builder(default)]
     pub liquidity_consumption: bool,
@@ -122,6 +130,7 @@ impl SandboxExecutionClientConfig {
         OrderMatchingEngineConfig::builder()
             .bar_execution(self.bar_execution)
             .trade_execution(self.trade_execution)
+            .book_execution(self.book_execution)
             .liquidity_consumption(self.liquidity_consumption)
             .queue_position(self.queue_position)
             .reject_stop_orders(self.reject_stop_orders)
@@ -188,6 +197,7 @@ mod tests {
         assert!(config.fee_model.is_none());
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
+        assert_eq!(config.book_execution, expected.book_execution);
         assert_eq!(config.liquidity_consumption, expected.liquidity_consumption);
         assert_eq!(config.queue_position, expected.queue_position);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
