@@ -40,10 +40,13 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
+    data::{
+        Bar, BarType, BookOrder, Data, InstrumentClose, InstrumentStatus, OrderBookDelta,
+        OrderBookDeltas, QuoteTick, TradeTick,
+    },
     enums::{
-        AccountType, AggressorSide, BookType, InstrumentCloseType, MarketStatusAction, OmsType,
-        OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, AggressorSide, BookAction, BookType, InstrumentCloseType, MarketStatusAction,
+        OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::{AccountState, OrderEventAny, OrderFilled, PositionClosed, PositionEvent},
     identifiers::{
@@ -2538,6 +2541,164 @@ fn test_message_handler_drops_precision_mismatched_trade(
 
     assert_eq!(test_context.client.matching_engine_count(), 0);
     test_context.client.stop().unwrap();
+}
+
+#[rstest]
+fn test_order_submission_does_not_replay_cached_trade(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let instrument_id = instrument.id();
+    let mut context =
+        create_test_context_with(trader_id, account_id, instrument_id.venue, |config| {
+            config.book_type = BookType::L2_MBP;
+            config.trade_execution = true;
+            config.liquidity_consumption = true;
+            config.queue_position = true;
+        });
+    context
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument)
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    context.client.start().unwrap();
+
+    let book = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("1000.00"),
+                    Quantity::from("1.000"),
+                    1,
+                ),
+                0,
+                1,
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("1010.00"),
+                    Quantity::from("1.000"),
+                    2,
+                ),
+                0,
+                2,
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ),
+        ],
+    );
+    context.client.process_order_book_deltas(&book).unwrap();
+
+    // This trade occurs before either order exists. It remains the latest trade in the shared
+    // cache, but it must be consumed by the matching engine exactly once.
+    let trade = TradeTick::new(
+        instrument_id,
+        Price::from("1000.00"),
+        Quantity::from("10.000"),
+        AggressorSide::Seller,
+        TradeId::new("PRE-ORDER-TRADE"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    context.cache.borrow_mut().add_trade(trade).unwrap();
+    context.client.process_trade_tick(&trade).unwrap();
+
+    let resting_buy = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1000.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("RESTING-BUY"))
+        .submit(true)
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(
+            resting_buy.clone(),
+            None,
+            Some(context.client.client_id()),
+            false,
+        )
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &resting_buy,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(2),
+        ))
+        .unwrap();
+    let first_events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        OrderEventAny::Accepted(accepted)
+            if accepted.client_order_id == resting_buy.client_order_id()
+    )));
+    assert!(
+        !first_events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Filled(fill) if fill.client_order_id == resting_buy.client_order_id()
+        )),
+        "unexpected first-submission fill events: {first_events:?}"
+    );
+
+    // A later submission for the same instrument used to replay PRE-ORDER-TRADE and fill the
+    // resting buy even though no new market-data event had occurred.
+    let probe_sell = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .price(Price::from("1010.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("PROBE-SELL"))
+        .submit(true)
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(
+            probe_sell.clone(),
+            None,
+            Some(context.client.client_id()),
+            false,
+        )
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &probe_sell,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(3),
+        ))
+        .unwrap();
+    let second_events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert!(!second_events.iter().any(|event| matches!(
+        event,
+        OrderEventAny::Filled(fill) if fill.client_order_id == resting_buy.client_order_id()
+    )));
+
+    context.client.stop().unwrap();
 }
 
 #[rstest]

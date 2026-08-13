@@ -51,7 +51,7 @@ use nautilus_model::{
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
     enums::OmsType,
     events::{OrderEventAny, PositionEvent},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -78,6 +78,13 @@ struct SandboxInner {
     config: SandboxExecutionClientConfig,
     /// Matching engines per instrument.
     matching_engines: AHashMap<InstrumentId, OrderEngineAdapter>,
+    /// Last trade tick processed per instrument.
+    ///
+    /// Order submission primes a newly started sandbox from the shared cache. The cache retains
+    /// the last trade tick, which is a consumptive event and must never be replayed for every
+    /// subsequent submission: doing so can fill an order against a trade which occurred before
+    /// that order existed.
+    last_processed_trade_ids: AHashMap<InstrumentId, TradeId>,
     /// Next raw ID assigned to a matching engine.
     next_engine_raw_id: u32,
     /// Current account balances.
@@ -245,6 +252,8 @@ impl SandboxInner {
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
                 engine.get_engine_mut().process_trade_tick(trade);
             }
+            self.last_processed_trade_ids
+                .insert(instrument_id, trade.trade_id);
         }
     }
 
@@ -365,6 +374,7 @@ impl SandboxInner {
         }
 
         self.matching_engines.remove(&instrument_id);
+        self.last_processed_trade_ids.remove(&instrument_id);
         self.cache
             .borrow_mut()
             .purge_instrument_skip_order_guard(instrument_id);
@@ -474,6 +484,7 @@ impl SandboxExecutionClient {
             cache: cache.clone(),
             config: config.clone(),
             matching_engines: AHashMap::new(),
+            last_processed_trade_ids: AHashMap::new(),
             next_engine_raw_id: 0,
             balances,
             event_handler: None,
@@ -805,6 +816,9 @@ impl SandboxExecutionClient {
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.get_engine_mut().process_trade_tick(trade);
         }
+        inner
+            .last_processed_trade_ids
+            .insert(instrument_id, trade.trade_id);
         Ok(())
     }
 
@@ -856,6 +870,7 @@ impl SandboxExecutionClient {
         for engine in inner.matching_engines.values_mut() {
             engine.get_engine_mut().reset();
         }
+        inner.last_processed_trade_ids.clear();
 
         inner.balances.clear();
         for money in &self.config.starting_balances {
@@ -1041,6 +1056,11 @@ impl ExecutionClient for SandboxExecutionClient {
 
         // Update matching engine with latest market data from cache
         let cache = self.cache.borrow();
+        let cached_trade = cache.trade(&instrument_id).filter(|trade| {
+            self.config.trade_execution
+                && inner.last_processed_trade_ids.get(&instrument_id) != Some(&trade.trade_id)
+                && check_trade_or_drop("cached trade tick", trade, &instrument)
+        });
 
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             if let Some(quote) = cache.quote(&instrument_id)
@@ -1049,12 +1069,14 @@ impl ExecutionClient for SandboxExecutionClient {
                 engine.get_engine_mut().process_quote_tick(quote);
             }
 
-            if self.config.trade_execution
-                && let Some(trade) = cache.trade(&instrument_id)
-                && check_trade_or_drop("cached trade tick", trade, &instrument)
-            {
+            if let Some(trade) = cached_trade {
                 engine.get_engine_mut().process_trade_tick(trade);
             }
+        }
+        if let Some(trade) = cached_trade {
+            inner
+                .last_processed_trade_ids
+                .insert(instrument_id, trade.trade_id);
         }
         drop(cache);
 
@@ -1108,6 +1130,12 @@ impl ExecutionClient for SandboxExecutionClient {
 
                 // Update with latest market data
                 let cache = self.cache.borrow();
+                let cached_trade = cache.trade(&instrument_id).filter(|trade| {
+                    self.config.trade_execution
+                        && inner.last_processed_trade_ids.get(&instrument_id)
+                            != Some(&trade.trade_id)
+                        && check_trade_or_drop("cached trade tick", trade, &instrument)
+                });
 
                 if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
                     if let Some(quote) = cache.quote(&instrument_id)
@@ -1116,12 +1144,14 @@ impl ExecutionClient for SandboxExecutionClient {
                         engine.get_engine_mut().process_quote_tick(quote);
                     }
 
-                    if self.config.trade_execution
-                        && let Some(trade) = cache.trade(&instrument_id)
-                        && check_trade_or_drop("cached trade tick", trade, &instrument)
-                    {
+                    if let Some(trade) = cached_trade {
                         engine.get_engine_mut().process_trade_tick(trade);
                     }
+                }
+                if let Some(trade) = cached_trade {
+                    inner
+                        .last_processed_trade_ids
+                        .insert(instrument_id, trade.trade_id);
                 }
                 drop(cache);
 
