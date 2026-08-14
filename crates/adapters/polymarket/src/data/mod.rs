@@ -121,6 +121,7 @@ pub struct PolymarketDataClient {
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
+    price_change_replay_guard: Arc<StdMutex<dispatch::PriceChangeReplayGuard>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
     active_quote_subs: Arc<AtomicSet<InstrumentId>>,
     active_delta_subs: Arc<AtomicSet<InstrumentId>>,
@@ -208,6 +209,9 @@ impl PolymarketDataClient {
             instruments: Arc::new(AtomicMap::new()),
             token_meta: Arc::new(DashMap::new()),
             order_books: Arc::new(DashMap::new()),
+            price_change_replay_guard: Arc::new(StdMutex::new(
+                dispatch::PriceChangeReplayGuard::default(),
+            )),
             last_quotes: Arc::new(DashMap::new()),
             active_quote_subs: Arc::new(AtomicSet::new()),
             active_delta_subs: Arc::new(AtomicSet::new()),

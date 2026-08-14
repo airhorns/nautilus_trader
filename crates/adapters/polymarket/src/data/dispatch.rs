@@ -24,8 +24,12 @@
 //! unchanged side's size carries forward. See
 //! `docs/integrations/polymarket.md` for the full description.
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex as StdMutex},
+};
 
+use ahash::AHashSet;
 use dashmap::DashMap;
 use nautilus_common::{live::get_runtime, messages::DataEvent};
 use nautilus_core::{AtomicMap, AtomicSet, time::AtomicTime};
@@ -56,13 +60,85 @@ use crate::{
     resolve::{ResolveContext, ResolveWatchEntry, apply_condition_resolution},
     rtds::PolymarketRtdsFeed,
     websocket::{
-        messages::{MarketWsMessage, PolymarketNewMarket, PolymarketQuotes, PolymarketWsMessage},
+        messages::{
+            MarketWsMessage, PolymarketNewMarket, PolymarketQuote, PolymarketQuotes,
+            PolymarketWsMessage,
+        },
         parse::{
             parse_book_deltas, parse_book_snapshot, parse_quote_from_price_change,
             parse_quote_from_snapshot, parse_timestamp_ms, parse_trade_tick,
         },
     },
 };
+
+const PRICE_CHANGE_REPLAY_WINDOW: usize = 8_192;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct PriceChangeIdentity {
+    asset_id: Ustr,
+    timestamp_ns: u64,
+    price: String,
+    side: crate::common::enums::PolymarketOrderSide,
+    size: String,
+    hash: String,
+    best_bid: Option<String>,
+    best_ask: Option<String>,
+}
+
+impl PriceChangeIdentity {
+    fn new(change: &PolymarketQuote, ts_event: nautilus_core::UnixNanos) -> Self {
+        Self {
+            asset_id: change.asset_id,
+            timestamp_ns: ts_event.as_u64(),
+            price: change.price.clone(),
+            side: change.side,
+            size: change.size.clone(),
+            hash: change.hash.clone(),
+            best_bid: change.best_bid.clone(),
+            best_ask: change.best_ask.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PriceChangeReplayGuard {
+    seen: AHashSet<PriceChangeIdentity>,
+    order: VecDeque<PriceChangeIdentity>,
+    capacity: usize,
+}
+
+impl Default for PriceChangeReplayGuard {
+    fn default() -> Self {
+        Self::new(PRICE_CHANGE_REPLAY_WINDOW)
+    }
+}
+
+impl PriceChangeReplayGuard {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "price-change replay window must be positive");
+        Self {
+            seen: AHashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Records an identity and returns whether it already existed in the bounded window.
+    fn observe(&mut self, identity: PriceChangeIdentity) -> bool {
+        if self.seen.contains(&identity) {
+            return true;
+        }
+
+        if self.order.len() == self.capacity {
+            let expired = self.order.pop_front().expect("non-empty at capacity");
+            self.seen.remove(&expired);
+        }
+
+        self.seen.insert(identity.clone());
+        self.order.push_back(identity);
+        false
+    }
+}
 
 struct NewMarketInflightGuard {
     inflight_keys: Arc<DashMap<String, ()>>,
@@ -90,6 +166,7 @@ pub(super) struct WsMessageContext {
     pub(super) clob_public_client: PolymarketClobPublicClient,
     pub(super) filters: Vec<Arc<dyn InstrumentFilter>>,
     pub(super) order_books: Arc<DashMap<InstrumentId, OrderBook>>,
+    pub(super) price_change_replay_guard: Arc<StdMutex<PriceChangeReplayGuard>>,
     pub(super) last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
     pub(super) active_quote_subs: Arc<AtomicSet<InstrumentId>>,
     pub(super) active_delta_subs: Arc<AtomicSet<InstrumentId>>,
@@ -114,6 +191,25 @@ impl WsMessageContext {
             watchlist: self.resolve_poll_watchlist.clone(),
             apply_mutex: self.resolve_watch_apply_mutex.clone(),
         }
+    }
+
+    fn is_replayed_regressive_price_change(
+        &self,
+        instrument_id: InstrumentId,
+        change: &PolymarketQuote,
+        ts_event: nautilus_core::UnixNanos,
+    ) -> bool {
+        let is_regressive = self
+            .order_books
+            .get(&instrument_id)
+            .is_some_and(|book| ts_event < book.ts_last);
+        let was_seen = self
+            .price_change_replay_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(PriceChangeIdentity::new(change, ts_event));
+
+        is_regressive && was_seen
     }
 }
 
@@ -306,6 +402,17 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                         continue;
                     }
                 };
+
+                if ctx.active_delta_subs.contains(&meta.instrument_id)
+                    && ctx.is_replayed_regressive_price_change(meta.instrument_id, change, ts_event)
+                {
+                    log::debug!(
+                        "Dropping replayed regressive price change for {} at {}",
+                        meta.instrument_id,
+                        ts_event,
+                    );
+                    continue;
+                }
                 resolved.push((meta, change));
 
                 match groups
@@ -1005,6 +1112,7 @@ mod tests {
             clob_public_client,
             filters: vec![],
             order_books: Arc::new(DashMap::new()),
+            price_change_replay_guard: Arc::new(StdMutex::new(PriceChangeReplayGuard::default())),
             last_quotes: Arc::new(DashMap::new()),
             active_quote_subs: Arc::new(AtomicSet::new()),
             active_delta_subs: Arc::new(AtomicSet::new()),
@@ -1142,6 +1250,7 @@ mod tests {
             clob_public_client: client.clob_public_client.clone(),
             filters: client.provider.filters(),
             order_books: client.order_books.clone(),
+            price_change_replay_guard: client.price_change_replay_guard.clone(),
             last_quotes: client.last_quotes.clone(),
             active_quote_subs: client.active_quote_subs.clone(),
             active_delta_subs: client.active_delta_subs.clone(),
@@ -3312,6 +3421,17 @@ mod tests {
     }
 
     fn make_price_change(market: &str, asset_id: &str, price: &str, size: &str) -> MarketWsMessage {
+        make_price_change_at(market, asset_id, price, size, "1700000002000", "")
+    }
+
+    fn make_price_change_at(
+        market: &str,
+        asset_id: &str,
+        price: &str,
+        size: &str,
+        timestamp: &str,
+        hash: &str,
+    ) -> MarketWsMessage {
         MarketWsMessage::PriceChange(PolymarketQuotes {
             market: Ustr::from(market),
             price_changes: vec![PolymarketQuote {
@@ -3319,11 +3439,11 @@ mod tests {
                 price: price.to_string(),
                 side: PolymarketOrderSide::Buy,
                 size: size.to_string(),
-                hash: String::new(),
+                hash: hash.to_string(),
                 best_bid: None,
                 best_ask: None,
             }],
-            timestamp: "1700000002000".to_string(),
+            timestamp: timestamp.to_string(),
         })
     }
 
@@ -3701,6 +3821,117 @@ mod tests {
         let book = ctx.order_books.get(&instrument_id).expect("book entry");
         assert_eq!(book.best_bid_price(), Some(Price::from("0.50")));
         assert_eq!(book.best_bid_size(), Some(Quantity::from("20.00")));
+    }
+
+    #[rstest]
+    fn replayed_regressive_price_change_is_not_applied_or_emitted() {
+        let asset_id = "0xTOKEN-REPLAY";
+        let market = "0xMARKET";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot(market, asset_id, &[("0.45", "5"), ("0.55", "12")]),
+            &ctx,
+        );
+        while data_rx.try_recv().is_ok() {}
+
+        handle_market_message(
+            make_price_change_at(
+                market,
+                asset_id,
+                "0.50",
+                "20",
+                "1700000001000",
+                "old-book-hash",
+            ),
+            &ctx,
+        );
+        handle_market_message(
+            make_price_change_at(
+                market,
+                asset_id,
+                "0.50",
+                "25",
+                "1700000002000",
+                "new-book-hash",
+            ),
+            &ctx,
+        );
+        handle_market_message(
+            make_price_change_at(
+                market,
+                asset_id,
+                "0.50",
+                "20",
+                "1700000001000",
+                "old-book-hash",
+            ),
+            &ctx,
+        );
+
+        let emitted_deltas = std::iter::from_fn(|| data_rx.try_recv().ok())
+            .filter(|event| matches!(event, DataEvent::Data(NautilusData::Deltas(_))))
+            .count();
+        assert_eq!(emitted_deltas, 2);
+
+        let book = ctx.order_books.get(&instrument_id).expect("book entry");
+        assert_eq!(book.ts_last, UnixNanos::from(1_700_000_002_000_000_000));
+        assert_eq!(book.best_bid_price(), Some(Price::from("0.50")));
+        assert_eq!(book.best_bid_size(), Some(Quantity::from("25.00")));
+    }
+
+    #[rstest]
+    fn unseen_regressive_price_change_remains_observable() {
+        let asset_id = "0xTOKEN-REGRESSION";
+        let market = "0xMARKET";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot(market, asset_id, &[("0.45", "5"), ("0.55", "12")]),
+            &ctx,
+        );
+        while data_rx.try_recv().is_ok() {}
+
+        handle_market_message(
+            make_price_change_at(
+                market,
+                asset_id,
+                "0.50",
+                "25",
+                "1700000003000",
+                "new-book-hash",
+            ),
+            &ctx,
+        );
+        handle_market_message(
+            make_price_change_at(
+                market,
+                asset_id,
+                "0.50",
+                "22",
+                "1700000002000",
+                "unseen-old-hash",
+            ),
+            &ctx,
+        );
+
+        let emitted_deltas = std::iter::from_fn(|| data_rx.try_recv().ok())
+            .filter(|event| matches!(event, DataEvent::Data(NautilusData::Deltas(_))))
+            .count();
+        assert_eq!(emitted_deltas, 2);
+        assert_eq!(
+            ctx.order_books
+                .get(&instrument_id)
+                .expect("book entry")
+                .best_bid_size(),
+            Some(Quantity::from("22.00")),
+        );
     }
 
     #[rstest]
