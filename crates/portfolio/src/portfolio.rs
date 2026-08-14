@@ -2600,6 +2600,15 @@ impl Portfolio {
         let current = mark_price
             .filter(is_valid)
             .or_else(|| cache.price(instrument_id, price_type).filter(is_valid))
+            .or_else(|| {
+                let book = cache.order_book(instrument_id)?;
+                match position.side {
+                    PositionSide::Long => book.best_bid_price(),
+                    PositionSide::Short => book.best_ask_price(),
+                    _ => unreachable!("position side was validated above"),
+                }
+                .filter(is_valid)
+            })
             .or_else(|| cache.price(instrument_id, PriceType::Last).filter(is_valid))
             .or_else(|| {
                 self.inner

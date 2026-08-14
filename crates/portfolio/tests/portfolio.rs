@@ -23,8 +23,8 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos, approx_eq};
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    data::{Bar, BarType, MarkPriceUpdate, QuoteTick},
-    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionSide},
+    data::{Bar, BarType, BookOrder, MarkPriceUpdate, QuoteTick},
+    enums::{AccountType, BookType, LiquiditySide, OmsType, OrderSide, OrderType, PositionSide},
     events::{
         AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderSubmitted, PortfolioSnapshot,
         PositionChanged, PositionClosed, PositionEvent, PositionOpened,
@@ -48,6 +48,7 @@ use nautilus_model::{
             xbtusd_bitmex,
         },
     },
+    orderbook::OrderBook,
     orders::{Order, OrderAny, OrderTestBuilder},
     position::Position,
     stubs::TestDefault,
@@ -7292,6 +7293,57 @@ fn test_equity_margin_account_with_unrealized_pnl(
     assert_eq!(
         equity.get(&Currency::USD()).unwrap().as_decimal(),
         dec!(20.0)
+    );
+}
+
+#[rstest]
+#[case(OrderSide::Buy, "90", dec!(10.0))]
+#[case(OrderSide::Sell, "110", dec!(9.0))]
+fn test_unrealized_pnl_falls_back_to_side_appropriate_order_book_top(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] order_side: OrderSide,
+    #[case] entry_price: &str,
+    #[case] expected_pnl: Decimal,
+) {
+    portfolio.update_account(&get_margin_account(Some("SIM-001")));
+    let mut book = OrderBook::new(instrument_audusd.id(), BookType::L2_MBP);
+    book.add(
+        BookOrder::new(OrderSide::Buy, Price::from("100"), Quantity::from("10"), 0),
+        0,
+        1,
+        0.into(),
+    );
+    book.add(
+        BookOrder::new(OrderSide::Sell, Price::from("101"), Quantity::from("10"), 0),
+        0,
+        1,
+        0.into(),
+    );
+    portfolio.cache().borrow_mut().add_order_book(book).unwrap();
+
+    let fill = make_fill_for_account(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        order_side,
+        Quantity::from("1"),
+        Price::from(entry_price),
+        PositionId::new("P-BOOK-TOP"),
+    );
+    let position = Position::new(&instrument_audusd, fill);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    assert_eq!(
+        portfolio
+            .unrealized_pnl(&instrument_audusd.id())
+            .unwrap()
+            .as_decimal(),
+        expected_pnl
     );
 }
 
