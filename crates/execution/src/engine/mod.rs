@@ -3039,6 +3039,21 @@ impl ExecutionEngine {
         send_portfolio_update: bool,
     ) -> Option<OrderAny> {
         let result = { self.cache.borrow_mut().update_order(event) };
+        let result = match result {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<OrderError>(),
+                    Some(OrderError::InvalidStateTransition)
+                ) =>
+            {
+                match self.repair_preapplied_async_accept(client_order_id, event) {
+                    Ok(Some(order)) => Ok(order),
+                    Ok(None) => Err(error),
+                    Err(repair_error) => Err(repair_error),
+                }
+            }
+            result => result,
+        };
 
         let order = match result {
             Ok(order) => order,
@@ -3146,6 +3161,63 @@ impl ExecutionEngine {
         }
 
         Some(order)
+    }
+
+    /// Repairs the narrow live-sandbox race where the matching engine must accept a marketable
+    /// order in its local clone before queued execution events can be drained.
+    ///
+    /// `SandboxExecutionClient` sends `Submitted`, then the matching engine applies and queues
+    /// `Accepted` before it can match the order. Both events use the live runner's async channel to
+    /// avoid re-entering `ExecutionEngine` while it is borrowed. The matching engine shares this
+    /// cache and therefore installs its accepted clone before either queued event is processed.
+    /// Rebuild the authoritative event stream when the queued `Submitted` arrives, then recognize
+    /// the exact already-installed `Accepted` event when it follows. No other out-of-order or
+    /// merely similar venue event is accepted by this path.
+    fn repair_preapplied_async_accept(
+        &self,
+        client_order_id: ClientOrderId,
+        event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderAny>> {
+        let mut cache = self.cache.borrow_mut();
+        let Some(existing) = cache.order(&client_order_id).map(|order| order.clone()) else {
+            return Ok(None);
+        };
+
+        match event {
+            OrderEventAny::Submitted(_) if existing.status() == OrderStatus::Accepted => {
+                let mut events = existing.events().into_iter().cloned().collect::<Vec<_>>();
+                if events
+                    .iter()
+                    .any(|existing| matches!(existing, OrderEventAny::Submitted(_)))
+                {
+                    return Ok(None);
+                }
+                let Some(accepted_index) = events
+                    .iter()
+                    .position(|existing| matches!(existing, OrderEventAny::Accepted(_)))
+                else {
+                    return Ok(None);
+                };
+                events.insert(accepted_index, event.clone());
+                let repaired = OrderAny::from_events(events).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to repair pre-applied async accept for {client_order_id}: {error}"
+                    )
+                })?;
+                cache.replace_order(&repaired)?;
+                Ok(Some(repaired))
+            }
+            OrderEventAny::Accepted(_)
+                if existing.status() == OrderStatus::Accepted
+                    && existing
+                        .events()
+                        .into_iter()
+                        .any(|existing| existing == event) =>
+            {
+                Ok(Some(existing))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn send_order_update_to_portfolio(&self, event: &OrderEventAny) {

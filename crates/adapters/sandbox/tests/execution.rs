@@ -2996,7 +2996,9 @@ fn test_initialized_ioc_market_order_cancels_remainder_through_live_runner(
 // same RefCell and panics with "RefCell already borrowed".
 //
 // The fix routes sandbox events through the async runner channel so they are processed
-// in the next iteration, after the borrow is released.
+// in the next iteration, after the borrow is released. A marketable limit also proves the
+// matching engine's eager accepted cache projection does not erase Submitted/Accepted from the
+// authoritative lifecycle before its immediate fill.
 #[rstest]
 fn test_submit_order_through_exec_engine_no_reentrant_panic(
     trader_id: TraderId,
@@ -3076,10 +3078,12 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         .unwrap();
 
     // Build and cache the order
-    let order = OrderTestBuilder::new(OrderType::Market)
+    let order = OrderTestBuilder::new(OrderType::Limit)
         .instrument_id(instrument_id)
         .side(OrderSide::Buy)
+        .price(Price::from("1001.00"))
         .quantity(Quantity::from("0.001"))
+        .time_in_force(TimeInForce::Ioc)
         .build();
     cache
         .borrow_mut()
@@ -3093,13 +3097,41 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
     let endpoint = MessagingSwitchboard::exec_engine_execute();
     msgbus::send_trading_command(endpoint, TradingCommand::SubmitOrder(submit));
 
-    // Verify events arrived through the channel instead of re-entering the engine
-    let mut events = Vec::new();
+    // Verify events arrived through the channel instead of re-entering the engine, then drain the
+    // two pre-fill lifecycle events exactly as the live runner does.
+    let mut events = Vec::<OrderEventAny>::new();
     while let Ok(event) = rx.try_recv() {
-        events.push(event);
+        if let ExecutionEvent::Order(order_event) = event {
+            events.push(order_event);
+        }
     }
-    assert!(
-        !events.is_empty(),
-        "Expected order events through the exec event channel"
-    );
+    assert!(matches!(events.first(), Some(OrderEventAny::Submitted(_))));
+    assert!(matches!(events.get(1), Some(OrderEventAny::Accepted(_))));
+    assert!(matches!(events.get(2), Some(OrderEventAny::Filled(_))));
+
+    engine.borrow_mut().process(&events[0]);
+    engine.borrow_mut().process(&events[1]);
+
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    let cached_events = cached.events();
+    assert_eq!(cached.status(), OrderStatus::Accepted);
+    assert_eq!(cached_events.len(), 3);
+    assert!(matches!(cached_events[0], OrderEventAny::Initialized(_)));
+    assert!(matches!(cached_events[1], OrderEventAny::Submitted(_)));
+    assert!(matches!(cached_events[2], OrderEventAny::Accepted(_)));
+
+    engine.borrow_mut().process(&events[2]);
+    let filled = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    let filled_events = filled.events();
+    assert_eq!(filled.status(), OrderStatus::Filled);
+    assert_eq!(filled_events.len(), 4);
+    assert!(matches!(filled_events[3], OrderEventAny::Filled(_)));
 }
