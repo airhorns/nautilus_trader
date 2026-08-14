@@ -81,7 +81,6 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
         clob_public_client: client.clob_public_client.clone(),
         filters: client.provider.filters(),
         order_books: client.order_books.clone(),
-        price_change_replay_guard: client.price_change_replay_guard.clone(),
         last_quotes: client.last_quotes.clone(),
         active_quote_subs: client.active_quote_subs.clone(),
         active_delta_subs: client.active_delta_subs.clone(),
