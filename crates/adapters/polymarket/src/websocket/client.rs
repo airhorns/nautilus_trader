@@ -230,6 +230,10 @@ impl PolymarketWebSocketClient {
             return Ok(());
         }
 
+        // A client may be connected again after a graceful stop/disconnect.
+        // The stop latch belongs to one handler generation only.
+        self.signal.store(false, Ordering::Relaxed);
+
         let (message_handler, raw_rx) = channel_message_handler();
         let cfg = self.websocket_config();
 
@@ -360,7 +364,7 @@ impl PolymarketWebSocketClient {
     /// Force-close fallback for the sync `stop()` path.
     /// Prefer `disconnect()` for graceful shutdown.
     pub(crate) fn abort(&mut self) {
-        self.signal.store(true, Ordering::Relaxed);
+        self.begin_shutdown();
         self.connection_mode
             .store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
 
@@ -370,10 +374,18 @@ impl PolymarketWebSocketClient {
         self.auth_tracker.invalidate();
     }
 
+    /// Marks the current handler generation as intentionally stopping.
+    ///
+    /// This is separated from async disconnect so synchronous client shutdown
+    /// can classify an output receiver closing during teardown as expected.
+    pub(crate) fn begin_shutdown(&self) {
+        self.signal.store(true, Ordering::Relaxed);
+    }
+
     /// Disconnects the WebSocket connection.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
         log::debug!("Disconnecting Polymarket WebSocket");
-        self.signal.store(true, Ordering::Relaxed);
+        self.begin_shutdown();
 
         if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
             log::debug!("Failed to send disconnect (handler may already be shut down): {e}");
@@ -642,7 +654,11 @@ mod tests {
             TransportBackend::default(),
         );
 
+        client.begin_shutdown();
+        assert!(client.signal.load(std::sync::atomic::Ordering::Relaxed));
+
         client.connect().await.expect("connect websocket client");
+        assert!(!client.signal.load(std::sync::atomic::Ordering::Relaxed));
 
         let message =
             tokio::time::timeout(tokio::time::Duration::from_secs(2), client.next_message())

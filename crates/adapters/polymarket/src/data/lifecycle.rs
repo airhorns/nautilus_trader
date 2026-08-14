@@ -289,6 +289,10 @@ impl PolymarketDataClient {
 
     pub(super) fn stop_client(&mut self) {
         log::info!("Stopping Polymarket data client: {}", self.client_id);
+        // LiveNode closes the data consumer while the synchronous stop phase is
+        // still running. Latch intentional shutdown before canceling that task
+        // so a final WebSocket send is not reported as a runtime failure.
+        self.ws_client.begin_shutdown();
         self.cancellation_token.cancel();
         self.is_connected
             .store(false, std::sync::atomic::Ordering::Relaxed);

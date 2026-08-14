@@ -44,8 +44,8 @@ use nautilus_model::{
     instruments::{
         CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny,
         stubs::{
-            audusd_sim, currency_pair_btcusdt, default_fx_ccy, ethusdt_bitmex, futures_spread_es,
-            xbtusd_bitmex,
+            audusd_sim, binary_option, currency_pair_btcusdt, default_fx_ccy, ethusdt_bitmex,
+            futures_spread_es, xbtusd_bitmex,
         },
     },
     orderbook::OrderBook,
@@ -7344,6 +7344,49 @@ fn test_unrealized_pnl_falls_back_to_side_appropriate_order_book_top(
             .unwrap()
             .as_decimal(),
         expected_pnl
+    );
+}
+
+#[rstest]
+#[case(OrderSide::Buy)]
+#[case(OrderSide::Sell)]
+fn test_unrealized_pnl_falls_back_to_conservative_instrument_bound(
+    mut portfolio: Portfolio,
+    #[case] order_side: OrderSide,
+) {
+    portfolio.update_account(&get_margin_account(Some("SIM-001")));
+    let mut binary = binary_option();
+    binary.min_price = Some(Price::from("0.001"));
+    binary.max_price = Some(Price::from("0.999"));
+    let instrument = InstrumentAny::BinaryOption(binary);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let fill = make_fill_for_account(
+        &instrument,
+        AccountId::new("SIM-001"),
+        order_side,
+        Quantity::from("1"),
+        Price::from("0.500"),
+        PositionId::new("P-BOUNDED-FALLBACK"),
+    );
+    let position = Position::new(&instrument, fill);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    assert_eq!(
+        portfolio
+            .unrealized_pnl(&instrument.id())
+            .unwrap()
+            .as_decimal(),
+        dec!(-0.499)
     );
 }
 

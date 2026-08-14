@@ -277,6 +277,18 @@ impl PolymarketMarketConnectionPool {
         Ok(())
     }
 
+    /// Marks every current shard as intentionally stopping without draining it.
+    ///
+    /// The synchronous data-client stop phase calls this before its merged
+    /// receiver is canceled, allowing shard handlers to classify the resulting
+    /// output-channel close as expected teardown.
+    pub(crate) fn begin_shutdown(&self) {
+        let state = self.inner.state.lock().expect("pool state mutex poisoned");
+        for shard in state.shards.values() {
+            shard.client.begin_shutdown();
+        }
+    }
+
     /// Force-closes every shard for the sync `stop()`/`reset()` path.
     ///
     /// Prefer [`Self::disconnect`] for graceful shutdown.

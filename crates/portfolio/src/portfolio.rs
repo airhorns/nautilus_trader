@@ -2618,6 +2618,21 @@ impl Portfolio {
                     .filter(|price| is_valid(price))
                     .copied()
             });
+        let bounded_fallback = if current.is_none() {
+            cache.instrument(instrument_id).and_then(|instrument| {
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    return None;
+                };
+                match position.side {
+                    PositionSide::Long => binary.min_price(),
+                    PositionSide::Short => binary.max_price(),
+                    _ => unreachable!("position side was validated above"),
+                }
+                .filter(is_valid)
+            })
+        } else {
+            None
+        };
         drop(cache);
 
         let key = (*instrument_id, position.side);
@@ -2627,6 +2642,13 @@ impl Portfolio {
             inner.stale_prices.remove(&key);
             Some(price)
         } else if let Some(price) = inner.last_prices.get(&key).copied() {
+            inner.stale_prices.insert(key);
+            Some(price)
+        } else if let Some(price) = bounded_fallback {
+            // A bounded instrument can still be valued conservatively when its
+            // liquidation side is temporarily empty (or a fill races the first
+            // cached top). Keep the mark explicitly stale until market data is
+            // available rather than failing the entire portfolio calculation.
             inner.stale_prices.insert(key);
             Some(price)
         } else {
