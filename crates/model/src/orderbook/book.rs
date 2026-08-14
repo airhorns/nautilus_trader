@@ -400,6 +400,16 @@ impl OrderBook {
         &mut self,
         deltas: &OrderBookDeltas,
     ) -> Result<(), BookIntegrityError> {
+        if deltas.deltas.first().is_some_and(|delta| {
+            delta.action == BookAction::Clear && RecordFlag::F_SNAPSHOT.matches(delta.flags)
+        }) {
+            // An authoritative snapshot starts a new metadata epoch. This matters after
+            // reconnects, where the replacement snapshot can legitimately predate the
+            // previous connection generation's final incremental update.
+            self.sequence = 0;
+            self.ts_last = UnixNanos::default();
+        }
+
         for delta in &deltas.deltas {
             self.apply_delta_unchecked(delta)?;
         }

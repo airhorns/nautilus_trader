@@ -8273,6 +8273,107 @@ fn test_l1_snapshot_tardis_style_selects_best_prices() {
 }
 
 #[rstest]
+fn test_authoritative_snapshot_starts_new_metadata_epoch() {
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    book.add(
+        BookOrder::new(
+            OrderSide::Buy,
+            Price::from("100.00"),
+            Quantity::from("10"),
+            1,
+        ),
+        0,
+        100,
+        UnixNanos::from(1_000),
+    );
+
+    let snapshot_ts = UnixNanos::from(900);
+    let snapshot = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::clear(instrument_id, 7, snapshot_ts, snapshot_ts),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("99.00"),
+                    Quantity::from("20"),
+                    2,
+                ),
+                RecordFlag::F_SNAPSHOT as u8,
+                8,
+                snapshot_ts,
+                snapshot_ts,
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("101.00"),
+                    Quantity::from("30"),
+                    3,
+                ),
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                9,
+                snapshot_ts,
+                snapshot_ts,
+            ),
+        ],
+    );
+
+    book.apply_deltas(&snapshot).unwrap();
+
+    assert_eq!(book.best_bid_price(), Some(Price::from("99.00")));
+    assert_eq!(book.best_ask_price(), Some(Price::from("101.00")));
+    assert_eq!(book.sequence, 9);
+    assert_eq!(book.ts_last, snapshot_ts);
+    assert_eq!(book.update_count, 4);
+}
+
+#[rstest]
+fn test_older_incremental_delta_preserves_metadata_high_water() {
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let high_water = UnixNanos::from(1_000);
+
+    book.add(
+        BookOrder::new(
+            OrderSide::Buy,
+            Price::from("100.00"),
+            Quantity::from("10"),
+            1,
+        ),
+        0,
+        100,
+        high_water,
+    );
+
+    let older_incremental = OrderBookDelta::new(
+        instrument_id,
+        BookAction::Add,
+        BookOrder::new(
+            OrderSide::Sell,
+            Price::from("101.00"),
+            Quantity::from("10"),
+            2,
+        ),
+        0,
+        99,
+        UnixNanos::from(900),
+        UnixNanos::from(900),
+    );
+    book.apply_delta(&older_incremental).unwrap();
+
+    assert_eq!(book.sequence, 100);
+    assert_eq!(book.ts_last, high_water);
+    assert_eq!(book.update_count, 2);
+}
+
+#[rstest]
 fn test_l1_consecutive_snapshots_clear_between() {
     // Verifies that consecutive Tardis-style snapshots correctly clear previous state
     let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
