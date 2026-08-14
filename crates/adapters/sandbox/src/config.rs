@@ -96,6 +96,13 @@ pub struct SandboxExecutionClientConfig {
     /// liquidity.
     #[builder(default = true)]
     pub book_execution: bool,
+    /// If newly submitted limit orders should use the current order book for immediate matching.
+    ///
+    /// This is independent from `book_execution`: enabling it while book execution is disabled
+    /// permits marketable IOC/FOK limit orders to consume displayed liquidity at submission, but
+    /// prevents subsequent book updates from filling already-resting passive orders.
+    #[builder(default)]
+    pub order_submission_book_execution: bool,
     /// If market liquidity should be consumed across matching orders.
     #[builder(default)]
     pub liquidity_consumption: bool,
@@ -131,6 +138,7 @@ impl SandboxExecutionClientConfig {
             .bar_execution(self.bar_execution)
             .trade_execution(self.trade_execution)
             .book_execution(self.book_execution)
+            .order_submission_book_execution(self.order_submission_book_execution)
             .liquidity_consumption(self.liquidity_consumption)
             .queue_position(self.queue_position)
             .reject_stop_orders(self.reject_stop_orders)
@@ -198,6 +206,10 @@ mod tests {
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
         assert_eq!(config.book_execution, expected.book_execution);
+        assert_eq!(
+            config.order_submission_book_execution,
+            expected.order_submission_book_execution
+        );
         assert_eq!(config.liquidity_consumption, expected.liquidity_consumption);
         assert_eq!(config.queue_position, expected.queue_position);
         assert_eq!(config.use_position_ids, expected.use_position_ids);

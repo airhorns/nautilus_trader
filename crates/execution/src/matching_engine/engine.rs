@@ -3587,6 +3587,14 @@ impl OrderMatchingEngine {
             return;
         }
 
+        // Keep passive fills trade-driven when `book_execution` is disabled, while still
+        // allowing newly submitted IOC/FOK limits and post-only validation to use the current
+        // authoritative book. Book updates intentionally do not call `iterate` under this mode.
+        if self.config.order_submission_book_execution {
+            self.core.bid = self.book.best_bid_price();
+            self.core.ask = self.book.best_ask_price();
+        }
+
         let limit_px = order.price().expect("Limit order must have a price");
         if order.is_post_only()
             && self

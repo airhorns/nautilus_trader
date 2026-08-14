@@ -27,6 +27,9 @@ pub struct OrderMatchingEngineConfig {
     pub trade_execution: bool,
     #[builder(default = true)]
     pub book_execution: bool,
+    /// If limit orders should use the current order book for immediate matching on submission.
+    #[builder(default)]
+    pub order_submission_book_execution: bool,
     #[builder(default)]
     pub liquidity_consumption: bool,
     #[builder(default = true)]
@@ -71,6 +74,7 @@ mod tests {
         assert!(!config.bar_adaptive_high_low_ordering);
         assert!(config.trade_execution);
         assert!(config.book_execution);
+        assert!(!config.order_submission_book_execution);
         assert!(!config.liquidity_consumption);
         assert!(config.reject_stop_orders);
         assert!(config.support_gtd_orders);

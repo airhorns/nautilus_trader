@@ -113,6 +113,7 @@ fn create_config(
         bar_execution: false,
         trade_execution: false,
         book_execution: true,
+        order_submission_book_execution: false,
         liquidity_consumption: false,
         queue_position: false,
         reject_stop_orders: true,
@@ -890,6 +891,8 @@ fn test_config_builder_with_overrides(trader_id: TraderId, account_id: AccountId
 #[rstest]
 fn test_config_to_matching_engine_config(config: SandboxExecutionClientConfig) {
     let config = SandboxExecutionClientConfig {
+        book_execution: false,
+        order_submission_book_execution: true,
         liquidity_consumption: true,
         queue_position: true,
         ..config
@@ -898,6 +901,8 @@ fn test_config_to_matching_engine_config(config: SandboxExecutionClientConfig) {
 
     assert!(!engine_config.bar_execution);
     assert!(!engine_config.trade_execution);
+    assert!(!engine_config.book_execution);
+    assert!(engine_config.order_submission_book_execution);
     assert!(engine_config.liquidity_consumption);
     assert!(engine_config.queue_position);
     assert!(engine_config.reject_stop_orders);
@@ -1972,6 +1977,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             bar_execution: false,
             trade_execution: false,
             book_execution: true,
+            order_submission_book_execution: false,
             liquidity_consumption: false,
             queue_position: false,
             reject_stop_orders: true,
@@ -3050,6 +3056,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         bar_execution: false,
         trade_execution: false,
         book_execution: true,
+        order_submission_book_execution: false,
         liquidity_consumption: false,
         queue_position: false,
         reject_stop_orders: true,

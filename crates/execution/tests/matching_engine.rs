@@ -11097,6 +11097,7 @@ fn get_trade_driven_l2_queue_position_engine(
     let config = OrderMatchingEngineConfig {
         trade_execution: true,
         book_execution: false,
+        order_submission_book_execution: true,
         liquidity_consumption: true,
         queue_position: true,
         ..Default::default()
@@ -11115,6 +11116,31 @@ fn get_trade_driven_l2_queue_position_engine(
     );
 
     (engine, cache, handler)
+}
+
+#[rstest]
+fn test_l2_submission_book_execution_fills_marketable_ioc(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let (mut engine, _cache, handler) =
+        get_trade_driven_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from("2.000"))
+        .client_order_id(ClientOrderId::from("MARKETABLE-IOC"))
+        .time_in_force(TimeInForce::Ioc)
+        .submit(true)
+        .build();
+    engine.process_order(&mut order, account_id);
+
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
 }
 
 #[rstest]

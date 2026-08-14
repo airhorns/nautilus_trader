@@ -34,7 +34,7 @@ use crate::config::SandboxExecutionClientConfig;
 impl SandboxExecutionClientConfig {
     /// Configuration for `SandboxExecutionClient` instances.
     #[new]
-    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, book_execution=true, liquidity_consumption=false, queue_position=false, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None))]
+    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, book_execution=true, order_submission_book_execution=false, liquidity_consumption=false, queue_position=false, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         venue: Venue,
@@ -50,6 +50,7 @@ impl SandboxExecutionClientConfig {
         bar_execution: bool,
         trade_execution: bool,
         book_execution: bool,
+        order_submission_book_execution: bool,
         liquidity_consumption: bool,
         queue_position: bool,
         reject_stop_orders: bool,
@@ -85,6 +86,7 @@ impl SandboxExecutionClientConfig {
             bar_execution,
             trade_execution,
             book_execution,
+            order_submission_book_execution,
             liquidity_consumption,
             queue_position,
             reject_stop_orders,
@@ -167,6 +169,11 @@ impl SandboxExecutionClientConfig {
     #[getter]
     fn book_execution(&self) -> bool {
         self.book_execution
+    }
+
+    #[getter]
+    fn order_submission_book_execution(&self) -> bool {
+        self.order_submission_book_execution
     }
 
     #[getter]

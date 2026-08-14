@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bar_execution: true,
         trade_execution: false,
         book_execution: true,
+        order_submission_book_execution: false,
         liquidity_consumption: false,
         queue_position: false,
         reject_stop_orders: true,
