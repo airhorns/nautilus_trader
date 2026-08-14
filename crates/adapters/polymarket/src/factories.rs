@@ -99,6 +99,9 @@ impl PolymarketDataClientFactory {
         name: &str,
         polymarket_config: &PolymarketDataClientConfig,
     ) -> anyhow::Result<PolymarketDataClient> {
+        if polymarket_config.reconnect_test_after_secs == Some(0) {
+            anyhow::bail!("reconnect_test_after_secs must be positive when configured");
+        }
         let client_id = ClientId::from(name);
         let proxy_url = polymarket_config.validated_proxy_url()?;
 

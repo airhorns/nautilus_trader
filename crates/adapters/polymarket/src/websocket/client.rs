@@ -88,6 +88,20 @@ impl WsSubscriptionHandle {
             .map_err(|e| anyhow::anyhow!("Failed to send UnsubscribeMarket: {e}"))
     }
 
+    /// Exercises the ordinary transport reconnect path without stopping the data client.
+    pub async fn reconnect_test(&self) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::ReconnectTest(response_tx))
+            .map_err(|e| anyhow::anyhow!("Failed to send ReconnectTest: {e}"))?;
+        response_rx
+            .await
+            .map_err(|e| anyhow::anyhow!("ReconnectTest response channel closed: {e}"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     // Constructs a handle around a raw command sender. Test-only: lets unit
     // tests observe the commands the handle emits without spinning up the real
     // feed handler.
@@ -547,7 +561,13 @@ impl PolymarketWebSocketClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::{
         Router,
@@ -565,6 +585,81 @@ mod tests {
     use rstest::rstest;
 
     use super::{PolymarketWebSocketClient, WsChannel, idle_timeout_ms_for};
+
+    #[derive(Clone)]
+    struct ReconnectServerState {
+        connections: Arc<AtomicUsize>,
+        events: tokio::sync::mpsc::UnboundedSender<(usize, String)>,
+    }
+
+    async fn handle_reconnect_upgrade(
+        ws: WebSocketUpgrade,
+        State(state): State<ReconnectServerState>,
+    ) -> Response {
+        ws.on_upgrade(move |socket| handle_reconnect_socket(socket, state))
+    }
+
+    async fn handle_reconnect_socket(mut socket: WebSocket, state: ReconnectServerState) {
+        let generation = state.connections.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = state.events.send((generation, "connected".to_string()));
+        while let Some(Ok(message)) = socket.recv().await {
+            match message {
+                AxumWsMessage::Text(text) => {
+                    let _ = state.events.send((generation, text.to_string()));
+                }
+                AxumWsMessage::Close(_) => {
+                    let _ = state.events.send((generation, "closed".to_string()));
+                    let _ = socket.send(AxumWsMessage::Close(None)).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn start_reconnect_test_server() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(usize, String)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reconnect websocket server");
+        let addr = listener.local_addr().expect("reconnect websocket address");
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = ReconnectServerState {
+            connections: Arc::new(AtomicUsize::new(0)),
+            events,
+        };
+        let router = Router::new()
+            .route("/ws", get(handle_reconnect_upgrade))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("reconnect websocket server failed");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        (addr, receiver)
+    }
+
+    async fn wait_for_server_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<(usize, String)>,
+        generation: usize,
+        expected: &str,
+    ) {
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                let (observed_generation, message) =
+                    events.recv().await.expect("reconnect server event channel");
+                if observed_generation == generation && message.contains(expected) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("wait for reconnect server event");
+    }
 
     async fn handle_upgrade(ws: WebSocketUpgrade) -> Response {
         ws.on_upgrade(handle_socket)
@@ -613,10 +708,7 @@ mod tests {
         }
     }
 
-    async fn start_heartbeat_test_server() -> (
-        SocketAddr,
-        tokio::sync::oneshot::Receiver<String>,
-    ) {
+    async fn start_heartbeat_test_server() -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind heartbeat websocket server");
@@ -678,6 +770,54 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
+    async fn reconnect_test_closes_reconnects_and_replays_subscription() {
+        let (addr, mut server_events) = start_reconnect_test_server().await;
+        let mut client = PolymarketWebSocketClient::new_market(
+            Some(format!("ws://{addr}/ws")),
+            false,
+            TransportBackend::Tungstenite,
+        );
+        client.connect().await.expect("connect websocket client");
+        let handle = client.clone_subscription_handle();
+        handle
+            .subscribe_market(vec!["token-reconnect-test".to_string()])
+            .await
+            .expect("subscribe before reconnect test");
+
+        wait_for_server_event(&mut server_events, 1, "connected").await;
+        wait_for_server_event(&mut server_events, 1, "token-reconnect-test").await;
+        handle.reconnect_test().await.expect("send reconnect test");
+        wait_for_server_event(&mut server_events, 1, "closed").await;
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(message) = client.next_message().await
+                    && matches!(
+                        message,
+                        super::super::messages::PolymarketWsMessage::Reconnected
+                    )
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("wait for reconnect sentinel");
+        assert!(matches!(
+            message,
+            super::super::messages::PolymarketWsMessage::Reconnected
+        ));
+        wait_for_server_event(&mut server_events, 2, "connected").await;
+        wait_for_server_event(&mut server_events, 2, "token-reconnect-test").await;
+
+        client
+            .disconnect()
+            .await
+            .expect("disconnect websocket client");
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn configured_heartbeat_writes_application_ping_text() {
         let (addr, heartbeat) = start_heartbeat_test_server().await;
         let adapter = PolymarketWebSocketClient::new_market(
@@ -688,16 +828,10 @@ mod tests {
         let mut config = adapter.websocket_config();
         // Preserve the production payload while shortening only the fixture cadence.
         config.heartbeat = Some(1);
-        let client = WebSocketClient::connect(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            None,
-            vec![],
-            None,
-        )
-        .await
-        .expect("connect heartbeat websocket client");
+        let client =
+            WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
+                .await
+                .expect("connect heartbeat websocket client");
 
         let message = tokio::time::timeout(tokio::time::Duration::from_secs(2), heartbeat)
             .await

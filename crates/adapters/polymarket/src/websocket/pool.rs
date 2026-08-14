@@ -376,6 +376,31 @@ impl PolymarketMarketPoolHandle {
         }
         Ok(())
     }
+
+    /// Sends one reconnect-test close frame on every currently open market shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are no open shards or any handler rejects the request.
+    pub async fn reconnect_test(&self) -> anyhow::Result<usize> {
+        let _wire = self.inner.wire_mutex.lock().await;
+        let handles = self
+            .inner
+            .state
+            .lock()
+            .expect("pool state mutex poisoned")
+            .shards
+            .values()
+            .map(|shard| shard.handle.clone())
+            .collect::<Vec<_>>();
+        if handles.is_empty() {
+            anyhow::bail!("No open Polymarket market shards for reconnect test");
+        }
+        for handle in &handles {
+            handle.reconnect_test().await?;
+        }
+        Ok(handles.len())
+    }
 }
 
 impl PoolInner {
@@ -805,6 +830,58 @@ mod tests {
             .expect("unsubscribe");
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reconnect_test_routes_to_every_open_shard() {
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        let handle = Handle::test_single_shard(first_tx, &[]);
+        {
+            let mut state = handle
+                .inner
+                .state
+                .lock()
+                .expect("pool state mutex poisoned");
+            state.shards.insert(
+                1,
+                ShardEntry {
+                    client: PolymarketWebSocketClient::new_market(
+                        None,
+                        false,
+                        TransportBackend::default(),
+                    ),
+                    handle: WsSubscriptionHandle::from_sender(second_tx),
+                    forwarder: None,
+                    owned: 0,
+                },
+            );
+        }
+
+        let first_responder = tokio::spawn(async move {
+            match first_rx.recv().await.expect("expected first ReconnectTest") {
+                HandlerCommand::ReconnectTest(response) => {
+                    response.send(Ok(())).expect("acknowledge reconnect test");
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+        let second_responder = tokio::spawn(async move {
+            match second_rx
+                .recv()
+                .await
+                .expect("expected second ReconnectTest")
+            {
+                HandlerCommand::ReconnectTest(response) => {
+                    response.send(Ok(())).expect("acknowledge reconnect test");
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+        assert_eq!(handle.reconnect_test().await.unwrap(), 2);
+        first_responder.await.expect("join first responder");
+        second_responder.await.expect("join second responder");
     }
 
     #[rstest]

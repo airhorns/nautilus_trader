@@ -276,6 +276,30 @@ impl PolymarketDataClient {
         self.tasks.push(handle);
     }
 
+    fn spawn_reconnect_test_task(&mut self) {
+        let Some(delay_secs) = self.config.reconnect_test_after_secs else {
+            return;
+        };
+        let cancellation = self.cancellation_token.clone();
+        let ws = self.ws_client.handle();
+        let handle = get_runtime().spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {
+                    match ws.reconnect_test().await {
+                        Ok(shards) => log::warn!(
+                            "Injected configured Polymarket reconnect test across {shards} shard(s)"
+                        ),
+                        Err(error) => log::error!(
+                            "Failed to inject configured Polymarket reconnect test: {error:#}"
+                        ),
+                    }
+                }
+                () = cancellation.cancelled() => {}
+            }
+        });
+        self.tasks.push(handle);
+    }
+
     pub(super) async fn await_tasks_with_timeout(&mut self, timeout: tokio::time::Duration) {
         for handle in self.tasks.drain(..) {
             let _ = tokio::time::timeout(timeout, handle).await;
@@ -381,6 +405,7 @@ impl PolymarketDataClient {
         self.spawn_message_handler(rx);
         self.spawn_instrument_refresh_task();
         self.spawn_resolve_poll_task();
+        self.spawn_reconnect_test_task();
 
         // Connect unconditionally: this clears the feed's closing latch from a prior
         // disconnect; without retained subscriptions no RTDS socket is opened.

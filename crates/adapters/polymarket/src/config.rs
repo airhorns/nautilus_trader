@@ -335,6 +335,12 @@ pub struct PolymarketDataClientConfig {
     /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Optional one-shot market WebSocket reconnect exercise delay in seconds.
+    ///
+    /// This test-only control is disabled by default. When configured, the data client sends a
+    /// close frame without stopping the node so the normal transport reconnect and subscription
+    /// replay path can be exercised against a live venue.
+    pub reconnect_test_after_secs: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -361,6 +367,7 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketDataClientConfig {
     resolve_poll_max_wait_secs: u64,
     base_url_rtds: Option<String>,
     transport_backend: TransportBackend,
+    reconnect_test_after_secs: Option<u64>,
     drop_quotes_missing_side: bool,
 });
 
@@ -423,6 +430,7 @@ impl Debug for PolymarketDataClientConfig {
             .field("filters", &self.filters)
             .field("new_market_filter", &self.new_market_filter)
             .field("transport_backend", &self.transport_backend)
+            .field("reconnect_test_after_secs", &self.reconnect_test_after_secs)
             .finish()
     }
 }

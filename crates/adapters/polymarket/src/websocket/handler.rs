@@ -51,6 +51,8 @@ pub enum HandlerCommand {
     UnsubscribeMarket(Vec<String>),
     /// Send the authenticated subscribe message on the user channel.
     SubscribeUser,
+    /// Send a close frame while leaving the handler live so the transport reconnects normally.
+    ReconnectTest(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 pub(super) struct FeedHandler {
@@ -326,6 +328,17 @@ impl FeedHandler {
                             self.user_subscribed = true;
                             self.send_subscribe_user().await;
                         }
+                        HandlerCommand::ReconnectTest(response) => {
+                            log::warn!("Executing configured Polymarket WebSocket reconnect test");
+                            let result = match self.client.as_ref() {
+                                Some(client) => client
+                                    .send_close_message()
+                                    .await
+                                    .map_err(|error| error.to_string()),
+                                None => Err("WebSocket client is not initialized".to_string()),
+                            };
+                            let _ = response.send(result);
+                        }
                     }
                 }
                 Some(raw) = self.raw_rx.recv() => {
@@ -484,10 +497,7 @@ mod tests {
     #[case(WsChannel::Market, "PONG")]
     #[case(WsChannel::Market, "NO NEW ASSETS")]
     #[case(WsChannel::User, "PONG")]
-    fn test_parse_control_text_is_not_market_data(
-        #[case] channel: WsChannel,
-        #[case] text: &str,
-    ) {
+    fn test_parse_control_text_is_not_market_data(#[case] channel: WsChannel, #[case] text: &str) {
         assert!(feed_handler(channel).parse_messages(text).is_empty());
     }
 

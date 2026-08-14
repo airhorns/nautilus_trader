@@ -344,6 +344,9 @@ fn extract_data_config_from_pyobject(
         Some(value) => value.extract::<TransportBackend>()?,
         None => default.transport_backend,
     };
+    let reconnect_test_after_secs = getattr_optional(obj, "reconnect_test_after_secs")?
+        .map(|value| value.extract::<u64>())
+        .transpose()?;
     let config = PolymarketDataClientConfig {
         instrument_config,
         base_url_http,
@@ -371,6 +374,7 @@ fn extract_data_config_from_pyobject(
         filters: Vec::new(),
         new_market_filter: None,
         transport_backend,
+        reconnect_test_after_secs,
     };
     validate_data_config(&config)?;
     Ok(config)
