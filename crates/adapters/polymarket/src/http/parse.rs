@@ -15,6 +15,7 @@
 
 //! Instrument parsing for Polymarket markets.
 
+use jiff::Timestamp;
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     enums::{AssetClass, CurrencyType},
@@ -71,10 +72,13 @@ pub struct PolymarketInstrumentDef {
     pub end_date: Option<String>,
     /// Whether the market is active and accepting orders.
     pub active: bool,
+    /// Whether Gamma reports the market closed.
+    #[serde(default)]
+    pub closed: bool,
     /// URL slug for the market.
     pub market_slug: Option<String>,
     /// Whether the market uses the neg-risk CTF exchange contract.
-    pub neg_risk: bool,
+    pub neg_risk: Option<bool>,
     /// Fee schedule for this market.
     pub fee_schedule: Option<FeeSchedule>,
     /// Game ID for sport markets.
@@ -124,22 +128,15 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
     // Only takers pay; makers are always zero.
     // Reference: https://docs.polymarket.com/trading/fees
     let maker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|_| Decimal::ZERO);
-    let taker_fee: Option<Decimal> = market
-        .fee_schedule
-        .as_ref()
-        .and_then(|fs| Decimal::try_from(fs.rate).ok());
+    let taker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|fs| fs.rate);
 
-    let min_size: Option<Decimal> = market
-        .order_min_size
-        .map(|s| s.to_string().parse())
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("Failed to parse min size: {e}"))?;
+    let min_size = market.order_min_size;
 
     let active = market.active.unwrap_or(false)
         && !market.closed.unwrap_or(false)
         && market.accepting_orders.unwrap_or(false);
 
-    let neg_risk = market.neg_risk.unwrap_or(false);
+    let neg_risk = market.neg_risk;
 
     let mut defs = Vec::with_capacity(2);
 
@@ -165,6 +162,7 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             start_date: market.start_date.clone(),
             end_date: market.end_date.clone(),
             active,
+            closed: market.closed.unwrap_or(false),
             market_slug: market.market_slug.clone(),
             neg_risk,
             fee_schedule: market.fee_schedule.clone(),
@@ -349,10 +347,16 @@ fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
         );
     }
 
-    map.insert(
-        "neg_risk".to_string(),
-        serde_json::Value::Bool(def.neg_risk),
-    );
+    if let Some(neg_risk) = def.neg_risk {
+        map.insert("neg_risk".to_string(), serde_json::Value::Bool(neg_risk));
+    }
+
+    if let Some(min_size) = def.min_size {
+        map.insert(
+            "min_order_size".to_string(),
+            serde_json::Value::String(min_size.to_string()),
+        );
+    }
 
     if let Some(fee_schedule) = &def.fee_schedule
         && let Ok(value) = serde_json::to_value(fee_schedule)
@@ -378,10 +382,10 @@ fn get_currency(code: &str) -> Currency {
 }
 
 fn parse_datetime_to_nanos(s: &str) -> Option<UnixNanos> {
-    chrono::DateTime::parse_from_rfc3339(s)
+    s.parse::<Timestamp>()
         .ok()
-        .and_then(|dt| dt.timestamp_nanos_opt())
-        .map(|ns| UnixNanos::from(ns as u64))
+        .and_then(|dt| u64::try_from(dt.as_nanosecond()).ok())
+        .map(UnixNanos::from)
 }
 
 #[cfg(test)]
@@ -632,7 +636,52 @@ mod tests {
             Some("btc-updown-5m-1773307200")
         );
         assert_eq!(info.get_u64("game_id"), None);
+        assert_eq!(info.get_str("min_order_size"), Some("5"));
+        assert_eq!(info.get_bool("neg_risk"), Some(false));
         assert_eq!(info.get("fee_schedule"), None);
+    }
+
+    #[rstest]
+    fn test_create_instrument_info_omits_missing_neg_risk() {
+        let mut market = load_gamma_market("gamma_market.json");
+        market.neg_risk = None;
+        let defs = parse_gamma_market(&market).unwrap();
+
+        let instrument =
+            create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap();
+        let InstrumentAny::BinaryOption(binary) = instrument else {
+            panic!("Expected BinaryOption");
+        };
+        let info = binary.info.as_ref().expect("info should be Some");
+
+        assert_eq!(info.get_bool("neg_risk"), None);
+    }
+
+    #[rstest]
+    fn test_past_end_market_carries_closure_state_on_the_definition_only() {
+        let mut market = load_gamma_market("gamma_market_past_end_date_open.json");
+        let defs = parse_gamma_market(&market).unwrap();
+
+        assert!(!defs[0].closed);
+
+        market.closed = Some(true);
+        let closed_defs = parse_gamma_market(&market).unwrap();
+
+        assert!(closed_defs[0].closed);
+
+        // `create_instrument_from_def` is shared with the historical loader, which keeps terminal
+        // state in `resolution_metadata`. Closure is stamped on the live Gamma path instead.
+        for def in [&defs[0], &closed_defs[0]] {
+            let instrument =
+                create_instrument_from_def(def, UnixNanos::from(1_000_000_000u64)).unwrap();
+            let binary = match &instrument {
+                InstrumentAny::BinaryOption(binary) => binary,
+                other => panic!("Expected BinaryOption, was {other:?}"),
+            };
+            let info = binary.info.as_ref().expect("info should be present");
+
+            assert_eq!(info.get_bool("closed"), None);
+        }
     }
 
     #[rstest]

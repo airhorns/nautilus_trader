@@ -544,6 +544,16 @@ impl OrderFillTrackerMap {
             .insert(venue_order_id, new_order_state(submitted_qty, order_side));
     }
 
+    /// Returns the registered submitted quantity for an order, if tracked.
+    pub(crate) fn submitted_qty(&self, venue_order_id: &VenueOrderId) -> Option<Quantity> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .orders
+            .get(venue_order_id)
+            .map(|s| s.submitted_qty)
+    }
+
     /// Records a fill against a registered order, for tests that drive fill accumulation directly.
     pub(crate) fn record_fill(&self, venue_order_id: &VenueOrderId, qty: Quantity) {
         record_fill_in(
@@ -663,6 +673,7 @@ mod tests {
         types::{Currency, Money, Price},
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -879,7 +890,7 @@ mod tests {
         );
 
         let make_report =
-            |venue_order_id: VenueOrderId, last_qty: f64, commission: f64| FillReport {
+            |venue_order_id: VenueOrderId, last_qty: f64, commission: Decimal| FillReport {
                 account_id: AccountId::from("POLY-001"),
                 instrument_id: InstrumentId::from("TEST.POLYMARKET"),
                 venue_order_id,
@@ -887,7 +898,7 @@ mod tests {
                 order_side: OrderSide::Buy,
                 last_qty: Quantity::new(last_qty, 6),
                 last_px: Price::new(0.55, 2),
-                commission: Money::new(commission, pusd()),
+                commission: Money::from_decimal(commission, pusd()).unwrap(),
                 liquidity_side: LiquiditySide::Taker,
                 avg_px: None,
                 report_id: UUID4::new(),
@@ -900,17 +911,17 @@ mod tests {
         // Known order: 4-ulp overfill, within band, last_qty must snap down.
         // Unknown order: tracker has no entry, reports pass through unchanged.
         let mut reports = vec![
-            make_report(known_id, 714.285714, 1.234),
-            make_report(unknown_id, 999.0, 5.678),
+            make_report(known_id, 714.285714, dec!(1.234)),
+            make_report(unknown_id, 999.0, dec!(5.678)),
         ];
 
         tracker.snap_fill_reports(&mut reports);
 
         assert_eq!(reports[0].last_qty, Quantity::new(714.285710, 6));
         // Commission untouched even though qty was snapped: it tracks venue truth.
-        assert_eq!(reports[0].commission, Money::new(1.234, pusd()));
+        assert_eq!(reports[0].commission.as_decimal(), dec!(1.234));
         assert_eq!(reports[1].last_qty, Quantity::new(999.0, 6));
-        assert_eq!(reports[1].commission, Money::new(5.678, pusd()));
+        assert_eq!(reports[1].commission.as_decimal(), dec!(5.678));
     }
 
     #[rstest]

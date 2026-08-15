@@ -37,14 +37,14 @@ use nautilus_core::{
 };
 use nautilus_execution::{
     matching_core::RestingOrder,
-    matching_engine::{config::OrderMatchingEngineConfig, engine::OrderMatchingEngine},
+    matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelAny},
     data::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
-        OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
     },
     enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
@@ -490,54 +490,57 @@ impl SimulatedExchange {
     }
 
     /// Returns all open orders, optionally filtered by instrument ID.
+    ///
+    /// An instrument ID with no matching engine returns no orders.
     #[must_use]
     pub fn get_open_orders(&self, instrument_id: Option<InstrumentId>) -> Vec<RestingOrder> {
-        instrument_id
-            .and_then(|id| {
-                self.matching_engines
-                    .get(&id)
-                    .map(OrderMatchingEngine::get_open_orders)
-            })
-            .unwrap_or_else(|| {
-                self.matching_engines
-                    .values()
-                    .flat_map(OrderMatchingEngine::get_open_orders)
-                    .collect()
-            })
+        match instrument_id {
+            Some(id) => self
+                .matching_engines
+                .get(&id)
+                .map_or_else(Vec::new, OrderMatchingEngine::get_open_orders),
+            None => self
+                .matching_engines
+                .values()
+                .flat_map(OrderMatchingEngine::get_open_orders)
+                .collect(),
+        }
     }
 
     /// Returns all open bid orders, optionally filtered by instrument ID.
+    ///
+    /// An instrument ID with no matching engine returns no orders.
     #[must_use]
     pub fn get_open_bid_orders(&self, instrument_id: Option<InstrumentId>) -> Vec<RestingOrder> {
-        instrument_id
-            .and_then(|id| {
-                self.matching_engines
-                    .get(&id)
-                    .map(OrderMatchingEngine::get_open_bid_orders)
-            })
-            .unwrap_or_else(|| {
-                self.matching_engines
-                    .values()
-                    .flat_map(OrderMatchingEngine::get_open_bid_orders)
-                    .collect()
-            })
+        match instrument_id {
+            Some(id) => self
+                .matching_engines
+                .get(&id)
+                .map_or_else(Vec::new, OrderMatchingEngine::get_open_bid_orders),
+            None => self
+                .matching_engines
+                .values()
+                .flat_map(OrderMatchingEngine::get_open_bid_orders)
+                .collect(),
+        }
     }
 
     /// Returns all open ask orders, optionally filtered by instrument ID.
+    ///
+    /// An instrument ID with no matching engine returns no orders.
     #[must_use]
     pub fn get_open_ask_orders(&self, instrument_id: Option<InstrumentId>) -> Vec<RestingOrder> {
-        instrument_id
-            .and_then(|id| {
-                self.matching_engines
-                    .get(&id)
-                    .map(OrderMatchingEngine::get_open_ask_orders)
-            })
-            .unwrap_or_else(|| {
-                self.matching_engines
-                    .values()
-                    .flat_map(OrderMatchingEngine::get_open_ask_orders)
-                    .collect()
-            })
+        match instrument_id {
+            Some(id) => self
+                .matching_engines
+                .get(&id)
+                .map_or_else(Vec::new, OrderMatchingEngine::get_open_ask_orders),
+            None => self
+                .matching_engines
+                .values()
+                .flat_map(OrderMatchingEngine::get_open_ask_orders)
+                .collect(),
+        }
     }
 
     /// Returns the account for this exchange, if an execution client is registered.
@@ -626,7 +629,7 @@ impl SimulatedExchange {
 
             if let Some((balances, margins, ts_event)) = account_state {
                 exec_client
-                    .generate_account_state(balances, margins, true, ts_event)
+                    .generate_account_state(balances, margins, true, ts_event, None)
                     .map_err(|e| AccountAdjustmentError::AccountStateGeneration(e.to_string()))?;
             }
         }
@@ -798,7 +801,7 @@ impl SimulatedExchange {
     /// Panics if adding a missing instrument during deltas processing fails.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
         for module in &self.modules {
-            module.pre_process(&Data::Deltas(OrderBookDeltas_API::new(deltas.clone())));
+            module.pre_process(&Data::Deltas(Box::new(deltas.clone())));
         }
 
         if !self.matching_engines.contains_key(&deltas.instrument_id) {
@@ -1056,7 +1059,7 @@ impl SimulatedExchange {
 
     fn queue_funding_rate(&mut self, funding_rate: FundingRateUpdate) -> Option<UnixNanos> {
         for module in &self.modules {
-            module.pre_process(&Data::FundingRateUpdate(funding_rate));
+            module.pre_process(&Data::FundingRate(funding_rate));
         }
 
         let Some(boundary) = Self::funding_boundary(&funding_rate) else {
@@ -1821,7 +1824,7 @@ impl SimulatedExchange {
         if let Some(exec_client) = &self.exec_client {
             let ts_event = self.clock.borrow().timestamp_ns();
             exec_client
-                .generate_account_state(balances, vec![], true, ts_event)
+                .generate_account_state(balances, vec![], true, ts_event, None)
                 .unwrap();
         }
 
@@ -1844,7 +1847,7 @@ impl SimulatedExchange {
                 AccountAny::Cash(cash_account) => {
                     cash_account.allow_borrowing = self.allow_cash_borrowing;
                 }
-                AccountAny::Betting(_) => {}
+                AccountAny::Betting(_) | AccountAny::Wallet(_) => {}
             }
 
             self.cache.borrow_mut().update_account(&account).unwrap();

@@ -42,7 +42,7 @@ use nautilus_model::{
     data::{
         Bar, CustomData, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentClose,
         InstrumentStatus, MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDeltas,
-        OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDepth10, QuoteTick, TradeTick,
     },
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{
@@ -82,7 +82,7 @@ use crate::{
 /// Exposes the backtest engine to Python as `BacktestEngine`.
 /// Uses `unsendable` because the inner engine holds `Rc<RefCell<...>>`.
 #[pyo3::pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.backtest",
+    module = "nautilus_trader.backtest",
     name = "BacktestEngine",
     unsendable
 )]
@@ -1048,7 +1048,7 @@ impl PyBacktestEngine {
 
         let trader_id = self.0.kernel().config.trader_id();
         let cache = self.0.kernel().cache.clone();
-        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let component_id = ComponentId::from(actor_id);
         let clock = self
             .0
             .kernel_mut()
@@ -1178,7 +1178,7 @@ impl PyBacktestEngine {
 
         let trader_id = self.0.kernel().config.trader_id();
         let cache = self.0.kernel().cache.clone();
-        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let component_id = ComponentId::from(actor_id);
         let clock = self
             .0
             .kernel_mut()
@@ -1714,7 +1714,7 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
     }
 
     if let Ok(deltas) = obj.extract::<OrderBookDeltas>() {
-        return Ok(Data::Deltas(OrderBookDeltas_API::new(deltas)));
+        return Ok(Data::Deltas(Box::new(deltas)));
     }
 
     if let Ok(quote) = obj.extract::<QuoteTick>() {
@@ -1734,15 +1734,15 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
     }
 
     if let Ok(mark) = obj.extract::<MarkPriceUpdate>() {
-        return Ok(Data::MarkPriceUpdate(mark));
+        return Ok(Data::MarkPrice(mark));
     }
 
     if let Ok(index) = obj.extract::<IndexPriceUpdate>() {
-        return Ok(Data::IndexPriceUpdate(index));
+        return Ok(Data::IndexPrice(index));
     }
 
     if let Ok(funding_rate) = obj.extract::<FundingRateUpdate>() {
-        return Ok(Data::FundingRateUpdate(funding_rate));
+        return Ok(Data::FundingRate(funding_rate));
     }
 
     if let Ok(greeks) = obj.extract::<OptionGreeks>() {
@@ -1764,47 +1764,6 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
     #[cfg(feature = "defi")]
     if let Ok(defi) = obj.extract::<DefiData>() {
         return Ok(Data::Defi(Box::new(defi)));
-    }
-
-    // Fall back to from_pyobject methods for Cython objects
-    if let Ok(delta) = OrderBookDelta::from_pyobject(obj) {
-        return Ok(Data::Delta(delta));
-    }
-
-    if let Ok(quote) = QuoteTick::from_pyobject(obj) {
-        return Ok(Data::Quote(quote));
-    }
-
-    if let Ok(trade) = TradeTick::from_pyobject(obj) {
-        return Ok(Data::Trade(trade));
-    }
-
-    if let Ok(bar) = Bar::from_pyobject(obj) {
-        return Ok(Data::Bar(bar));
-    }
-
-    if let Ok(mark) = MarkPriceUpdate::from_pyobject(obj) {
-        return Ok(Data::MarkPriceUpdate(mark));
-    }
-
-    if let Ok(index) = IndexPriceUpdate::from_pyobject(obj) {
-        return Ok(Data::IndexPriceUpdate(index));
-    }
-
-    if let Ok(funding_rate) = FundingRateUpdate::from_pyobject(obj) {
-        return Ok(Data::FundingRateUpdate(funding_rate));
-    }
-
-    if let Ok(greeks) = OptionGreeks::from_pyobject(obj) {
-        return Ok(Data::OptionGreeks(greeks));
-    }
-
-    if let Ok(status) = InstrumentStatus::from_pyobject(obj) {
-        return Ok(Data::InstrumentStatus(status));
-    }
-
-    if let Ok(close) = InstrumentClose::from_pyobject(obj) {
-        return Ok(Data::InstrumentClose(close));
     }
 
     let type_name = obj.get_type().name()?;
@@ -1843,6 +1802,39 @@ mod model_tests {
             };
             assert_eq!(converted.data_type.type_name(), "StubCustomData");
             assert_eq!(converted.data.ts_init().as_u64(), 2);
+        });
+    }
+
+    #[rstest]
+    fn test_pyobject_to_data_rejects_duck_typed_object() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            // Mirrors the attribute shape the removed Cython `from_pyobject` path accepted
+            let obj = py
+                .eval(
+                    c_str!(
+                        "type('FakeQuote', (), {\
+                            'instrument_id': type('I', (), {'value': 'AUD/USD.SIM'})(), \
+                            'bid_price': type('P', (), {'raw': 1, 'precision': 5})(), \
+                            'ask_price': type('P', (), {'raw': 1, 'precision': 5})(), \
+                            'bid_size': type('Q', (), {'raw': 1, 'precision': 0})(), \
+                            'ask_size': type('Q', (), {'raw': 1, 'precision': 0})(), \
+                            'ts_event': 0, \
+                            'ts_init': 0\
+                        })()"
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let err = super::pyobject_to_data(py, &obj).unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "TypeError: Cannot convert FakeQuote to Data"
+            );
         });
     }
 

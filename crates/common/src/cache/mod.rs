@@ -34,6 +34,7 @@ mod tests;
 use std::{
     borrow::Cow,
     cell::{Ref, RefCell},
+    cmp::Reverse,
     fmt::{Debug, Display},
     rc::Rc,
     time::{SystemTime, UNIX_EPOCH},
@@ -75,8 +76,8 @@ use nautilus_model::{
     },
     events::{AccountState, OrderEventAny},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
+        PositionId, StrategyId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::{
@@ -370,16 +371,6 @@ impl<'a> CacheApi<'a> {
     ) -> AHashSet<PositionId> {
         self.cache()
             .position_closed_ids(venue, instrument_id, strategy_id, account_id)
-    }
-
-    /// Returns the actor IDs in the cache.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cache is already mutably borrowed.
-    #[must_use]
-    pub fn actor_ids(&self) -> AHashSet<ComponentId> {
-        self.cache().actor_ids()
     }
 
     /// Returns the strategy IDs in the cache.
@@ -2170,7 +2161,7 @@ where
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.common", unsendable)
 )]
 pub struct Cache {
     config: CacheConfig,
@@ -2356,7 +2347,8 @@ impl Cache {
             .collect();
 
         if let Some(db) = &self.database {
-            self.index.order_position = db.load_index_order_position()?;
+            let order_position = db.load_index_order_position()?;
+            self.index.order_position = self.sanitize_order_position_index(order_position);
             self.index.order_client = db.load_index_order_client()?;
         }
 
@@ -2453,7 +2445,8 @@ impl Cache {
         };
 
         if let Some(db) = &self.database {
-            self.index.order_position = db.load_index_order_position()?;
+            let order_position = db.load_index_order_position()?;
+            self.index.order_position = self.sanitize_order_position_index(order_position);
             self.index.order_client = db.load_index_order_client()?;
         }
 
@@ -2461,6 +2454,23 @@ impl Cache {
 
         self.assign_position_ids_to_contingencies();
         Ok(())
+    }
+
+    fn sanitize_order_position_index(
+        &self,
+        mut order_position: AHashMap<ClientOrderId, PositionId>,
+    ) -> AHashMap<ClientOrderId, PositionId> {
+        let original_len = order_position.len();
+        order_position.retain(|client_order_id, _| self.orders.contains_key(client_order_id));
+        let removed = original_len - order_position.len();
+
+        if removed > 0 {
+            log::warn!(
+                "Filtered {removed} stale order-position index entries without backing orders during cache load"
+            );
+        }
+
+        order_position
     }
 
     /// Clears and reloads the position cache from the database.
@@ -2653,11 +2663,13 @@ impl Cache {
                 .insert(*position_id, position.strategy_id);
 
             // 3: Build index.position_orders -> {PositionId, {ClientOrderId}}
-            self.index
-                .position_orders
-                .entry(*position_id)
-                .or_default()
-                .extend(position.client_order_ids());
+            let position_orders = self.index.position_orders.entry(*position_id).or_default();
+            position_orders.extend(
+                position
+                    .client_order_ids()
+                    .into_iter()
+                    .filter(|client_order_id| self.orders.contains_key(client_order_id)),
+            );
 
             // 4: Build index.instrument_positions -> {InstrumentId, {PositionId}}
             self.index
@@ -2665,6 +2677,10 @@ impl Cache {
                 .entry(instrument_id)
                 .or_default()
                 .insert(*position_id);
+            self.index
+                .instrument_orders
+                .entry(instrument_id)
+                .or_default();
 
             // 5: Build index.strategy_positions -> {StrategyId, {PositionId}}
             self.index
@@ -2672,6 +2688,7 @@ impl Cache {
                 .entry(strategy_id)
                 .or_default()
                 .insert(*position_id);
+            self.index.strategy_orders.entry(strategy_id).or_default();
 
             // 6: Build index.account_positions -> {AccountId, {PositionId}}
             self.index
@@ -2749,11 +2766,11 @@ impl Cache {
     /// Returns an error if loading actor state fails.
     pub fn load_actor_state(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_actor(component_id))
+            .map(|database| database.load_actor(actor_id))
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }
@@ -2783,11 +2800,11 @@ impl Cache {
     /// Returns an error if updating actor state fails.
     pub fn update_actor_state(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
         state: &IndexMap<String, Vec<u8>>,
     ) -> anyhow::Result<()> {
         if let Some(database) = &self.database {
-            database.update_actor(component_id, &Self::encode_component_state(state))?;
+            database.update_actor(actor_id, &Self::encode_component_state(state))?;
         }
         Ok(())
     }
@@ -3885,6 +3902,7 @@ impl Cache {
         self.position_snapshots.clear();
         self.position_snapshot_revisions.clear();
         self.greeks.clear();
+        self.option_greeks.clear();
         self.yield_curves.clear();
 
         if self.config.drop_instruments_on_reset {
@@ -4641,17 +4659,29 @@ impl Cache {
             database.index_order_position(*client_order_id, *position_id)?;
         }
 
-        // Index: PositionId -> StrategyId
-        self.index
-            .position_strategy
-            .insert(*position_id, *strategy_id);
-
-        // Index: PositionId -> set[ClientOrderId]
+        self.index_position(position_id, venue, strategy_id);
         self.index
             .position_orders
             .entry(*position_id)
             .or_default()
             .insert(*client_order_id);
+
+        Ok(())
+    }
+
+    fn index_position(
+        &mut self,
+        position_id: &PositionId,
+        venue: &Venue,
+        strategy_id: &StrategyId,
+    ) {
+        // Index: PositionId -> StrategyId
+        self.index
+            .position_strategy
+            .insert(*position_id, *strategy_id);
+
+        // Every position has a reverse-order bucket, including orderless positions.
+        self.index.position_orders.entry(*position_id).or_default();
 
         // Index: StrategyId -> set[PositionId]
         self.index
@@ -4666,8 +4696,6 @@ impl Cache {
             .entry(*venue)
             .or_default()
             .insert(*position_id);
-
-        Ok(())
     }
 
     // Propagates parent OTO `position_id` to contingent children that are missing one.
@@ -4676,8 +4704,7 @@ impl Cache {
     // execution engine assigns `position_id` to each contingent child in a non-atomic loop
     // (`set_position_id` then `add_position_id`), so a crash mid-loop can leave the database
     // with the parent updated and some children un-updated. This pass re-applies any missing
-    // assignments after load. Mirrors the Cython behaviour at
-    // `nautilus_trader/cache/cache.pyx::_assign_position_id_to_contingencies`.
+    // assignments after load.
     fn assign_position_ids_to_contingencies(&mut self) {
         let mut assignments: Vec<(PositionId, ClientOrderId)> = Vec::new();
 
@@ -4732,21 +4759,56 @@ impl Cache {
     ///
     /// Returns an error if persisting the position to the backing database fails.
     pub fn add_position(&mut self, position: &Position, oms_type: OmsType) -> anyhow::Result<()> {
+        self.add_position_inner(position, oms_type, true)
+    }
+
+    /// Adds a position whose opening fill intentionally has no backing order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the position to the backing database fails.
+    pub fn add_position_without_order(
+        &mut self,
+        position: &Position,
+        oms_type: OmsType,
+    ) -> anyhow::Result<()> {
+        self.add_position_inner(position, oms_type, false)
+    }
+
+    fn add_position_inner(
+        &mut self,
+        position: &Position,
+        oms_type: OmsType,
+        index_order: bool,
+    ) -> anyhow::Result<()> {
         self.positions
             .insert(position.id, SharedCell::new(position.clone()));
         self.index.position_oms.insert(position.id, oms_type);
         self.index.positions.insert(position.id);
         self.index.positions_open.insert(position.id);
         self.index.positions_closed.remove(&position.id); // Cleanup for NETTING reopen
+        self.index.strategies.insert(position.strategy_id);
+        self.index
+            .strategy_orders
+            .entry(position.strategy_id)
+            .or_default();
 
         log::debug!("Adding {position}");
 
-        self.add_position_id(
-            &position.id,
-            &position.instrument_id.venue,
-            &position.opening_order_id,
-            &position.strategy_id,
-        )?;
+        if index_order {
+            self.add_position_id(
+                &position.id,
+                &position.instrument_id.venue,
+                &position.opening_order_id,
+                &position.strategy_id,
+            )?;
+        } else {
+            self.index_position(
+                &position.id,
+                &position.instrument_id.venue,
+                &position.strategy_id,
+            );
+        }
 
         let venue = position.instrument_id.venue;
         let venue_positions = self.index.venue_positions.entry(venue).or_default();
@@ -4760,6 +4822,10 @@ impl Cache {
             .entry(instrument_id)
             .or_default();
         instrument_positions.insert(position.id);
+        self.index
+            .instrument_orders
+            .entry(instrument_id)
+            .or_default();
 
         // Index: AccountId -> AHashSet<PositionId>
         self.index
@@ -4811,29 +4877,31 @@ impl Cache {
         Ok(())
     }
 
-    /// Removes the `account` from the cache and returns it.
+    /// Returns an owned `account`, removing its cache entry when ownership is exclusive.
     ///
     /// This supports hot paths which need owned account mutation without
     /// cloning the account event history. The cache is the sole owner of the
     /// account cell (the field is private and accessors only hand out
-    /// lifetime-scoped [`AccountRef`] borrows), so the value is moved out of
-    /// its cell rather than cloned.
+    /// lifetime-scoped [`AccountRef`] borrows). When the cache is the sole owner, the value is
+    /// moved out of its cell rather than cloned.
     ///
-    /// # Panics
-    ///
-    /// Panics if the cache no longer holds the only strong handle to the
-    /// account cell. This indicates an internal invariant violation: some
-    /// component cloned the underlying [`SharedCell`] and held it past the
-    /// scope of a single cache method.
+    /// If another strong handle exists, the canonical entry remains cached and this returns
+    /// `None`.
     #[must_use]
     pub fn take_account(&mut self, account_id: &AccountId) -> Option<AccountAny> {
-        self.accounts.remove(account_id).map(|cell| {
-            let rc: Rc<RefCell<AccountAny>> = cell.into();
-            Rc::try_unwrap(rc).map_or_else(
-                |_| panic!("take_account: cache must be sole owner of {account_id} cell"),
-                RefCell::into_inner,
-            )
-        })
+        let cell = self.accounts.remove(account_id)?;
+        let rc: Rc<RefCell<AccountAny>> = cell.into();
+
+        match Rc::try_unwrap(rc) {
+            Ok(cell) => Some(cell.into_inner()),
+            Err(rc) => {
+                log::error!(
+                    "Cannot move account {account_id} out of cache: account cell has an outstanding owner"
+                );
+                self.accounts.insert(*account_id, rc.into());
+                None
+            }
+        }
     }
 
     /// Caches the `account` in memory without updating the database.
@@ -6057,12 +6125,6 @@ impl Cache {
             strategy_id,
             account_id,
         )
-    }
-
-    /// Returns the `ComponentId`s of all actors.
-    #[must_use]
-    pub fn actor_ids(&self) -> AHashSet<ComponentId> {
-        self.index.actors.clone()
     }
 
     /// Returns the `StrategyId`s of all strategies.
@@ -7629,11 +7691,21 @@ impl Cache {
     ) -> (AHashMap<Ustr, Decimal>, AHashMap<Ustr, Decimal>) {
         let mut bid_quotes = AHashMap::new();
         let mut ask_quotes = AHashMap::new();
+        let mut quote_sources = AHashMap::new();
 
-        for instrument_id in self.instruments.keys() {
+        for (instrument_id, instrument) in &self.instruments {
             if instrument_id.venue != *venue {
                 continue;
             }
+
+            let Some(base_currency) = instrument.base_currency() else {
+                continue;
+            };
+            let pair = Ustr::from(&format!(
+                "{}/{}",
+                base_currency.code,
+                instrument.quote_currency().code
+            ));
 
             let (bid_price, ask_price) = if let Some(ticks) = self.quotes.get(instrument_id) {
                 if let Some(tick) = ticks.front() {
@@ -7676,8 +7748,22 @@ impl Cache {
                 }
             };
 
-            bid_quotes.insert(instrument_id.symbol.inner(), bid_price.as_decimal());
-            ask_quotes.insert(instrument_id.symbol.inner(), ask_price.as_decimal());
+            let preference = (
+                bid_price.is_positive() && ask_price.is_positive(),
+                instrument.instrument_class() == InstrumentClass::Spot,
+                Reverse(*instrument_id),
+            );
+
+            if quote_sources
+                .get(&pair)
+                .is_some_and(|current| current >= &preference)
+            {
+                continue;
+            }
+
+            bid_quotes.insert(pair, bid_price.as_decimal());
+            ask_quotes.insert(pair, ask_price.as_decimal());
+            quote_sources.insert(pair, preference);
         }
 
         (bid_quotes, ask_quotes)
@@ -7917,15 +8003,19 @@ impl Cache {
             .map(|account_cell| AccountRefMut::new(account_cell.borrow_mut()))
     }
 
-    /// Gets an owned snapshot of the account with the `account_id` (if found).
+    /// Gets an owned snapshot of the account with the `account_id` when present and not mutably
+    /// borrowed.
     ///
     /// Use when downstream needs an owned [`AccountAny`] that crosses a boundary. The snapshot
     /// will not reflect later cache mutations.
     #[must_use]
     pub fn account_owned(&self, account_id: &AccountId) -> Option<AccountAny> {
-        self.accounts
-            .get(account_id)
-            .map(|account_cell| account_cell.borrow().clone())
+        self.accounts.get(account_id).and_then(|account_cell| {
+            account_cell
+                .try_borrow()
+                .ok()
+                .map(|account| account.clone())
+        })
     }
 
     /// Returns a borrow of the account for the `venue` (if found).

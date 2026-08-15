@@ -38,6 +38,13 @@ pub(crate) fn is_instrument_expired(instrument: &InstrumentAny, now_ns: UnixNano
     crate::filters::is_expired(instrument, now_ns)
 }
 
+pub(crate) fn is_instrument_expired_and_not_reported_open(
+    instrument: &InstrumentAny,
+    now_ns: UnixNanos,
+) -> bool {
+    crate::filters::is_expired_and_not_reported_open(instrument, now_ns)
+}
+
 pub(crate) fn seed_token_meta_from_live_instruments(
     now_ns: UnixNanos,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -46,17 +53,13 @@ pub(crate) fn seed_token_meta_from_live_instruments(
     let loaded = instruments.load();
 
     for instrument in loaded.values() {
-        if is_instrument_expired(instrument, now_ns) {
+        if is_instrument_expired_and_not_reported_open(instrument, now_ns) {
             continue;
         }
 
         token_meta.insert(
             Ustr::from(instrument.raw_symbol().as_str()),
-            TokenMeta {
-                instrument_id: instrument.id(),
-                price_precision: instrument.price_precision(),
-                size_precision: instrument.size_precision(),
-            },
+            TokenMeta::from_instrument(instrument),
         );
     }
 }
@@ -82,7 +85,6 @@ fn has_live_runtime_state(
     instrument_id: InstrumentId,
     token_id: Option<&str>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
-    order_books: &Arc<DashMap<InstrumentId, OrderBook>>,
     last_quotes: &Arc<DashMap<InstrumentId, QuoteTick>>,
     active_quote_subs: &Arc<AtomicSet<InstrumentId>>,
     active_delta_subs: &Arc<AtomicSet<InstrumentId>>,
@@ -95,7 +97,6 @@ fn has_live_runtime_state(
         || active_delta_subs.contains(&instrument_id)
         || active_trade_subs.contains(&instrument_id)
         || pending_snapshot_after_tick_change.contains(&instrument_id)
-        || order_books.contains_key(&instrument_id)
         || last_quotes.contains_key(&instrument_id)
     {
         return true;
@@ -202,7 +203,7 @@ pub(crate) async fn retire_expired_local_instruments(
         loaded
             .iter()
             .filter_map(|(instrument_id, instrument)| {
-                is_instrument_expired(instrument, now_ns)
+                is_instrument_expired_and_not_reported_open(instrument, now_ns)
                     .then_some((*instrument_id, instrument.raw_symbol().as_str().to_string()))
             })
             .collect()
@@ -217,7 +218,6 @@ pub(crate) async fn retire_expired_local_instruments(
                 instrument_id,
                 Some(token_id.as_str()),
                 token_meta,
-                order_books,
                 last_quotes,
                 active_quote_subs,
                 active_delta_subs,
@@ -231,6 +231,13 @@ pub(crate) async fn retire_expired_local_instruments(
         }
 
         expired_ids.push(instrument_id);
+    }
+
+    if !expired_ids.is_empty() {
+        log::info!(
+            "Removing live state for {} closed Polymarket instrument(s)",
+            expired_ids.len()
+        );
     }
 
     for instrument_id in expired_ids {
@@ -308,11 +315,7 @@ mod tests {
     ) {
         token_meta.insert(
             Ustr::from(instrument.raw_symbol().as_str()),
-            TokenMeta {
-                instrument_id: instrument.id(),
-                price_precision: instrument.price_precision(),
-                size_precision: instrument.size_precision(),
-            },
+            TokenMeta::from_instrument(instrument),
         );
         instruments.insert(instrument.id(), instrument.clone());
     }
@@ -356,6 +359,49 @@ mod tests {
                 UnixNanos::default(),
             ),
         );
+    }
+
+    #[rstest]
+    fn active_delta_subscription_is_live_without_other_runtime_state() {
+        let instrument_id = InstrumentId::from("0xCOND-0xTOKEN.POLYMARKET");
+        let token_meta = Arc::new(DashMap::new());
+        let last_quotes = Arc::new(DashMap::new());
+        let active_quote_subs = Arc::new(AtomicSet::new());
+        let active_delta_subs = Arc::new(AtomicSet::new());
+        let active_trade_subs = Arc::new(AtomicSet::new());
+        let pending_snapshot_after_tick_change = Arc::new(AtomicSet::new());
+        let pending_auto_loads = Arc::new(StdMutex::new(AHashSet::new()));
+        let ws_open_tokens = Arc::new(AtomicSet::new());
+
+        active_delta_subs.insert(instrument_id);
+
+        assert!(has_live_runtime_state(
+            instrument_id,
+            None,
+            &token_meta,
+            &last_quotes,
+            &active_quote_subs,
+            &active_delta_subs,
+            &active_trade_subs,
+            &pending_snapshot_after_tick_change,
+            &pending_auto_loads,
+            &ws_open_tokens,
+        ));
+
+        active_delta_subs.remove(&instrument_id);
+
+        assert!(!has_live_runtime_state(
+            instrument_id,
+            None,
+            &token_meta,
+            &last_quotes,
+            &active_quote_subs,
+            &active_delta_subs,
+            &active_trade_subs,
+            &pending_snapshot_after_tick_change,
+            &pending_auto_loads,
+            &ws_open_tokens,
+        ));
     }
 
     #[rstest]

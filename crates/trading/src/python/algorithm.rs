@@ -17,11 +17,12 @@
 
 use std::{cell::UnsafeCell, collections::HashMap, fmt::Debug, rc::Rc};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_common::{
     actor::{DataActor, DataActorNative, data_actor::DataActorCore},
     component::Component,
     enums::ComponentState,
+    messages::system::{QueueStateChanged, SocketStateChanged},
     python::{cache::PyCache, clock::PyClock, logging::PyLogger},
     signal::Signal,
     timer::TimeEvent,
@@ -204,6 +205,24 @@ impl PyExecutionAlgorithm {
         if let Some(ref py_self) = self.inner().py_self {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_signal", (signal.clone().into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_queue_state(&self, event: &QueueStateChanged) -> PyResult<()> {
+        if let Some(ref py_self) = self.inner().py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_queue_state", (event.clone().into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_socket_state(&self, event: &SocketStateChanged) -> PyResult<()> {
+        if let Some(ref py_self) = self.inner().py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_socket_state", (event.clone().into_py_any(py)?,))
             })?;
         }
         Ok(())
@@ -550,6 +569,16 @@ impl DataActor for PyExecutionAlgorithm {
         self.dispatch_on_signal(signal)
             .map_err(|e| anyhow::anyhow!("Python on_signal failed: {e}"))
     }
+
+    fn on_queue_state(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+        self.dispatch_on_queue_state(event)
+            .map_err(|e| anyhow::anyhow!("Python on_queue_state failed: {e}"))
+    }
+
+    fn on_socket_state(&mut self, event: &SocketStateChanged) -> anyhow::Result<()> {
+        self.dispatch_on_socket_state(event)
+            .map_err(|e| anyhow::anyhow!("Python on_socket_state failed: {e}"))
+    }
 }
 
 #[pyo3::pymethods]
@@ -789,8 +818,10 @@ impl PyExecutionAlgorithm {
     }
 
     #[pyo3(name = "publish_data")]
-    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) {
+    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         DataActor::publish_data(self, data_type, data);
+        Ok(())
     }
 
     #[pyo3(name = "publish_signal")]
@@ -806,6 +837,7 @@ impl PyExecutionAlgorithm {
         value: Py<PyAny>,
         ts_event: u64,
     ) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         let value_str: String = value.bind(py).str()?.extract()?;
         DataActor::publish_signal(self, name, value_str, UnixNanos::from(ts_event));
         Ok(())
@@ -813,14 +845,48 @@ impl PyExecutionAlgorithm {
 
     #[pyo3(name = "subscribe_signal")]
     #[pyo3(signature = (name="", priority=None))]
-    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) {
+    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::subscribe_signal(self, name, priority);
+        Ok(())
+    }
+
+    #[pyo3(name = "subscribe_queue_state")]
+    #[pyo3(signature = (priority=None))]
+    fn py_subscribe_queue_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::subscribe_queue_state(self, priority);
+        Ok(())
+    }
+
+    #[pyo3(name = "subscribe_socket_state")]
+    #[pyo3(signature = (priority=None))]
+    fn py_subscribe_socket_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::subscribe_socket_state(self, priority);
+        Ok(())
     }
 
     #[pyo3(name = "unsubscribe_signal")]
     #[pyo3(signature = (name=""))]
-    fn py_unsubscribe_signal(&mut self, name: &str) {
+    fn py_unsubscribe_signal(&mut self, name: &str) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_signal(self, name);
+        Ok(())
+    }
+
+    #[pyo3(name = "unsubscribe_queue_state")]
+    fn py_unsubscribe_queue_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::unsubscribe_queue_state(self);
+        Ok(())
+    }
+
+    #[pyo3(name = "unsubscribe_socket_state")]
+    fn py_unsubscribe_socket_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::unsubscribe_socket_state(self);
+        Ok(())
     }
 
     #[pyo3(name = "on_start")]
@@ -851,6 +917,14 @@ impl PyExecutionAlgorithm {
     #[allow(unused_variables)]
     #[pyo3(name = "on_signal")]
     fn py_on_signal(&mut self, signal: &Signal) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_queue_state")]
+    fn py_on_queue_state(&mut self, event: QueueStateChanged) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_socket_state")]
+    fn py_on_socket_state(&mut self, event: SocketStateChanged) {}
 
     #[allow(clippy::needless_pass_by_value)]
     #[pyo3(name = "execute")]
@@ -923,7 +997,7 @@ impl PyExecutionAlgorithm {
         quantity: Quantity,
         price: Price,
         time_in_force: TimeInForce,
-        expire_time: Option<DateTime<Utc>>,
+        expire_time: Option<Timestamp>,
         post_only: bool,
         reduce_only: bool,
         display_qty: Option<Quantity>,
@@ -967,7 +1041,7 @@ impl PyExecutionAlgorithm {
         primary: Py<PyAny>,
         quantity: Quantity,
         time_in_force: TimeInForce,
-        expire_time: Option<DateTime<Utc>>,
+        expire_time: Option<Timestamp>,
         reduce_only: bool,
         display_qty: Option<Quantity>,
         emulation_trigger: Option<TriggerType>,
@@ -1192,6 +1266,26 @@ impl PyExecutionAlgorithm {
 
         Ok(has_id)
     }
+
+    fn ensure_registered_for_data(&self) -> PyResult<()> {
+        if self.inner().core.actor.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "ExecutionAlgorithm must be registered before publishing data",
+            ))
+        }
+    }
+
+    fn ensure_registered(&self) -> PyResult<()> {
+        if self.inner().core.actor.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "ExecutionAlgorithm must be registered before managing subscriptions",
+            ))
+        }
+    }
 }
 
 #[pyo3::pymethods]
@@ -1341,15 +1435,213 @@ fn py_dict_to_json(config: &Bound<'_, PyDict>) -> PyResult<HashMap<String, serde
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{
+        cache::Cache,
+        clock::{Clock, TestClock},
+        messages::system::{
+            QueueCondition, QueueState, QueueStateChanged, SocketState, SocketStateChanged,
+        },
+        msgbus::{
+            MessageBus, MessagingSwitchboard, get_message_bus, switchboard::get_signal_topic,
+        },
+        runner::SystemChannel,
+    };
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         enums::OrderType,
-        identifiers::{ClientOrderId, InstrumentId, OrderListId, StrategyId},
+        identifiers::{
+            ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
+        },
         orders::OrderTestBuilder,
     };
     use pyo3::ffi::c_str;
     use rstest::rstest;
+    use ustr::Ustr;
 
     use super::*;
+
+    fn sample_queue_state_changed() -> QueueStateChanged {
+        QueueStateChanged::new(
+            TraderId::from("TRADER-001"),
+            SystemChannel::ExecCommands,
+            QueueCondition::Backlogged,
+            QueueState::Triggered,
+            17,
+            23,
+            UUID4::from("00000000-0000-4000-8000-000000000001"),
+            UnixNanos::from(1_700_000_000_000_000_001),
+            UnixNanos::from(1_700_000_000_000_000_002),
+        )
+    }
+
+    fn sample_socket_state_changed() -> SocketStateChanged {
+        SocketStateChanged::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("BINANCE"),
+            Some(Venue::from("BINANCE")),
+            Ustr::from("binance-futures-market-streams"),
+            SocketState::Connected,
+            UUID4::from("00000000-0000-4000-8000-000000000001"),
+            UnixNanos::from(1_700_000_000_000_000_001),
+            UnixNanos::from(1_700_000_000_000_000_002),
+        )
+    }
+
+    #[rstest]
+    fn test_python_queue_state_dispatches_exact_event() {
+        Python::initialize();
+
+        let tracker = Python::attach(|py| {
+            py.run(
+                c_str!(
+                    r#"
+class QueueStateTracker:
+    def __init__(self):
+        self.event = None
+
+    def on_queue_state(self, event):
+        self.event = event
+"#
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+            py.eval(c_str!("QueueStateTracker()"), None, None)
+                .unwrap()
+                .unbind()
+        });
+        let mut algorithm = PyExecutionAlgorithm::new(None);
+        algorithm.set_python_instance(tracker);
+        let event = sample_queue_state_changed();
+
+        DataActor::on_queue_state(&mut algorithm, &event).unwrap();
+
+        let received = Python::attach(|py| {
+            algorithm
+                .inner()
+                .py_self
+                .as_ref()
+                .unwrap()
+                .getattr(py, "event")
+                .unwrap()
+                .extract::<QueueStateChanged>(py)
+                .unwrap()
+        });
+        assert_eq!(received, event);
+    }
+
+    #[rstest]
+    fn test_python_socket_state_dispatches_exact_event() {
+        Python::initialize();
+
+        let tracker = Python::attach(|py| {
+            py.run(
+                c_str!(
+                    r#"
+class SocketStateTracker:
+    def __init__(self):
+        self.event = None
+
+    def on_socket_state(self, event):
+        self.event = event
+"#
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+            py.eval(c_str!("SocketStateTracker()"), None, None)
+                .unwrap()
+                .unbind()
+        });
+        let mut algorithm = PyExecutionAlgorithm::new(None);
+        algorithm.set_python_instance(tracker);
+        let event = sample_socket_state_changed();
+
+        DataActor::on_socket_state(&mut algorithm, &event).unwrap();
+
+        let received = Python::attach(|py| {
+            algorithm
+                .inner()
+                .py_self
+                .as_ref()
+                .unwrap()
+                .getattr(py, "event")
+                .unwrap()
+                .extract::<SocketStateChanged>(py)
+                .unwrap()
+        });
+        assert_eq!(received, event);
+    }
+
+    #[rstest]
+    fn test_python_subscribe_and_unsubscribe_signal_update_msgbus() {
+        *get_message_bus().borrow_mut() = MessageBus::default();
+
+        let mut algorithm = PyExecutionAlgorithm::new(None);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        Component::register(&mut algorithm, TraderId::from("TRADER-001"), clock, cache).unwrap();
+
+        algorithm.py_subscribe_signal("risk", Some(50)).unwrap();
+
+        let topic = get_signal_topic("risk");
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].priority, 50);
+
+        algorithm.py_unsubscribe_signal("risk").unwrap();
+
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert!(subscriptions.is_empty());
+    }
+
+    #[rstest]
+    fn test_python_subscribe_and_unsubscribe_queue_state_update_msgbus() {
+        *get_message_bus().borrow_mut() = MessageBus::default();
+
+        let mut algorithm = PyExecutionAlgorithm::new(None);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        Component::register(&mut algorithm, TraderId::from("TRADER-001"), clock, cache).unwrap();
+
+        algorithm.py_subscribe_queue_state(Some(50)).unwrap();
+
+        let topic = MessagingSwitchboard::queue_state_changed_topic();
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].priority, 50);
+
+        algorithm.py_unsubscribe_queue_state().unwrap();
+
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert!(subscriptions.is_empty());
+    }
+
+    #[rstest]
+    fn test_python_subscribe_and_unsubscribe_socket_state_update_msgbus() {
+        *get_message_bus().borrow_mut() = MessageBus::default();
+
+        let mut algorithm = PyExecutionAlgorithm::new(None);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        Component::register(&mut algorithm, TraderId::from("TRADER-001"), clock, cache).unwrap();
+
+        algorithm.py_subscribe_socket_state(Some(50)).unwrap();
+
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].priority, 50);
+
+        algorithm.py_unsubscribe_socket_state().unwrap();
+
+        let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+        assert!(subscriptions.is_empty());
+    }
 
     #[rstest]
     fn test_python_order_list_override_receives_resolved_orders_without_fanout() {

@@ -12,7 +12,7 @@ The principles, structures, and designs that underpin the platform.
 
 ## Actors
 
-The `Actor` is the base component for interacting with the trading system.
+The `DataActor` is the base component for interacting with the trading system.
 Covers capabilities and implementation details.
 
 ## Strategies
@@ -144,6 +144,11 @@ while the node runs.
 ## Adapters
 
 Requirements and best practices for developing integration adapters for data providers and trading venues.
+
+## Networking
+
+Architecture, reliability policy, and performance characteristics for the shared HTTP, WebSocket,
+and raw TCP socket clients.
 
 ## Rust
 

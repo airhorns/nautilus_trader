@@ -35,7 +35,7 @@ use nautilus_model::{
         position::snapshot::PositionSnapshot,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
+        AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
         TraderId, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
@@ -60,14 +60,18 @@ const CACHE_PROCESS: &str = "cache-process";
 /// Configuration for a Postgres-backed cache database.
 ///
 /// Missing fields are resolved from Postgres environment variables and then built-in defaults.
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "config deserializes plain fields; unsafe methods come from generated PyO3 integration"
+    )
+)]
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.infrastructure",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.infrastructure", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -171,7 +175,7 @@ impl CacheDatabaseFactory for PostgresCacheConfig {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.infrastructure")
+    pyo3::pyclass(module = "nautilus_trader.infrastructure")
 )]
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
@@ -790,11 +794,11 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         rx.recv()?
     }
 
-    fn load_actor(&self, component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {component_id}")
+    fn load_actor(&self, actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
+        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
-    fn delete_actor(&self, _component_id: &ComponentId) -> anyhow::Result<()> {
+    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -1144,10 +1148,10 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn update_actor(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("update_actor not implemented for PostgreSQL cache adapter: {component_id}")
+        anyhow::bail!("update_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
     fn update_strategy(

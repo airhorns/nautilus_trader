@@ -74,7 +74,10 @@ use crate::{
     data_iterator::BacktestDataIterator,
     exchange::SimulatedExchange,
     execution_client::BacktestExecutionClient,
-    result::BacktestResult,
+    result::{
+        BacktestResult, CanonicalBacktestResult, CanonicalBacktestState, CanonicalDiagnostic,
+        CanonicalDiagnosticCode, CanonicalRunOutcome,
+    },
 };
 
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
@@ -438,8 +441,8 @@ impl BacktestEngine {
         }
 
         if validate {
-            // Mirror Cython: validate against the first element only and assume the
-            // batch is homogeneous (documented contract on add_data).
+            // Validate against the first element only and assume the batch is
+            // homogeneous (documented contract on add_data).
             let first = &to_add[0];
             #[cfg(feature = "defi")]
             let first_is_defi = matches!(first, Data::Defi(_));
@@ -726,10 +729,7 @@ impl BacktestEngine {
 
         // Determine time boundaries
         let start_ns = start.unwrap_or_else(|| self.ts_first.unwrap_or_default());
-        let end_ns = end.unwrap_or_else(|| {
-            self.ts_last_data
-                .unwrap_or(UnixNanos::from(4_102_444_800_000_000_000u64))
-        });
+        let end_ns = end.unwrap_or_else(|| self.ts_last_data.unwrap_or(start_ns));
         anyhow::ensure!(start_ns <= end_ns, "start was > end");
         self.end_ns = end_ns;
         self.last_ns = start_ns;
@@ -792,16 +792,15 @@ impl BacktestEngine {
         self.log_run();
 
         // Skip data before start_ns
-        let mut data = self.data_iterator.next_item();
-        while let Some(ref d) = data {
+        while let Some(d) = self.data_iterator.peek() {
             if d.ts_init() >= start_ns {
                 break;
             }
-            data = self.data_iterator.next_item();
+            self.data_iterator.next_item();
         }
 
         // Initialize last_ns before first data point
-        if let Some(ref d) = data {
+        if let Some(d) = self.data_iterator.peek() {
             let ts = d.ts_init();
             self.last_ns = if ts.as_u64() > 0 {
                 UnixNanos::from(ts.as_u64() - 1)
@@ -823,7 +822,7 @@ impl BacktestEngine {
                 break;
             }
 
-            if data.is_none() {
+            let Some(d) = self.data_iterator.peek() else {
                 if streaming {
                     // In streaming mode, don't advance timers past the
                     // current batch. The next batch will provide more data
@@ -831,22 +830,21 @@ impl BacktestEngine {
                     break;
                 }
                 let done = self.process_next_timer(&clocks)?;
-                data = self.data_iterator.next_item();
-                if data.is_none() && done {
+                if self.data_iterator.peek().is_none() && done {
                     break;
                 }
                 continue;
-            }
+            };
 
-            let d = data.as_ref().unwrap();
             let ts_init = d.ts_init();
 
             if ts_init > end_ns {
                 break;
             }
 
+            let d = self.data_iterator.next_item().unwrap();
+
             if ts_init > self.last_ns {
-                self.last_ns = ts_init;
                 self.advance_time_impl(ts_init, &clocks)?;
             }
 
@@ -857,18 +855,20 @@ impl BacktestEngine {
                 break;
             }
 
-            self.route_data_to_exchange(d);
-            self.kernel.data_engine.borrow_mut().process_data(d.clone());
+            self.route_data_to_exchange(&d);
+            self.kernel.data_engine.borrow_mut().process_data(d);
 
             // Drain deferred commands, then process exchange queues
             self.drain_command_queues();
             self.settle_venues(ts_init);
 
             let prev_last_ns = self.last_ns;
-            data = self.data_iterator.next_item();
-
             // If timestamp changed (or exhausted), flush timers then run modules
-            if data.is_none() || data.as_ref().unwrap().ts_init() > prev_last_ns {
+            if self
+                .data_iterator
+                .peek()
+                .is_none_or(|next| next.ts_init() > prev_last_ns)
+            {
                 self.flush_accumulator_events(&clocks, prev_last_ns)?;
                 self.finalize_timestamp(&clocks, prev_last_ns)?;
             }
@@ -1158,6 +1158,107 @@ impl BacktestEngine {
         }
     }
 
+    /// Returns the versioned deterministic projection of observable state from the last run.
+    ///
+    /// This projection excludes host, process, random identity, wall-clock, and elapsed-time noise.
+    /// It retains deterministic references between domain events and includes the observable cache,
+    /// account, portfolio, component, outcome, and diagnostic state available after the run ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if observable state cannot be projected into the canonical schema.
+    pub fn get_canonical_result(&self) -> anyhow::Result<CanonicalBacktestResult> {
+        let result = self.get_result();
+        let cache = self.kernel.cache.borrow();
+        let orders = cache
+            .orders(None, None, None, None, None)
+            .into_iter()
+            .map(|order| order.cloned())
+            .collect();
+        let positions = cache
+            .positions(None, None, None, None, None)
+            .into_iter()
+            .map(|position| position.cloned())
+            .collect();
+        let position_snapshots = cache.position_snapshots(None, None);
+        let accounts = cache.accounts_all_owned();
+        drop(cache);
+
+        let portfolio = self.kernel.portfolio.borrow();
+        let mut portfolio_snapshots = Vec::new();
+        for account in &accounts {
+            portfolio_snapshots.extend(portfolio.snapshots(&account.id()));
+        }
+        drop(portfolio);
+
+        let trader = self.kernel.trader.borrow();
+        let trader_state = trader.state().to_string();
+        let actor_ids = trader
+            .actor_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        let strategy_ids = trader
+            .strategy_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        let exec_algorithm_ids = trader
+            .exec_algorithm_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        drop(trader);
+
+        let outcome = if self.funding_error.is_some() {
+            CanonicalRunOutcome::Failed
+        } else if self.run_finished.is_none() {
+            CanonicalRunOutcome::Incomplete
+        } else if self.force_stop || self.kernel.is_shutdown_requested() {
+            CanonicalRunOutcome::Stopped
+        } else {
+            CanonicalRunOutcome::Completed
+        };
+        let diagnostics = self
+            .funding_error
+            .as_ref()
+            .map(|_| CanonicalDiagnostic {
+                code: CanonicalDiagnosticCode::FundingSettlementFailed,
+            })
+            .into_iter()
+            .collect();
+        let statistics = nautilus_analysis::PortfolioStatistics {
+            pnls: result.stats_pnls,
+            returns: result.stats_returns,
+            general: result.stats_general,
+            returns_series: result.returns_series,
+        };
+
+        CanonicalBacktestResult::from_state(CanonicalBacktestState {
+            trader_id: result.trader_id,
+            run_config_id: result.run_config_id,
+            backtest_start: result.backtest_start,
+            backtest_end: result.backtest_end,
+            iterations: result.iterations,
+            total_events: result.total_events,
+            total_orders: result.total_orders,
+            total_positions: result.total_positions,
+            outcome,
+            diagnostics,
+            trader_state,
+            actor_ids,
+            strategy_ids,
+            exec_algorithm_ids,
+            summary: result.summary.into_iter().collect(),
+            orders,
+            positions,
+            position_snapshots,
+            accounts,
+            portfolio_snapshots,
+            statistics,
+        })
+    }
+
     fn build_result_summary(
         &self,
         cache: &Cache,
@@ -1263,10 +1364,7 @@ impl BacktestEngine {
     fn route_data_to_exchange(&mut self, data: &Data) {
         if matches!(
             data,
-            Data::MarkPriceUpdate(_)
-                | Data::IndexPriceUpdate(_)
-                | Data::OptionGreeks(_)
-                | Data::Custom(_)
+            Data::MarkPrice(_) | Data::IndexPrice(_) | Data::OptionGreeks(_) | Data::Custom(_)
         ) {
             return;
         }
@@ -1298,7 +1396,7 @@ impl BacktestEngine {
                 Data::Bar(bar) => exchange_ref.process_bar(*bar),
                 Data::InstrumentStatus(status) => exchange_ref.process_instrument_status(*status),
                 Data::InstrumentClose(close) => exchange_ref.process_instrument_close(*close),
-                Data::FundingRateUpdate(funding) => {
+                Data::FundingRate(funding) => {
                     let settlement_ns =
                         exchange_ref.process_funding_rate_deferred(*funding, data.ts_init());
                     self.schedule_funding_settlement_if_required(venue, settlement_ns);
@@ -1364,6 +1462,7 @@ impl BacktestEngine {
         if let Some(ts_event) = shutdown_at {
             self.last_ns = ts_event;
         } else {
+            self.last_ns = ts_now;
             Self::set_all_clocks_time(clocks, ts_now);
             logging_clock_set_static_time(ts_now.as_u64());
         }
@@ -1381,6 +1480,8 @@ impl BacktestEngine {
             self.accumulator.clear();
             return Ok(());
         }
+
+        let last_ns = self.last_ns;
 
         for clock in clocks {
             Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
@@ -1407,6 +1508,10 @@ impl BacktestEngine {
             for clock in clocks {
                 Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
             }
+        }
+
+        if !self.kernel.is_shutdown_requested() {
+            self.last_ns = last_ns;
         }
 
         Ok(())
@@ -1449,6 +1554,7 @@ impl BacktestEngine {
         ts_event: UnixNanos,
         advance_to: UnixNanos,
     ) {
+        self.last_ns = ts_event;
         while self.accumulator.peek_next_time() == Some(ts_event) {
             let handler = self
                 .accumulator
@@ -1822,6 +1928,7 @@ impl BacktestEngine {
                     AccountAny::Margin(margin) => margin,
                     AccountAny::Cash(cash) => cash,
                     AccountAny::Betting(betting) => betting,
+                    AccountAny::Wallet(wallet) => wallet,
                 };
 
                 for balance in account_ref.starting_balances().values() {
@@ -1991,11 +2098,11 @@ fn event_count_as_usize(event_count: u64) -> usize {
 fn format_optional_duration(start: Option<UnixNanos>, end: Option<UnixNanos>) -> String {
     match (start, end) {
         (Some(s), Some(e)) => {
-            let delta = e.to_datetime_utc() - s.to_datetime_utc();
-            let days = delta.num_days().abs();
-            let hours = delta.num_hours().abs() % 24;
-            let minutes = delta.num_minutes().abs() % 60;
-            let seconds = delta.num_seconds().abs() % 60;
+            let delta = s.to_datetime_utc().duration_until(e.to_datetime_utc());
+            let days = delta.as_hours().abs() / 24;
+            let hours = delta.as_hours().abs() % 24;
+            let minutes = delta.as_mins().abs() % 60;
+            let seconds = delta.as_secs().abs() % 60;
             let micros = delta.subsec_nanos().unsigned_abs() / 1_000;
             format!("{days} days {hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
         }
@@ -2041,6 +2148,8 @@ fn log_portfolio_performance(analyzer: &PortfolioAnalyzer) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use indexmap::IndexMap;
     use nautilus_common::{
         actor::DataActor,
@@ -2061,7 +2170,7 @@ mod tests {
             AccountType, BookType, MarketStatus, MarketStatusAction, OmsType, OrderSide,
             OrderStatus, OrderType, TriggerType,
         },
-        identifiers::{AccountId, ActorId, ClientId, ComponentId, PositionId, StrategyId, Venue},
+        identifiers::{AccountId, ActorId, ClientId, PositionId, StrategyId, Venue},
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
@@ -2161,6 +2270,92 @@ mod tests {
             .unwrap();
         engine.add_venue(venue_config).unwrap();
         engine
+    }
+
+    #[rstest]
+    fn test_timer_handler_sets_last_ns_to_fire_time() {
+        let mut engine = create_engine();
+        engine.last_ns = UnixNanos::from(30);
+        let fired = Rc::new(Cell::new(false));
+        let fired_clone = Rc::clone(&fired);
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired_clone.set(true);
+        }));
+        engine
+            .kernel
+            .clock
+            .borrow_mut()
+            .set_timer_ns(
+                "ROLL",
+                1,
+                Some(UnixNanos::from(20)),
+                None,
+                Some(callback),
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+        let clocks = engine.collect_all_clocks();
+
+        for clock in &clocks {
+            BacktestEngine::advance_clock_on_accumulator(
+                &mut engine.accumulator,
+                clock,
+                UnixNanos::from(30),
+                false,
+            );
+        }
+        engine.run_timer_handlers_at(&clocks, UnixNanos::from(20), UnixNanos::from(30));
+
+        assert!(fired.get());
+        assert_eq!(engine.last_ns, UnixNanos::from(20));
+    }
+
+    #[rstest]
+    #[case::complete(false, 25)]
+    #[case::shutdown(true, 20)]
+    fn test_flush_accumulator_events_sets_last_ns_for_completion(
+        #[case] shutdown: bool,
+        #[case] expected_last_ns: u64,
+    ) {
+        let mut engine = create_engine();
+        let last_ns = UnixNanos::from(25);
+        let ts_now = UnixNanos::from(30);
+        engine.last_ns = last_ns;
+        let clocks = engine.collect_all_clocks();
+        BacktestEngine::set_all_clocks_time(&clocks, last_ns);
+        let fired = Rc::new(Cell::new(false));
+        let fired_clone = Rc::clone(&fired);
+        let observed_ns = Rc::new(Cell::new(UnixNanos::default()));
+        let observed_ns_clone = Rc::clone(&observed_ns);
+        let clock = Rc::clone(&engine.kernel.clock);
+        let shutdown_requested = engine.kernel.shutdown_flag();
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired_clone.set(true);
+            observed_ns_clone.set(clock.borrow().timestamp_ns());
+            shutdown_requested.set(shutdown);
+        }));
+        engine
+            .kernel
+            .clock
+            .borrow_mut()
+            .set_timer_ns(
+                "ROLL",
+                100,
+                Some(UnixNanos::from(20)),
+                None,
+                Some(callback),
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+
+        engine.flush_accumulator_events(&clocks, ts_now).unwrap();
+
+        assert!(fired.get());
+        assert_eq!(observed_ns.get(), UnixNanos::from(20));
+        assert_eq!(engine.kernel.is_shutdown_requested(), shutdown);
+        assert_eq!(engine.last_ns, UnixNanos::from(expected_last_ns));
     }
 
     #[rstest]
@@ -2493,7 +2688,7 @@ mod tests {
         let strategy_save =
             IndexMap::from([("strategy-save".to_string(), b"strategy-saved".to_vec())]);
         let (database, control) = TestCacheDatabaseControl::create();
-        control.set_actor_state(ComponentId::from(actor_id.as_str()), &actor_load);
+        control.set_actor_state(actor_id, &actor_load);
         control.set_strategy_state(strategy_id, &strategy_load);
         let config = BacktestEngineConfig {
             load_state: true,
@@ -2550,10 +2745,7 @@ mod tests {
                 "database.close",
             ]
         );
-        assert_eq!(
-            control.actor_state(&ComponentId::from(actor_id.as_str())),
-            Some(actor_save)
-        );
+        assert_eq!(control.actor_state(&actor_id), Some(actor_save));
         assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
         assert_eq!(engine.backtest_end, Some(UnixNanos::from(0)));
     }

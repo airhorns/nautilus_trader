@@ -27,6 +27,7 @@ use nautilus_model::events::PositionEvent;
 use super::{
     PolymarketDataClient,
     dispatch::{WsMessageContext, handle_ws_message},
+    instruments::refresh_expired_market_closure,
     runtime::{retire_expired_local_instruments, seed_token_meta_from_live_instruments},
 };
 use crate::{
@@ -82,6 +83,7 @@ impl PolymarketDataClient {
             clob_public_client: self.clob_public_client.clone(),
             filters: self.provider.filters(),
             order_books: self.order_books.clone(),
+            latest_delta_ts: self.latest_delta_ts.clone(),
             last_quotes: self.last_quotes.clone(),
             active_quote_subs: self.active_quote_subs.clone(),
             active_delta_subs: self.active_delta_subs.clone(),
@@ -93,8 +95,9 @@ impl PolymarketDataClient {
             new_market_fetch_semaphore: self.new_market_fetch_semaphore.clone(),
             rtds_feed: self.rtds_feed.clone(),
             subscribe_new_markets: self.config.subscribe_new_markets,
-            drop_quotes_missing_side: self.config.drop_quotes_missing_side,
             new_market_filter: self.config.new_market_filter.clone(),
+            drop_quotes_missing_side: self.config.drop_quotes_missing_side,
+            compute_effective_deltas: self.config.compute_effective_deltas,
             cancellation_token: cancellation.clone(),
         };
 
@@ -146,6 +149,8 @@ impl PolymarketDataClient {
         let ws_open_tokens = self.ws_open_tokens.clone();
         let ws_sub_mutex = self.ws_sub_mutex.clone();
         let ws = self.ws_client.handle();
+        let closure_client = gamma_client.clone();
+        let closure_sender = self.data_sender.clone();
 
         let ctx = WsMessageContext {
             clock: self.clock,
@@ -156,6 +161,7 @@ impl PolymarketDataClient {
             clob_public_client: clob_public_client.clone(),
             filters: self.provider.filters(),
             order_books: self.order_books.clone(),
+            latest_delta_ts: self.latest_delta_ts.clone(),
             last_quotes: self.last_quotes.clone(),
             active_quote_subs: self.active_quote_subs.clone(),
             active_delta_subs: self.active_delta_subs.clone(),
@@ -167,8 +173,9 @@ impl PolymarketDataClient {
             new_market_fetch_semaphore: self.new_market_fetch_semaphore.clone(),
             rtds_feed: self.rtds_feed.clone(),
             subscribe_new_markets: self.config.subscribe_new_markets,
-            drop_quotes_missing_side: self.config.drop_quotes_missing_side,
             new_market_filter: self.config.new_market_filter.clone(),
+            drop_quotes_missing_side: self.config.drop_quotes_missing_side,
+            compute_effective_deltas: self.config.compute_effective_deltas,
             cancellation_token: cancellation.clone(),
         };
 
@@ -191,6 +198,15 @@ impl PolymarketDataClient {
                     () = cancellation.cancelled() => break,
                     _ = interval.tick() => {
                         let now_ns = clock.get_time_ns();
+
+                        // Runs on every tick so retirement never trails closure by more than one
+                        // cycle. Without an expired instrument reported open, no request is sent.
+                        if let Err(e) = refresh_expired_market_closure(
+                            &closure_client, &instruments, &closure_sender, now_ns,
+                        ).await {
+                            log::warn!("Failed to refresh Polymarket market closure state: {e}");
+                        }
+
                         retire_expired_local_instruments(
                             now_ns,
                             &instruments,
@@ -354,12 +370,13 @@ impl PolymarketDataClient {
         self.pending_snapshot_after_tick_change = std::sync::Arc::new(AtomicSet::new());
         self.new_market_inflight_keys = std::sync::Arc::new(DashMap::new());
         self.ws_open_tokens = std::sync::Arc::new(AtomicSet::new());
-        self.rtds_feed = crate::rtds::PolymarketRtdsFeed::new_with_proxy(
+        self.rtds_feed = crate::rtds::PolymarketRtdsFeed::new_with_proxy_and_socket_control(
             self.config.rtds_url(),
             self.config.transport_backend,
             self.clock,
             self.data_sender.clone(),
             self.proxy_url.clone(),
+            self.rtds_socket_control.clone(),
         );
 
         self.pending_auto_loads
@@ -456,7 +473,10 @@ mod tests {
         live::runner::{replace_data_event_sender, replace_exec_event_sender},
         messages::{
             DataEvent, ExecutionEvent,
-            data::{SubscribeCustomData, UnsubscribeCustomData},
+            data::{
+                SubscribeBookDeltas, SubscribeCustomData, UnsubscribeBookDeltas,
+                UnsubscribeCustomData,
+            },
         },
         testing::wait_until_async,
     };
@@ -694,6 +714,22 @@ mod tests {
             .lock()
             .expect("pending_auto_loads mutex poisoned")
             .insert(instrument_id);
+        client.order_books.insert(
+            instrument_id,
+            OrderBook::new(instrument_id, BookType::L2_MBP),
+        );
+        client.last_quotes.insert(
+            instrument_id,
+            QuoteTick::new(
+                instrument_id,
+                Price::from("0.49"),
+                Price::from("0.51"),
+                Quantity::from("10"),
+                Quantity::from("8"),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            ),
+        );
         client.auto_load_scheduled.store(true, Ordering::Release);
 
         client
@@ -707,6 +743,8 @@ mod tests {
         assert!(client.active_delta_subs.is_empty());
         assert!(client.active_trade_subs.is_empty());
         assert!(client.ws_open_tokens.is_empty());
+        assert!(client.order_books.is_empty());
+        assert!(client.last_quotes.is_empty());
         assert!(client.new_market_inflight_keys.is_empty());
         assert!(client.pending_snapshot_after_tick_change.is_empty());
         assert!(
@@ -717,6 +755,112 @@ mod tests {
                 .is_empty()
         );
         assert!(!client.auto_load_scheduled.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[case::disabled(false)]
+    #[case::enabled(true)]
+    fn book_delta_subscription_gates_and_cleans_local_book_state(#[case] enabled: bool) {
+        let mut client = make_client_for_reset_test();
+        client.config.compute_effective_deltas = enabled;
+        client.cancellation_token.cancel();
+        let instrument_id = InstrumentId::from("0xCOND-0xTOKEN.POLYMARKET");
+        let subscribe = || {
+            SubscribeBookDeltas::new(
+                instrument_id,
+                BookType::L2_MBP,
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                true,
+                None,
+                None,
+            )
+        };
+        let unsubscribe = || {
+            UnsubscribeBookDeltas::new(
+                instrument_id,
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            )
+        };
+
+        client
+            .subscribe_book_deltas(subscribe())
+            .expect("subscribe book deltas");
+
+        assert!(client.active_delta_subs.contains(&instrument_id));
+        assert!(
+            client
+                .pending_auto_loads
+                .lock()
+                .expect("pending_auto_loads mutex poisoned")
+                .contains(&instrument_id)
+        );
+        assert_eq!(client.order_books.contains_key(&instrument_id), enabled);
+
+        if let Some(mut book) = client.order_books.get_mut(&instrument_id) {
+            book.update_count = 7;
+        }
+
+        client.active_quote_subs.insert(instrument_id);
+        client.last_quotes.insert(
+            instrument_id,
+            QuoteTick::new(
+                instrument_id,
+                Price::from("0.49"),
+                Price::from("0.51"),
+                Quantity::from("10"),
+                Quantity::from("8"),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            ),
+        );
+        client
+            .unsubscribe_book_deltas(&unsubscribe())
+            .expect("unsubscribe book deltas");
+
+        assert!(!client.active_delta_subs.contains(&instrument_id));
+        assert!(!client.order_books.contains_key(&instrument_id));
+        assert!(client.last_quotes.contains_key(&instrument_id));
+        assert!(
+            client
+                .pending_auto_loads
+                .lock()
+                .expect("pending_auto_loads mutex poisoned")
+                .contains(&instrument_id)
+        );
+
+        client
+            .subscribe_book_deltas(subscribe())
+            .expect("resubscribe book deltas");
+
+        assert_eq!(client.order_books.contains_key(&instrument_id), enabled);
+        if let Some(book) = client.order_books.get(&instrument_id) {
+            assert_eq!(book.update_count, 0);
+        }
+
+        client.active_quote_subs.remove(&instrument_id);
+        client
+            .unsubscribe_book_deltas(&unsubscribe())
+            .expect("final unsubscribe book deltas");
+
+        assert!(!client.active_delta_subs.contains(&instrument_id));
+        assert!(!client.order_books.contains_key(&instrument_id));
+        assert!(!client.last_quotes.contains_key(&instrument_id));
+        assert!(
+            client
+                .pending_auto_loads
+                .lock()
+                .expect("pending_auto_loads mutex poisoned")
+                .is_empty()
+        );
     }
 
     #[rstest]

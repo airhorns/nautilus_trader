@@ -17,6 +17,7 @@
 
 mod auto_load;
 mod dispatch;
+mod effective_deltas;
 mod instruments;
 mod lifecycle;
 mod requests;
@@ -35,7 +36,7 @@ use ahash::AHashSet;
 use dashmap::DashMap;
 use nautilus_common::{
     cache::InstrumentLookupError,
-    clients::DataClient,
+    clients::{DataClient, SocketReconnectRegistry},
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
         DataEvent,
@@ -72,11 +73,14 @@ use self::{
         request_book_snapshot, request_data, request_instrument, request_instruments,
         request_trades,
     },
-    runtime::is_instrument_expired,
+    runtime::is_instrument_expired_and_not_reported_open,
     subscriptions::{resolve_token_id_from, sync_ws_subscription_async},
 };
 use crate::{
-    common::consts::POLYMARKET_VENUE,
+    common::{
+        consts::POLYMARKET_VENUE,
+        socket::{RTDS_STREAMS_ENDPOINT, SocketControl, SocketStatePublisher},
+    },
     config::PolymarketDataClientConfig,
     data_types::POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
     filters::InstrumentFilter,
@@ -121,6 +125,7 @@ pub struct PolymarketDataClient {
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
+    latest_delta_ts: Arc<DashMap<InstrumentId, nautilus_core::UnixNanos>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
     active_quote_subs: Arc<AtomicSet<InstrumentId>>,
     active_delta_subs: Arc<AtomicSet<InstrumentId>>,
@@ -136,6 +141,8 @@ pub struct PolymarketDataClient {
     auto_load_scheduled: Arc<AtomicBool>,
     position_event_handler: Option<TypedHandler<PositionEvent>>,
     rtds_feed: PolymarketRtdsFeed,
+    socket_registry: SocketReconnectRegistry,
+    rtds_socket_control: Option<SocketControl>,
     proxy_url: Option<ProxyUrl>,
 }
 
@@ -172,6 +179,17 @@ impl PolymarketDataClient {
     ) -> Self {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_registry = SocketReconnectRegistry::default();
+        let state_publisher = SocketStatePublisher::new(client_id, socket_registry.clone());
+
+        let ws_client = if let Some(publisher) = state_publisher.as_ref() {
+            ws_client.with_socket_publisher(publisher.clone())
+        } else {
+            ws_client
+        };
+        let rtds_socket_control = state_publisher
+            .as_ref()
+            .map(|publisher| publisher.control(RTDS_STREAMS_ENDPOINT));
         let provider =
             PolymarketInstrumentProvider::new(gamma_client, config.instrument_config.clone());
         let configured_fetch_max_concurrency = config.new_market_fetch_max_concurrency;
@@ -208,6 +226,7 @@ impl PolymarketDataClient {
             instruments: Arc::new(AtomicMap::new()),
             token_meta: Arc::new(DashMap::new()),
             order_books: Arc::new(DashMap::new()),
+            latest_delta_ts: Arc::new(DashMap::new()),
             last_quotes: Arc::new(DashMap::new()),
             active_quote_subs: Arc::new(AtomicSet::new()),
             active_delta_subs: Arc::new(AtomicSet::new()),
@@ -224,13 +243,16 @@ impl PolymarketDataClient {
             pending_auto_loads: Arc::new(StdMutex::new(AHashSet::new())),
             auto_load_scheduled: Arc::new(AtomicBool::new(false)),
             position_event_handler: None,
-            rtds_feed: PolymarketRtdsFeed::new_with_proxy(
+            rtds_feed: PolymarketRtdsFeed::new_with_proxy_and_socket_control(
                 rtds_url,
                 rtds_transport_backend,
                 clock,
                 rtds_data_sender,
                 proxy_url.clone(),
+                rtds_socket_control.clone(),
             ),
+            socket_registry,
+            rtds_socket_control,
             proxy_url,
         }
     }
@@ -295,7 +317,7 @@ impl PolymarketDataClient {
             return Ok(());
         };
 
-        if is_instrument_expired(instrument, now_ns) {
+        if is_instrument_expired_and_not_reported_open(instrument, now_ns) {
             anyhow::bail!(
                 "Instrument {instrument_id} is expired and no longer available for live subscription"
             );
@@ -314,7 +336,7 @@ impl PolymarketDataClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?
             .clone();
 
-        if is_instrument_expired(&instrument, self.clock.get_time_ns()) {
+        if is_instrument_expired_and_not_reported_open(&instrument, self.clock.get_time_ns()) {
             anyhow::bail!(
                 "Instrument {instrument_id} is expired and no longer available for market data requests"
             );
@@ -360,6 +382,10 @@ impl DataClient for PolymarketDataClient {
 
     fn venue(&self) -> Option<Venue> {
         Some(*POLYMARKET_VENUE)
+    }
+
+    fn socket_reconnect_registry(&self) -> Option<&SocketReconnectRegistry> {
+        Some(&self.socket_registry)
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -498,9 +524,12 @@ impl DataClient for PolymarketDataClient {
 
         // Mark intent before routing so unsubscribe can race-safely clear it.
         self.active_delta_subs.insert(instrument_id);
-        self.order_books
-            .entry(instrument_id)
-            .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
+
+        if self.config.compute_effective_deltas {
+            self.order_books
+                .entry(instrument_id)
+                .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
+        }
 
         if !cached {
             self.queue_pending_load(instrument_id);
@@ -582,7 +611,7 @@ impl DataClient for PolymarketDataClient {
         self.pending_snapshot_after_tick_change
             .remove(&instrument_id);
         self.drop_pending_if_unwanted(instrument_id);
-        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.drop_local_data_state_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);
         Ok(())
     }
@@ -591,7 +620,7 @@ impl DataClient for PolymarketDataClient {
         let instrument_id = cmd.instrument_id;
         self.active_quote_subs.remove(&instrument_id);
         self.drop_pending_if_unwanted(instrument_id);
-        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.drop_local_data_state_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);
         Ok(())
     }

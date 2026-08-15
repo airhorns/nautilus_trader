@@ -24,7 +24,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_common::{
     cache::InstrumentLookupError,
     clients::DataClient,
@@ -50,10 +50,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{
-        Bar, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate,
-        OrderBookDeltas_API, TradeTick,
-    },
+    data::{Bar, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate, TradeTick},
     enums::{BarAggregation, BookType, OrderSide},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -69,7 +66,7 @@ use crate::{
     common::{
         consts::HYPERLIQUID_VENUE,
         credential::{Secrets, credential_env_vars},
-        parse::bar_type_to_interval,
+        parse::{bar_type_to_interval, millis_to_nanos},
     },
     config::HyperliquidDataClientConfig,
     data_types::register_hyperliquid_custom_data,
@@ -309,6 +306,24 @@ impl HyperliquidDataClient {
         Ok(Some(instrument_id))
     }
 
+    fn custom_user(data_type: &DataType) -> anyhow::Result<Option<String>> {
+        let Some(user) = data_type
+            .metadata()
+            .and_then(|m| m.get("user"))
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        anyhow::ensure!(
+            user == user.trim(),
+            "metadata['user'] must not contain surrounding whitespace",
+        );
+
+        Ok(Some(user.to_string()))
+    }
+
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
         let instruments = self
             .http_client
@@ -419,7 +434,7 @@ impl HyperliquidDataClient {
                                 NautilusWsMessage::Deltas(deltas) => {
                                     if let Err(e) = data_sender
                                         .send(DataEvent::Data(Data::Deltas(
-                                            OrderBookDeltas_API::new(deltas),
+                                            Box::new(deltas),
                                         )))
                                     {
                                         log::error!("Failed to send order book deltas: {e}");
@@ -441,14 +456,14 @@ impl HyperliquidDataClient {
                                 }
                                 NautilusWsMessage::MarkPrice(update) => {
                                     if let Err(e) = data_sender
-                                        .send(DataEvent::Data(Data::MarkPriceUpdate(update)))
+                                        .send(DataEvent::Data(Data::MarkPrice(update)))
                                     {
                                         log::error!("Failed to send mark price update: {e}");
                                     }
                                 }
                                 NautilusWsMessage::IndexPrice(update) => {
                                     if let Err(e) = data_sender
-                                        .send(DataEvent::Data(Data::IndexPriceUpdate(update)))
+                                        .send(DataEvent::Data(Data::IndexPrice(update)))
                                     {
                                         log::error!("Failed to send index price update: {e}");
                                     }
@@ -686,6 +701,30 @@ impl DataClient for HyperliquidDataClient {
             return Ok(());
         }
 
+        if data_type == "HyperliquidTwapHistory" {
+            let ws = self.ws_client.clone();
+            let user = Self::custom_user(&cmd.data_type)?
+                .context("HyperliquidTwapHistory subscriptions require metadata['user']")?;
+
+            self.spawn_task("subscribe_user_twap_history", async move {
+                ws.subscribe_user_twap_history(&user).await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidTwapSliceFill" {
+            let ws = self.ws_client.clone();
+            let user = Self::custom_user(&cmd.data_type)?
+                .context("HyperliquidTwapSliceFill subscriptions require metadata['user']")?;
+
+            self.spawn_task("subscribe_user_twap_slice_fills", async move {
+                ws.subscribe_user_twap_slice_fills(&user).await
+            });
+
+            return Ok(());
+        }
+
         log::warn!("Unsupported custom data subscription: {data_type}");
         Ok(())
     }
@@ -745,6 +784,30 @@ impl DataClient for HyperliquidDataClient {
 
             self.spawn_task("unsubscribe_public_trades", async move {
                 ws.unsubscribe_public_trades(instrument_id).await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidTwapHistory" {
+            let ws = self.ws_client.clone();
+            let user = Self::custom_user(&cmd.data_type)?
+                .context("HyperliquidTwapHistory unsubscriptions require metadata['user']")?;
+
+            self.spawn_task("unsubscribe_user_twap_history", async move {
+                ws.unsubscribe_user_twap_history(&user).await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidTwapSliceFill" {
+            let ws = self.ws_client.clone();
+            let user = Self::custom_user(&cmd.data_type)?
+                .context("HyperliquidTwapSliceFill unsubscriptions require metadata['user']")?;
+
+            self.spawn_task("unsubscribe_user_twap_slice_fills", async move {
+                ws.unsubscribe_user_twap_slice_fills(&user).await
             });
 
             return Ok(());
@@ -1328,15 +1391,15 @@ impl DataClient for HyperliquidDataClient {
         let start_nanos = datetime_to_unix_nanos(start_dt);
         let end_nanos = datetime_to_unix_nanos(end_dt);
 
-        let now_ms = Utc::now().timestamp_millis() as u64;
+        let now_ms = Timestamp::now().as_millisecond() as u64;
 
         // Hyperliquid requires a startTime; default to a 7-day lookback when none given
         let default_lookback_ms: u64 = 7 * 86_400_000;
         let start_ms = match start_dt {
-            Some(dt) => dt.timestamp_millis().max(0) as u64,
+            Some(dt) => dt.as_millisecond().max(0) as u64,
             None => now_ms.saturating_sub(default_lookback_ms),
         };
-        let end_ms = end_dt.map(|dt| dt.timestamp_millis().max(0) as u64);
+        let end_ms = end_dt.map(|dt| dt.as_millisecond().max(0) as u64);
 
         self.spawn_task("request_funding_rates", async move {
             let entries = http
@@ -1946,8 +2009,12 @@ pub(crate) fn candle_to_bar(
     price_precision: u8,
     size_precision: u8,
 ) -> anyhow::Result<Bar> {
-    let ts_init = UnixNanos::from(candle.timestamp * 1_000_000);
-    let ts_event = ts_init;
+    let ts_event = millis_to_nanos(candle.timestamp)?;
+    let close_boundary = candle
+        .end_timestamp
+        .checked_add(1)
+        .context("candle close boundary overflow")?;
+    let ts_init = millis_to_nanos(close_boundary)?;
 
     let open = Price::from_decimal_dp(candle.open, price_precision)
         .map_err(|e| anyhow::anyhow!("invalid open price: {e}"))?;
@@ -1969,8 +2036,8 @@ pub(crate) fn candle_to_bar(
 async fn request_bars_from_http(
     http_client: HyperliquidHttpClient,
     bar_type: BarType,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
     limit: Option<u32>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
 ) -> anyhow::Result<Vec<Bar>> {
@@ -1990,10 +2057,10 @@ async fn request_bars_from_http(
     let interval = bar_type_to_interval(&bar_type)?;
 
     // Hyperliquid uses millisecond timestamps
-    let now = Utc::now();
-    let end_time = end.unwrap_or(now).timestamp_millis() as u64;
+    let now = Timestamp::now();
+    let end_time = end.unwrap_or(now).as_millisecond() as u64;
     let start_time = if let Some(start) = start {
-        start.timestamp_millis() as u64
+        start.as_millisecond() as u64
     } else {
         // Default to 1000 bars before end_time
         let spec = bar_type.spec();
@@ -2011,8 +2078,10 @@ async fn request_bars_from_http(
         .await
         .context("failed to fetch candle snapshot from Hyperliquid")?;
 
+    let now_ms = now.as_millisecond() as u64;
     let mut bars: Vec<Bar> = candles
         .iter()
+        .filter(|candle| candle.end_timestamp < now_ms)
         .filter_map(|candle| {
             candle_to_bar(candle, bar_type, price_precision, size_precision)
                 .map_err(|e| {
@@ -2053,6 +2122,50 @@ mod tests {
 
     fn btc_perp_id() -> InstrumentId {
         InstrumentId::from("BTC-PERP.HYPERLIQUID")
+    }
+
+    #[rstest]
+    fn test_candle_to_bar_uses_causal_initialization_timestamp() {
+        let candle = HyperliquidCandle {
+            timestamp: 1_700_000_000_000,
+            end_timestamp: 1_700_000_059_999,
+            open: dec!(100.0),
+            high: dec!(101.0),
+            low: dec!(99.0),
+            close: dec!(100.5),
+            volume: dec!(10.0),
+            num_trades: Some(42),
+        };
+        let bar_type = BarType::from("BTC-USD-PERP.HYPERLIQUID-1-MINUTE-LAST-EXTERNAL");
+
+        let bar = candle_to_bar(&candle, bar_type, 1, 1).unwrap();
+
+        assert_eq!(candle.end_timestamp - candle.timestamp, 59_999);
+        assert_eq!(bar.ts_event, millis_to_nanos(candle.timestamp).unwrap());
+        assert_eq!(
+            bar.ts_init,
+            millis_to_nanos(candle.end_timestamp + 1).unwrap()
+        );
+        assert!(bar.ts_init > bar.ts_event);
+    }
+
+    #[rstest]
+    fn test_candle_to_bar_rejects_close_boundary_overflow() {
+        let candle = HyperliquidCandle {
+            timestamp: 1_700_000_000_000,
+            end_timestamp: u64::MAX,
+            open: dec!(100.0),
+            high: dec!(101.0),
+            low: dec!(99.0),
+            close: dec!(100.5),
+            volume: dec!(10.0),
+            num_trades: Some(42),
+        };
+        let bar_type = BarType::from("BTC-USD-PERP.HYPERLIQUID-1-MINUTE-LAST-EXTERNAL");
+
+        let err = candle_to_bar(&candle, bar_type, 1, 1).unwrap_err();
+
+        assert!(err.to_string().contains("close boundary overflow"));
     }
 
     #[rstest]

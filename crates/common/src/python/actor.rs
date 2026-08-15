@@ -23,8 +23,8 @@ use std::{
     rc::Rc,
 };
 
-use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use jiff::Timestamp;
 use nautilus_core::{
     from_pydict,
     nanos::UnixNanos,
@@ -71,7 +71,10 @@ use crate::{
     component::{Component, with_component_registry},
     enums::ComponentState,
     logging::{CMD, RECV},
-    messages::execution::TradingCommand,
+    messages::{
+        execution::TradingCommand,
+        system::{QueueStateChanged, SocketStateChanged},
+    },
     msgbus::{self, ShareableMessageHandler},
     python::{
         cache::PyCache,
@@ -410,6 +413,24 @@ impl PyDataActorInner {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_signal", (signal.clone().into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_queue_state(&mut self, event: &QueueStateChanged) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_queue_state", (event.clone().into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_socket_state(&mut self, event: &SocketStateChanged) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_socket_state", (event.clone().into_py_any(py)?,))
             })?;
         }
         Ok(())
@@ -849,9 +870,8 @@ impl PyDataActor {
 
     /// Stores the original Python config object passed at construction.
     ///
-    /// Retained so the constructed instance exposes `.config` (matching v1) and so
-    /// instance-based registration can source the actor ID and logging flags from the
-    /// same single config object.
+    /// Retained so the constructed instance exposes `.config` and instance-based registration can
+    /// source the actor ID and logging flags from the same single config object.
     pub fn set_config(&mut self, config: Option<Py<PyAny>>) {
         self.inner_mut().config = config;
     }
@@ -1020,6 +1040,16 @@ impl DataActor for PyDataActorInner {
             .map_err(|e| anyhow::anyhow!("Python on_signal failed: {e}"))
     }
 
+    fn on_queue_state(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+        self.dispatch_on_queue_state(event)
+            .map_err(|e| anyhow::anyhow!("Python on_queue_state failed: {e}"))
+    }
+
+    fn on_socket_state(&mut self, event: &SocketStateChanged) -> anyhow::Result<()> {
+        self.dispatch_on_socket_state(event)
+            .map_err(|e| anyhow::anyhow!("Python on_socket_state failed: {e}"))
+    }
+
     fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         Python::attach(|py| {
             let py_instrument = instrument_any_to_pyobject(py, instrument.clone())
@@ -1134,6 +1164,8 @@ impl DataActor for PyDataActorInner {
         Python::attach(|py| {
             let py_data: Py<PyAny> = if let Some(custom_data) = data.downcast_ref::<CustomData>() {
                 Py::new(py, custom_data.clone())?.into_any()
+            } else if let Some(custom_data) = data.downcast_ref::<Vec<CustomData>>() {
+                custom_data.clone().into_py_any(py)?
             } else {
                 anyhow::bail!("Failed to convert historical data to Python: unsupported type");
             };
@@ -1369,8 +1401,10 @@ impl PyDataActor {
     }
 
     #[pyo3(name = "publish_data")]
-    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) {
+    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner().publish_data(data_type, data);
+        Ok(())
     }
 
     #[pyo3(name = "publish_signal")]
@@ -1386,7 +1420,7 @@ impl PyDataActor {
         value: Py<PyAny>,
         ts_event: u64,
     ) -> PyResult<()> {
-        // Accept any int / float / str / bool - match v1 behaviour by coercing with `str(value)`.
+        self.ensure_registered_for_data()?;
         let value_str: String = value.bind(py).str()?.extract()?;
         self.inner()
             .publish_signal(name, value_str, UnixNanos::from(ts_event));
@@ -1395,6 +1429,7 @@ impl PyDataActor {
 
     #[pyo3(name = "add_synthetic")]
     fn py_add_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner()
             .add_synthetic(synthetic)
             .map_err(to_pyvalue_err)
@@ -1402,6 +1437,7 @@ impl PyDataActor {
 
     #[pyo3(name = "update_synthetic")]
     fn py_update_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner()
             .update_synthetic(synthetic)
             .map_err(to_pyvalue_err)
@@ -1503,6 +1539,14 @@ impl PyDataActor {
     fn py_on_signal(&mut self, signal: &Signal) {}
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_queue_state")]
+    fn py_on_queue_state(&mut self, event: QueueStateChanged) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_socket_state")]
+    fn py_on_socket_state(&mut self, event: SocketStateChanged) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_instrument")]
     fn py_on_instrument(&mut self, instrument: Py<PyAny>) {}
 
@@ -1567,6 +1611,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_data(self.inner_mut(), data_type, client_id, params);
         Ok(())
@@ -1574,8 +1619,26 @@ impl PyDataActor {
 
     #[pyo3(name = "subscribe_signal")]
     #[pyo3(signature = (name="", priority=None))]
-    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) {
+    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::subscribe_signal(self.inner_mut(), name, priority);
+        Ok(())
+    }
+
+    #[pyo3(name = "subscribe_queue_state")]
+    #[pyo3(signature = (priority=None))]
+    fn py_subscribe_queue_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::subscribe_queue_state(self.inner_mut(), priority);
+        Ok(())
+    }
+
+    #[pyo3(name = "subscribe_socket_state")]
+    #[pyo3(signature = (priority=None))]
+    fn py_subscribe_socket_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::subscribe_socket_state(self.inner_mut(), priority);
+        Ok(())
     }
 
     #[pyo3(name = "subscribe_instruments")]
@@ -1587,6 +1650,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instruments(self.inner_mut(), venue, client_id, params);
         Ok(())
@@ -1601,6 +1665,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1619,6 +1684,7 @@ impl PyDataActor {
         managed: bool,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         let depth = depth.and_then(NonZeroUsize::new);
         DataActor::subscribe_book_deltas(
@@ -1644,6 +1710,7 @@ impl PyDataActor {
         managed: bool,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_book_depth10(
             self.inner_mut(),
@@ -1669,11 +1736,12 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let params = dict_to_params(py, params)?;
-        let depth = depth.and_then(NonZeroUsize::new);
         let interval_ms = NonZeroUsize::new(interval_ms)
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
+        self.ensure_registered()?;
+        let params = dict_to_params(py, params)?;
+        let depth = depth.and_then(NonZeroUsize::new);
         DataActor::subscribe_book_at_interval(
             self.inner_mut(),
             instrument_id,
@@ -1695,6 +1763,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_quotes(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1709,6 +1778,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_trades(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1723,6 +1793,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_bars(self.inner_mut(), bar_type, client_id, params);
         Ok(())
@@ -1737,6 +1808,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_mark_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1751,6 +1823,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_index_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1765,6 +1838,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_funding_rates(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1779,6 +1853,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_option_greeks(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1793,6 +1868,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument_status(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1807,6 +1883,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument_close(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1823,6 +1900,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_option_chain(
             self.inner_mut(),
@@ -1844,6 +1922,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_data(self.inner_mut(), data_type, client_id, params);
         Ok(())
@@ -1851,8 +1930,24 @@ impl PyDataActor {
 
     #[pyo3(name = "unsubscribe_signal")]
     #[pyo3(signature = (name=""))]
-    fn py_unsubscribe_signal(&mut self, name: &str) {
+    fn py_unsubscribe_signal(&mut self, name: &str) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_signal(self.inner_mut(), name);
+        Ok(())
+    }
+
+    #[pyo3(name = "unsubscribe_queue_state")]
+    fn py_unsubscribe_queue_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::unsubscribe_queue_state(self.inner_mut());
+        Ok(())
+    }
+
+    #[pyo3(name = "unsubscribe_socket_state")]
+    fn py_unsubscribe_socket_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
+        DataActor::unsubscribe_socket_state(self.inner_mut());
+        Ok(())
     }
 
     #[pyo3(name = "unsubscribe_instruments")]
@@ -1864,6 +1959,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instruments(self.inner_mut(), venue, client_id, params);
         Ok(())
@@ -1878,6 +1974,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1892,6 +1989,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_deltas(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1906,6 +2004,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_depth10(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1921,10 +2020,11 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let params = dict_to_params(py, params)?;
         let interval_ms = NonZeroUsize::new(interval_ms)
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
+        self.ensure_registered()?;
+        let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_at_interval(
             self.inner_mut(),
             instrument_id,
@@ -1944,6 +2044,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_quotes(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1958,6 +2059,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_trades(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1972,6 +2074,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_bars(self.inner_mut(), bar_type, client_id, params);
         Ok(())
@@ -1986,6 +2089,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_mark_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2000,6 +2104,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_index_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2014,6 +2119,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_funding_rates(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2028,6 +2134,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_option_greeks(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2042,6 +2149,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument_status(
             self.inner_mut(),
@@ -2061,6 +2169,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument_close(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2072,8 +2181,10 @@ impl PyDataActor {
         &mut self,
         series_id: OptionSeriesId,
         client_id: Option<ClientId>,
-    ) {
+    ) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_option_chain(self.inner_mut(), series_id, client_id);
+        Ok(())
     }
 
     #[pyo3(name = "request_data")]
@@ -2084,11 +2195,12 @@ impl PyDataActor {
         py: Python<'_>,
         data_type: DataType,
         client_id: ClientId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_data(
@@ -2110,11 +2222,12 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let request_id = DataActor::request_instrument(
             self.inner_mut(),
@@ -2134,11 +2247,12 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         venue: Option<Venue>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let request_id =
             DataActor::request_instruments(self.inner_mut(), venue, start, end, client_id, params)
@@ -2156,6 +2270,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let depth = depth.and_then(NonZeroUsize::new);
 
@@ -2177,12 +2292,13 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_book_deltas(
@@ -2205,13 +2321,14 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         depth: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let depth = depth.and_then(NonZeroUsize::new);
@@ -2236,12 +2353,13 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_quotes(
@@ -2264,12 +2382,13 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_trades(
@@ -2292,12 +2411,13 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_funding_rates(
@@ -2320,12 +2440,13 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_bars(
@@ -2339,6 +2460,12 @@ impl PyDataActor {
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
+    }
+
+    /// Requests reconnect of one socket endpoint owned by `client_id`.
+    #[pyo3(name = "reconnect_socket")]
+    fn py_reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> PyResult<()> {
+        DataActor::reconnect_socket(self.inner(), client_id, endpoint).map_err(to_pyruntime_err)
     }
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -2429,6 +2556,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_blocks(self.inner_mut(), chain, client_id, params);
         Ok(())
@@ -2443,6 +2571,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2457,6 +2586,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_swaps(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2471,6 +2601,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_liquidity_updates(
             self.inner_mut(),
@@ -2490,6 +2621,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_fee_collects(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2504,6 +2636,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_flash_events(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2518,6 +2651,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_blocks(self.inner_mut(), chain, client_id, params);
         Ok(())
@@ -2532,6 +2666,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2546,6 +2681,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_swaps(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2560,6 +2696,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_liquidity_updates(
             self.inner_mut(),
@@ -2579,6 +2716,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_fee_collects(
             self.inner_mut(),
@@ -2598,6 +2736,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_flash_events(
             self.inner_mut(),
@@ -2606,6 +2745,28 @@ impl PyDataActor {
             params,
         );
         Ok(())
+    }
+}
+
+impl PyDataActor {
+    fn ensure_registered_for_data(&self) -> PyResult<()> {
+        if self.inner().core.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "DataActor must be registered before publishing, managing synthetics, or requesting data",
+            ))
+        }
+    }
+
+    fn ensure_registered(&self) -> PyResult<()> {
+        if self.inner().core.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "DataActor must be registered before managing subscriptions",
+            ))
+        }
     }
 }
 
@@ -2655,8 +2816,16 @@ mod tests {
         clock::TestClock,
         component::Component,
         enums::ComponentState,
-        messages::data::{BarsResponse, QuotesResponse, TradesResponse},
-        runner::{SyncDataCommandSender, set_data_cmd_sender},
+        live::runner::replace_system_command_sender,
+        messages::{
+            SystemCommand,
+            data::{BarsResponse, CustomDataResponse, QuotesResponse, TradesResponse},
+            system::{
+                QueueCondition, QueueState, QueueStateChanged, SocketState, SocketStateChanged,
+            },
+        },
+        msgbus::{self, MessageBus, MessagingSwitchboard, get_message_bus},
+        runner::{SyncDataCommandSender, SystemChannel, set_data_cmd_sender},
         signal::Signal,
         timer::TimeEvent,
     };
@@ -2888,7 +3057,7 @@ mod tests {
         });
         msgbus::subscribe_any(topic.into(), handler, None);
 
-        actor.py_publish_data(&data.data_type, &data);
+        actor.py_publish_data(&data.data_type, &data).unwrap();
 
         let received = received.borrow();
         assert_eq!(received.len(), 1);
@@ -3007,10 +3176,10 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("example", None);
-        actor.py_unsubscribe_signal("example");
-        actor.py_subscribe_signal("", None);
-        actor.py_unsubscribe_signal("");
+        actor.py_subscribe_signal("example", None).unwrap();
+        actor.py_unsubscribe_signal("example").unwrap();
+        actor.py_subscribe_signal("", None).unwrap();
+        actor.py_unsubscribe_signal("").unwrap();
     }
 
     #[rstest]
@@ -3024,7 +3193,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("trigger", Some(50));
+        actor.py_subscribe_signal("trigger", Some(50)).unwrap();
 
         // The PyO3 binding must forward the priority to the bus unchanged.
         let topic = get_signal_topic("trigger");
@@ -3059,8 +3228,8 @@ mod tests {
                 .py_subscribe_data(py, data.data_type.clone(), None, None)
                 .unwrap();
 
-            rust_actor.py_publish_data(&data.data_type, &data);
-            rust_actor.py_publish_data(&data.data_type, &data);
+            rust_actor.py_publish_data(&data.data_type, &data).unwrap();
+            rust_actor.py_publish_data(&data.data_type, &data).unwrap();
 
             assert!(python_method_was_called(&py_actor, py, "on_data"));
             assert_eq!(python_method_call_count(&py_actor, py, "on_data"), 2);
@@ -3088,7 +3257,7 @@ mod tests {
             rust_actor.register_in_global_registries();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None);
+            rust_actor.py_subscribe_signal("example", None).unwrap();
             let val1: Py<PyAny> = "1.5".into_py_any_unwrap(py);
             let val2: Py<PyAny> = 2.0_f64.into_py_any_unwrap(py);
             rust_actor
@@ -3124,19 +3293,108 @@ mod tests {
             rust_actor.register_in_global_registries();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None);
+            rust_actor.py_subscribe_signal("example", None).unwrap();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             rust_actor
                 .py_publish_signal(py, "example", val1, 0)
                 .unwrap();
 
-            rust_actor.py_unsubscribe_signal("example");
+            rust_actor.py_unsubscribe_signal("example").unwrap();
             rust_actor
                 .py_publish_signal(py, "example", val2, 0)
                 .unwrap();
 
             assert_eq!(python_method_call_count(&py_actor, py, "on_signal"), 1);
+        });
+    }
+
+    #[rstest]
+    fn test_queue_state_changed_subscription_dispatches_and_unsubscribes(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        *get_message_bus().borrow_mut() = MessageBus::default();
+
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let py_actor = create_tracking_python_actor(py).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+            rust_actor.register_in_global_registries();
+            rust_actor.py_start().unwrap();
+            rust_actor.py_subscribe_queue_state(Some(50)).unwrap();
+
+            let topic = MessagingSwitchboard::queue_state_changed_topic();
+            let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+            assert_eq!(subscriptions.len(), 1);
+            assert_eq!(subscriptions[0].priority, 50);
+
+            let triggered = sample_queue_state_changed(QueueState::Triggered);
+            msgbus::publish_any(topic, &triggered);
+
+            let (received,) = py_actor
+                .call_method1(py, "last_call_args", ("on_queue_state",))
+                .unwrap()
+                .extract::<(QueueStateChanged,)>(py)
+                .unwrap();
+            assert_eq!(received, triggered);
+
+            rust_actor.py_unsubscribe_queue_state().unwrap();
+            let cleared = sample_queue_state_changed(QueueState::Cleared);
+            msgbus::publish_any(topic, &cleared);
+
+            assert_eq!(python_method_call_count(&py_actor, py, "on_queue_state"), 1);
+        });
+    }
+
+    #[rstest]
+    fn test_socket_state_changed_subscription_dispatches_and_unsubscribes(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        *get_message_bus().borrow_mut() = MessageBus::default();
+
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let py_actor = create_tracking_python_actor(py).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+            rust_actor.register_in_global_registries();
+            rust_actor.py_start().unwrap();
+            rust_actor.py_subscribe_socket_state(Some(50)).unwrap();
+
+            let topic = MessagingSwitchboard::socket_state_changed_topic();
+            let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+            assert_eq!(subscriptions.len(), 1);
+            assert_eq!(subscriptions[0].priority, 50);
+
+            let connected = sample_socket_state_changed(SocketState::Connected);
+            msgbus::publish_any(topic, &connected);
+
+            let (received,) = py_actor
+                .call_method1(py, "last_call_args", ("on_socket_state",))
+                .unwrap()
+                .extract::<(SocketStateChanged,)>(py)
+                .unwrap();
+            assert_eq!(received, connected);
+
+            rust_actor.py_unsubscribe_socket_state().unwrap();
+            let disconnected = sample_socket_state_changed(SocketState::Disconnected);
+            msgbus::publish_any(topic, &disconnected);
+
+            assert_eq!(
+                python_method_call_count(&py_actor, py, "on_socket_state"),
+                1
+            );
         });
     }
 
@@ -3161,7 +3419,7 @@ mod tests {
             rust_actor.register_in_global_registries();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("", None);
+            rust_actor.py_subscribe_signal("", None).unwrap();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             let val3: Py<PyAny> = "3".into_py_any_unwrap(py);
@@ -3382,6 +3640,46 @@ class CapturingActor:
         assert_eq!(state, ComponentState::Ready);
     }
 
+    #[rstest]
+    fn test_python_reconnect_socket_enqueues_typed_command(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+        replace_system_command_sender(system_tx);
+        let actor = create_registered_actor(clock, cache, trader_id);
+
+        actor
+            .py_reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+            .expect("valid reconnect command");
+        let command = system_rx
+            .try_recv()
+            .expect("reconnect command should be queued");
+        let SystemCommand::ReconnectSocket(command) = command;
+
+        assert_eq!(command.trader_id, trader_id);
+        assert_eq!(command.client_id, ClientId::from("POLYMARKET"));
+        assert_eq!(command.endpoint.as_str(), "polymarket-market-streams");
+        assert_eq!(command.ts_init, UnixNanos::default());
+    }
+
+    #[rstest]
+    fn test_python_reconnect_socket_returns_errors_without_panicking() {
+        let actor = create_unregistered_actor();
+
+        assert!(
+            actor
+                .py_reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+                .is_err()
+        );
+        assert!(
+            actor
+                .py_reconnect_socket(ClientId::from("POLYMARKET"), "wss://secret.example")
+                .is_err()
+        );
+    }
+
     fn sample_instrument() -> CurrencyPair {
         audusd_sim()
     }
@@ -3405,6 +3703,33 @@ class CapturingActor:
             "1.0".to_string(),
             UnixNanos::default(),
             UnixNanos::default(),
+        )
+    }
+
+    fn sample_queue_state_changed(state: QueueState) -> QueueStateChanged {
+        QueueStateChanged::new(
+            TraderId::from("TRADER-001"),
+            SystemChannel::ExecCommands,
+            QueueCondition::Backlogged,
+            state,
+            17,
+            23,
+            UUID4::from("00000000-0000-4000-8000-000000000001"),
+            UnixNanos::from(1_700_000_000_000_000_001),
+            UnixNanos::from(1_700_000_000_000_000_002),
+        )
+    }
+
+    fn sample_socket_state_changed(state: SocketState) -> SocketStateChanged {
+        SocketStateChanged::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("BINANCE"),
+            Some(Venue::from("BINANCE")),
+            Ustr::from("binance-futures-market-streams"),
+            state,
+            UUID4::from("00000000-0000-4000-8000-000000000001"),
+            UnixNanos::from(1_700_000_000_000_000_001),
+            UnixNanos::from(1_700_000_000_000_000_002),
         )
     }
 
@@ -3753,6 +4078,8 @@ class TrackingActor:
         "on_time_event",
         "on_data",
         "on_signal",
+        "on_queue_state",
+        "on_socket_state",
         "on_instrument",
         "on_quote",
         "on_trade",
@@ -4416,6 +4743,8 @@ class IndicatorEventActor:
     #[case("on_time_event")]
     #[case("on_data")]
     #[case("on_signal")]
+    #[case("on_queue_state")]
+    #[case("on_socket_state")]
     #[case("on_instrument")]
     #[case("on_quote")]
     #[case("on_trade")]
@@ -4452,6 +4781,14 @@ class IndicatorEventActor:
                     "on_signal" => {
                         let signal = sample_signal();
                         rust_actor.inner_mut().on_signal(&signal)
+                    }
+                    "on_queue_state" => {
+                        let event = sample_queue_state_changed(QueueState::Triggered);
+                        rust_actor.inner_mut().on_queue_state(&event)
+                    }
+                    "on_socket_state" => {
+                        let event = sample_socket_state_changed(SocketState::Connected);
+                        rust_actor.inner_mut().on_socket_state(&event)
                     }
                     "on_instrument" => {
                         let instrument = InstrumentAny::CurrencyPair(sample_instrument());
@@ -4731,6 +5068,115 @@ class IndicatorEventActor:
             rust_actor.inner_mut().on_quote(&quote).unwrap();
 
             assert_eq!(python_method_call_count(&py_actor, py, "on_quote"), 3);
+        });
+    }
+
+    #[rstest]
+    fn test_python_dispatch_historical_custom_data_preserves_payload_shape(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+        client_id: ClientId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let py_actor = create_tracking_python_actor(py).unwrap();
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+
+            let data = vec![
+                stub_custom_data(1, 42, None, None),
+                stub_custom_data(2, 84, None, None),
+            ];
+            let scalar = stub_custom_data(3, 126, None, None);
+            let scalar_response = CustomDataResponse::new(
+                UUID4::new(),
+                client_id,
+                None,
+                scalar.data_type.clone(),
+                scalar.clone(),
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+
+            DataActor::handle_data_response(rust_actor.inner_mut(), &scalar_response);
+
+            let actual_scalar = py_actor
+                .call_method1(py, "last_call_args", ("on_historical_data",))
+                .unwrap()
+                .bind(py)
+                .get_item(0)
+                .unwrap()
+                .extract::<CustomData>()
+                .unwrap();
+
+            assert_eq!(
+                python_method_call_count(&py_actor, py, "on_historical_data"),
+                1
+            );
+            assert_eq!(actual_scalar, scalar);
+
+            let empty_response = CustomDataResponse::new(
+                UUID4::new(),
+                client_id,
+                None,
+                data[0].data_type.clone(),
+                Vec::<CustomData>::new(),
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+
+            DataActor::handle_data_response(rust_actor.inner_mut(), &empty_response);
+
+            let empty = py_actor
+                .call_method1(py, "last_call_args", ("on_historical_data",))
+                .unwrap()
+                .bind(py)
+                .get_item(0)
+                .unwrap()
+                .extract::<Vec<CustomData>>()
+                .unwrap();
+
+            assert_eq!(
+                python_method_call_count(&py_actor, py, "on_historical_data"),
+                2
+            );
+            assert!(empty.is_empty());
+
+            let response = CustomDataResponse::new(
+                UUID4::new(),
+                client_id,
+                None,
+                data[0].data_type.clone(),
+                data.clone(),
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+
+            DataActor::handle_data_response(rust_actor.inner_mut(), &response);
+
+            let actual = py_actor
+                .call_method1(py, "last_call_args", ("on_historical_data",))
+                .unwrap()
+                .bind(py)
+                .get_item(0)
+                .unwrap()
+                .extract::<Vec<CustomData>>()
+                .unwrap();
+
+            assert_eq!(
+                python_method_call_count(&py_actor, py, "on_historical_data"),
+                3
+            );
+            assert_eq!(actual, data);
         });
     }
 

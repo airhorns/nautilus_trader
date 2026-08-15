@@ -2052,6 +2052,7 @@ mod tests {
             last_px: Price::from("1.00000"),
             currency: Currency::USD(),
             avg_px_open: 1.0,
+            realized_pnl: None,
             event_id: UUID4::new(),
             ts_event: UnixNanos::from(10),
             ts_init: UnixNanos::from(11),
@@ -2677,6 +2678,46 @@ mod tests {
                 .contains("failed to decode JSON QuoteTick"),
             "{error:?}"
         );
+        reset_message_bus();
+    }
+
+    #[rstest]
+    fn republish_external_message_rejects_invalid_topic_and_processes_next_message() {
+        let quote = QuoteTick::default();
+        let payload = serde_json::to_vec(&quote).unwrap();
+        let invalid_message = BusMessage::with_str_topic(
+            "data.quotes.AUDUSD.SIM*",
+            BusPayloadType::Custom(Ustr::from("UnregisteredCustomData")),
+            Bytes::from(payload.clone()),
+            SerializationEncoding::Json,
+        );
+        let valid_message = BusMessage::with_str_topic(
+            "data.quotes.AUDUSD.SIM",
+            BusPayloadType::QuoteTick,
+            Bytes::from(payload),
+            SerializationEncoding::Json,
+        );
+        let received = Rc::new(RefCell::new(Vec::<QuoteTick>::new()));
+        let received_handler = received.clone();
+        subscribe_quotes(
+            "data.quotes.*".into(),
+            TypedHandler::from(move |quote: &QuoteTick| {
+                received_handler.borrow_mut().push(*quote);
+            }),
+            None,
+        );
+        get_message_bus()
+            .borrow_mut()
+            .add_streaming_type(BusPayloadType::QuoteTick);
+
+        let error = republish_external_message(&invalid_message).unwrap_err();
+        republish_external_message(&valid_message).unwrap();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "invalid external message topic: Topic `value` contained invalid characters, was data.quotes.AUDUSD.SIM*"
+        );
+        assert_eq!(*received.borrow(), vec![quote]);
         reset_message_bus();
     }
 

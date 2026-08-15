@@ -29,7 +29,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -161,7 +161,7 @@ mod tests {
         indicator::{Indicator, MovingAverage},
         momentum::macd::MovingAverageConvergenceDivergence,
         stubs::*,
-        testing::approx_equal,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -214,11 +214,7 @@ mod tests {
         macd_10.update_raw(1.00020);
         macd_10.update_raw(1.00010);
         macd_10.update_raw(1.00000);
-        assert!(
-            approx_equal(macd_10.value, -2.5e-5),
-            "MACD value {:.17e} not within tolerance of -2.5e-5",
-            macd_10.value
-        );
+        assert_approx_equal(macd_10.value, -2.5e-5);
     }
 
     #[rstest]

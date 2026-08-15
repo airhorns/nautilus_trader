@@ -24,8 +24,8 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos, correctness::check_predicate_true};
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{
@@ -80,7 +80,7 @@ use crate::{
             UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionChain,
             UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
         },
-        system::ShutdownSystem,
+        system::{QueueStateChanged, ShutdownSystem, SocketStateChanged},
     },
     msgbus::{
         self, MStr, Pattern, ShareableMessageHandler, Topic, TypedHandler, get_message_bus,
@@ -96,17 +96,21 @@ use crate::{
     signal::Signal,
     timer::{TimeEvent, TimeEventCallback},
 };
+#[cfg(feature = "live")]
+use crate::{
+    live::try_get_system_command_sender,
+    messages::{
+        SystemCommand,
+        system::{ReconnectSocket, socket_endpoint},
+    },
+};
 
 /// Common configuration for [`DataActor`] based components.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.common",
-        subclass,
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.common", subclass, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -136,7 +140,7 @@ impl Default for DataActorConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.common", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -401,6 +405,26 @@ pub trait DataActor: Component {
         Ok(())
     }
 
+    /// Actions to be performed when receiving a queue state change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the queue state change fails.
+    #[allow(unused_variables)]
+    fn on_queue_state(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving a socket state change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the socket state change fails.
+    #[allow(unused_variables)]
+    fn on_socket_state(&mut self, event: &SocketStateChanged) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Actions to be performed when receiving an instrument.
     ///
     /// # Errors
@@ -607,7 +631,10 @@ pub trait DataActor: Component {
         Ok(())
     }
 
-    /// Actions to be performed when receiving historical data.
+    /// Actions to be performed when receiving historical custom data.
+    ///
+    /// The callback runs once per response. A scalar [`CustomData`] remains scalar, while a
+    /// `Vec<CustomData>` batch remains intact, including when empty.
     ///
     /// # Errors
     ///
@@ -832,6 +859,34 @@ pub trait DataActor: Component {
         }
 
         if let Err(e) = self.on_signal(signal) {
+            log_error(&e);
+        }
+    }
+
+    /// Handles a received queue state change.
+    fn handle_queue_state(&mut self, event: &QueueStateChanged) {
+        log_received(&event);
+
+        if self.not_running() {
+            log_not_running(&event);
+            return;
+        }
+
+        if let Err(e) = self.on_queue_state(event) {
+            log_error(&e);
+        }
+    }
+
+    /// Handles a received socket state change.
+    fn handle_socket_state(&mut self, event: &SocketStateChanged) {
+        log_received(&event);
+
+        if self.not_running() {
+            log_not_running(&event);
+            return;
+        }
+
+        if let Err(e) = self.on_socket_state(event) {
             log_error(&e);
         }
     }
@@ -1157,7 +1212,12 @@ pub trait DataActor: Component {
 
     /// Handles a data response.
     fn handle_data_response(&mut self, resp: &CustomDataResponse) {
-        log_received(&resp);
+        if let Some(data) = resp.data.as_ref().downcast_ref::<Vec<CustomData>>() {
+            log_received_bulk("CustomDataResponse", &resp.correlation_id, data.len());
+            log::trace!("{RECV} {resp:?}");
+        } else {
+            log_received(&resp);
+        }
 
         if let Err(e) = self.on_historical_data(resp.data.as_ref()) {
             log_error(&e);
@@ -1333,6 +1393,50 @@ pub trait DataActor: Component {
         });
 
         DataActorCore::subscribe_signal(self.core_mut(), handler, name, priority);
+    }
+
+    /// Subscribes to [`QueueStateChanged`] events.
+    ///
+    /// `priority` controls dispatch order when multiple actors subscribe to the event. Higher
+    /// values receive the event first. Re-subscribing does not update an existing priority; call
+    /// [`unsubscribe_queue_state`](Self::unsubscribe_queue_state) first.
+    fn subscribe_queue_state(&mut self, priority: Option<u32>)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.core().actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |event: &QueueStateChanged| {
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_queue_state(event);
+            } else {
+                log::error!("Actor {actor_id} not found for queue state change handling");
+            }
+        });
+
+        DataActorCore::subscribe_queue_state(self.core_mut(), handler, priority);
+    }
+
+    /// Subscribes to [`SocketStateChanged`] events.
+    ///
+    /// `priority` controls dispatch order when multiple actors subscribe to the event. Higher
+    /// values receive the event first. Re-subscribing does not update an existing priority; call
+    /// [`unsubscribe_socket_state`](Self::unsubscribe_socket_state) first.
+    fn subscribe_socket_state(&mut self, priority: Option<u32>)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.core().actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |event: &SocketStateChanged| {
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_socket_state(event);
+            } else {
+                log::error!("Actor {actor_id} not found for socket state change handling");
+            }
+        });
+
+        DataActorCore::subscribe_socket_state(self.core_mut(), handler, priority);
     }
 
     /// Subscribe to streaming [`QuoteTick`] data for the `instrument_id`.
@@ -1977,6 +2081,24 @@ pub trait DataActor: Component {
         DataActorCore::unsubscribe_signal(self.core_mut(), name);
     }
 
+    /// Unsubscribes from [`QueueStateChanged`] events.
+    fn unsubscribe_queue_state(&mut self)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        DataActorCore::unsubscribe_queue_state(self.core_mut());
+    }
+
+    /// Unsubscribes from [`SocketStateChanged`] events.
+    fn unsubscribe_socket_state(&mut self)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        DataActorCore::unsubscribe_socket_state(self.core_mut());
+    }
+
     /// Unsubscribe from streaming [`InstrumentAny`] data for the `venue`.
     fn unsubscribe_instruments(
         &mut self,
@@ -2293,8 +2415,8 @@ pub trait DataActor: Component {
         &mut self,
         data_type: DataType,
         client_id: ClientId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         params: Option<Params>,
     ) -> anyhow::Result<UUID4>
@@ -2327,8 +2449,8 @@ pub trait DataActor: Component {
     fn request_instrument(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Params>,
     ) -> anyhow::Result<UUID4>
@@ -2360,8 +2482,8 @@ pub trait DataActor: Component {
     fn request_instruments(
         &mut self,
         venue: Option<Venue>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Params>,
     ) -> anyhow::Result<UUID4>
@@ -2424,8 +2546,8 @@ pub trait DataActor: Component {
     fn request_book_deltas(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -2460,8 +2582,8 @@ pub trait DataActor: Component {
     fn request_book_depth(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         depth: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
@@ -2497,8 +2619,8 @@ pub trait DataActor: Component {
     fn request_quotes(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -2532,8 +2654,8 @@ pub trait DataActor: Component {
     fn request_trades(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -2567,8 +2689,8 @@ pub trait DataActor: Component {
     fn request_bars(
         &mut self,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -2602,8 +2724,8 @@ pub trait DataActor: Component {
     fn request_funding_rates(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -2627,6 +2749,24 @@ pub trait DataActor: Component {
             params,
             handler,
         )
+    }
+
+    /// Requests reconnect of one socket endpoint owned by `client_id`.
+    ///
+    /// This is a fire-and-observe command. A successful return means the live runner queued the
+    /// request. [`SocketStateChanged`] events for the same endpoint report whether the transport
+    /// enters reconnect mode and later recovers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is not registered, the endpoint label is invalid, the live
+    /// runner is unavailable, or the runner command channel is closed.
+    #[cfg(feature = "live")]
+    fn reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> anyhow::Result<()>
+    where
+        Self: DataActorNative,
+    {
+        DataActorCore::reconnect_socket(self.core(), client_id, endpoint)
     }
 }
 
@@ -2655,7 +2795,7 @@ where
     T: DataActor + DataActorNative + Debug + 'static,
 {
     fn component_id(&self) -> ComponentId {
-        ComponentId::new(self.core().actor_id.inner().as_str())
+        ComponentId::from(self.core().actor_id)
     }
 
     fn state(&self) -> ComponentState {
@@ -2790,6 +2930,7 @@ impl DataActorCore {
         &mut self,
         topic: MStr<Topic>,
         handler: ShareableMessageHandler,
+        priority: Option<u32>,
     ) {
         let pattern: MStr<Pattern> = topic.into();
         if self.topic_handlers.contains_key(&pattern) {
@@ -2801,7 +2942,7 @@ impl DataActorCore {
         }
 
         self.topic_handlers.insert(pattern, handler.clone());
-        msgbus::subscribe_any(pattern, handler, None);
+        msgbus::subscribe_any(pattern, handler, priority);
     }
 
     /// Removes a subscription handler for the `topic` if present.
@@ -3664,7 +3805,7 @@ impl DataActorCore {
         );
 
         let topic = get_custom_topic(&data_type);
-        self.add_subscription_any(topic, handler);
+        self.add_subscription_any(topic, handler, None);
 
         // If no client ID specified, just subscribe to the topic
         if client_id.is_none() {
@@ -3709,6 +3850,38 @@ impl DataActorCore {
         }
         self.topic_handlers.insert(pattern, handler.clone());
         msgbus::subscribe_any(pattern, handler, priority);
+    }
+
+    /// Registers a queue state change subscription from the trait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn subscribe_queue_state(
+        &mut self,
+        handler: ShareableMessageHandler,
+        priority: Option<u32>,
+    ) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::queue_state_changed_topic();
+        self.add_subscription_any(topic, handler, priority);
+    }
+
+    /// Registers a socket state change subscription from the trait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn subscribe_socket_state(
+        &mut self,
+        handler: ShareableMessageHandler,
+        priority: Option<u32>,
+    ) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
+        self.add_subscription_any(topic, handler, priority);
     }
 
     /// Helper method for registering quotes subscriptions from the trait.
@@ -4053,7 +4226,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.add_subscription_any(topic, handler);
+        self.add_subscription_any(topic, handler, None);
 
         let command = SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
             instrument_id,
@@ -4173,6 +4346,30 @@ impl DataActorCore {
                 self.actor_id,
             );
         }
+    }
+
+    /// Unsubscribes from queue state changes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn unsubscribe_queue_state(&mut self) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::queue_state_changed_topic();
+        self.remove_subscription_any(topic);
+    }
+
+    /// Unsubscribes from socket state changes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn unsubscribe_socket_state(&mut self) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
+        self.remove_subscription_any(topic);
     }
 
     /// Helper method for unsubscribing from instruments.
@@ -4567,8 +4764,8 @@ impl DataActorCore {
         &self,
         data_type: DataType,
         client_id: ClientId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         params: Option<Params>,
         handler: ShareableMessageHandler,
@@ -4607,8 +4804,8 @@ impl DataActorCore {
     pub fn request_instrument(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Params>,
         handler: ShareableMessageHandler,
@@ -4646,8 +4843,8 @@ impl DataActorCore {
     pub fn request_instruments(
         &self,
         venue: Option<Venue>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Params>,
         handler: ShareableMessageHandler,
@@ -4720,8 +4917,8 @@ impl DataActorCore {
     pub fn request_book_deltas(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -4762,8 +4959,8 @@ impl DataActorCore {
     pub fn request_book_depth(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         depth: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
@@ -4806,8 +5003,8 @@ impl DataActorCore {
     pub fn request_quotes(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -4848,8 +5045,8 @@ impl DataActorCore {
     pub fn request_trades(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -4890,8 +5087,8 @@ impl DataActorCore {
     pub fn request_bars(
         &self,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -4938,8 +5135,8 @@ impl DataActorCore {
     pub fn request_funding_rates(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -4969,6 +5166,35 @@ impl DataActorCore {
         self.send_data_cmd(DataCommand::Request(command));
 
         Ok(request_id)
+    }
+
+    /// Sends a fire-and-observe reconnect command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is not registered, the endpoint label is invalid, the live
+    /// runner is unavailable, or the command channel is closed.
+    #[cfg(feature = "live")]
+    pub fn reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> anyhow::Result<()> {
+        let endpoint = socket_endpoint(endpoint)?;
+
+        if !self.is_properly_registered() {
+            anyhow::bail!(
+                "Actor {} has not been registered with a Trader",
+                self.actor_id
+            );
+        }
+
+        let sender = try_get_system_command_sender()
+            .ok_or_else(|| anyhow::anyhow!("Live runner system command channel is unavailable"))?;
+        let trader_id = self
+            .trader_id
+            .ok_or_else(|| anyhow::anyhow!("Actor {} has no trader ID", self.actor_id))?;
+        let command = ReconnectSocket::new(trader_id, client_id, endpoint, self.timestamp_ns());
+        sender
+            .send(SystemCommand::ReconnectSocket(command))
+            .map_err(|_| anyhow::anyhow!("Live runner system command channel is closed"))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5037,9 +5263,9 @@ impl DataActorNative for DataActorCore {
 }
 
 fn check_timestamps(
-    now: DateTime<Utc>,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    now: Timestamp,
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
 ) -> anyhow::Result<()> {
     if let Some(start) = start {
         check_predicate_true(start <= now, "start was > now")?;

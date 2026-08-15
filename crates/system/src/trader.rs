@@ -317,7 +317,7 @@ impl Trader {
             anyhow::bail!("Actor {actor_id} is already registered");
         }
 
-        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let component_id = ComponentId::from(actor_id);
         let clock = self.create_component_clock(component_id);
 
         let mut actor_mut = actor;
@@ -379,7 +379,7 @@ impl Trader {
         python_actor: &Py<PyAny>,
         actor_id: ActorId,
     ) -> anyhow::Result<()> {
-        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let component_id = ComponentId::from(actor_id);
         let clock = self.create_component_clock(component_id);
         let trader_id = self.trader_id;
         let cache = self.cache.clone();
@@ -828,7 +828,7 @@ impl Trader {
             self.strategy_ids.iter().map(StrategyId::get_tag).collect();
         ensure_unique_order_id_tag(&existing_order_id_tags, strategy_id.get_tag())?;
 
-        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let component_id = ComponentId::from(strategy_id);
         let clock = self.create_component_clock(component_id);
         let trader_id = self.trader_id;
         let cache = self.cache.clone();
@@ -950,7 +950,7 @@ impl Trader {
                 .strategy_id())
         })?;
 
-        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let component_id = ComponentId::from(strategy_id);
         let clock = self.create_component_clock(component_id);
         let trader_id = self.trader_id;
         let cache = self.cache.clone();
@@ -1523,7 +1523,7 @@ impl Trader {
         for strategy_id in &self.strategy_ids {
             log::debug!("Disposing strategy {strategy_id}");
             dispose_component(&strategy_id.inner())?;
-            let component_id = ComponentId::new(strategy_id.inner().as_str());
+            let component_id = ComponentId::from(*strategy_id);
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
@@ -1563,7 +1563,7 @@ impl Trader {
             // misbehaving actor does not leave the rest in a half-cleared state.
             let _ = stop_component(&actor_id.inner());
             dispose_component(&actor_id.inner())?;
-            let component_id = ComponentId::new(actor_id.inner().as_str());
+            let component_id = ComponentId::from(*actor_id);
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
@@ -1588,7 +1588,7 @@ impl Trader {
             dispose_component(&exec_algorithm_id.inner())?;
             let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
             msgbus::deregister_any(endpoint.into());
-            let component_id = ComponentId::new(exec_algorithm_id.inner().as_str());
+            let component_id = ComponentId::from(exec_algorithm_id);
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
@@ -1651,7 +1651,7 @@ impl Trader {
 
         self.actor_ids.swap_remove(pos);
         self.actor_state_callbacks.remove(actor_id);
-        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let component_id = ComponentId::from(*actor_id);
         if let Some(clock) = self.clocks.get(&component_id) {
             clock.borrow_mut().cancel_timers();
         }
@@ -1778,7 +1778,7 @@ impl Trader {
         self.strategy_ids.swap_remove(pos);
         self.strategy_state_callbacks.remove(strategy_id);
         self.strategy_stop_fns.remove(strategy_id);
-        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let component_id = ComponentId::from(*strategy_id);
         if let Some(clock) = self.clocks.get(&component_id) {
             clock.borrow_mut().cancel_timers();
         }
@@ -1814,10 +1814,9 @@ impl Trader {
         }
 
         for (actor_id, callbacks) in actor_callbacks {
-            let component_id = ComponentId::new(actor_id.inner().as_str());
             let state = cache
                 .borrow()
-                .load_actor_state(&component_id)
+                .load_actor_state(&actor_id)
                 .map_err(|e| anyhow::anyhow!("Failed to load actor {actor_id} state: {e:#}"))?;
             let Some(state) = state.filter(|state| !state.is_empty()) else {
                 continue;
@@ -1872,8 +1871,7 @@ impl Trader {
         for (actor_id, callbacks) in actor_callbacks {
             match (callbacks.save)(actor_id.inner()) {
                 Ok(state) => {
-                    let component_id = ComponentId::new(actor_id.inner().as_str());
-                    if let Err(e) = cache.borrow().update_actor_state(&component_id, &state) {
+                    if let Err(e) = cache.borrow().update_actor_state(&actor_id, &state) {
                         errors.push(format!("actor {actor_id} persistence: {e:#}"));
                     }
                 }
@@ -2316,6 +2314,7 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
+        sync::Arc,
     };
 
     use nautilus_common::{
@@ -2327,22 +2326,35 @@ mod tests {
         cache::Cache,
         clock::TestClock,
         enums::{ComponentState, Environment},
+        messages::execution::SubmitOrder,
         msgbus,
-        msgbus::{MessageBus, TypedHandler, switchboard::get_event_order_topic},
+        msgbus::{
+            MessageBus, MessagingSwitchboard, TypedHandler, set_message_bus,
+            switchboard::get_event_order_topic,
+        },
         nautilus_actor,
+        runner::{
+            SyncTradingCommandSender, drain_trading_cmd_queue, replace_exec_cmd_sender,
+            trading_cmd_queue_is_empty,
+        },
     };
     use nautilus_core::UUID4;
     use nautilus_data::engine::{DataEngine, config::DataEngineConfig};
     use nautilus_execution::engine::{ExecutionEngine, config::ExecutionEngineConfig};
     use nautilus_model::{
-        enums::{OrderType, PositionAdjustmentType},
+        enums::{OrderSide, OrderStatus, OrderType, PositionAdjustmentType},
         events::{
-            OrderAccepted, OrderFilled, OrderRejected, OrderUpdated, PositionAdjusted,
-            order::spec::{OrderFilledSpec, OrderRejectedSpec, OrderUpdatedSpec},
+            OrderAccepted, OrderDenied, OrderFilled, OrderRejected, OrderUpdated, PositionAdjusted,
+            order::spec::{
+                OrderAcceptedSpec, OrderFilledSpec, OrderRejectedSpec, OrderSubmittedSpec,
+                OrderUpdatedSpec,
+            },
         },
         identifiers::{
             AccountId, ActorId, ClientOrderId, ComponentId, InstrumentId, PositionId, TraderId,
+            VenueOrderId,
         },
+        instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
         orders::{OrderAny, OrderTestBuilder},
         stubs::TestDefault,
         types::Quantity,
@@ -2386,6 +2398,9 @@ mod tests {
     struct TestExecAlgorithm {
         core: ExecutionAlgorithmCore,
         fail_start: bool,
+        submit_on_accept: Option<OrderAny>,
+        accepted_events: usize,
+        denied_events: usize,
         rejected_events: usize,
         updated_events: usize,
         filled_events: usize,
@@ -2397,6 +2412,9 @@ mod tests {
             Self {
                 core: ExecutionAlgorithmCore::new(config),
                 fail_start: false,
+                submit_on_accept: None,
+                accepted_events: 0,
+                denied_events: 0,
                 rejected_events: 0,
                 updated_events: 0,
                 filled_events: 0,
@@ -2421,6 +2439,18 @@ mod tests {
 
         fn on_order_rejected(&mut self, _event: OrderRejected) {
             self.rejected_events += 1;
+        }
+
+        fn on_order_accepted(&mut self, _event: OrderAccepted) {
+            self.accepted_events += 1;
+
+            if let Some(order) = self.submit_on_accept.take() {
+                self.submit_order(order, None, None).unwrap();
+            }
+        }
+
+        fn on_order_denied(&mut self, _event: OrderDenied) {
+            self.denied_events += 1;
         }
 
         fn on_order_updated(&mut self, _event: OrderUpdated) {
@@ -2998,6 +3028,183 @@ mod tests {
         assert_eq!(trader.exec_algorithm_count(), 1);
         assert_eq!(trader.component_count(), 1);
         assert!(trader.exec_algorithm_ids().contains(&exec_algorithm_id));
+    }
+
+    #[rstest]
+    fn test_exec_algorithm_submit_from_order_event_defers_risk_denial() {
+        std::thread::spawn(|| {
+            msgbus::get_message_bus().borrow_mut().dispose();
+            replace_exec_cmd_sender(Arc::new(SyncTradingCommandSender));
+
+            let trader_id = TraderId::test_default();
+            let instance_id = UUID4::new();
+            let strategy_id = StrategyId::from("Callback-001");
+            let exec_algorithm_id = ExecAlgorithmId::from("CALLBACK");
+            let account_id = AccountId::from("SIM-001");
+            let venue_order_id = VenueOrderId::from("V-PRIMARY-001");
+            let parent_order_id = ClientOrderId::from("O-PRIMARY-001");
+            let child_order_id = ClientOrderId::from("O-CHILD-001");
+            let clock_factory = ClockFactory::test_default();
+            let clock = clock_factory.clock();
+            let msgbus = Rc::new(RefCell::new(MessageBus::new(
+                trader_id,
+                instance_id,
+                Some("test".to_string()),
+                None,
+            )));
+            set_message_bus(msgbus);
+
+            let cache = Rc::new(RefCell::new(Cache::default()));
+            let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+            let instrument_id = instrument.id();
+            cache.borrow_mut().add_instrument(instrument).unwrap();
+            let portfolio = Rc::new(RefCell::new(Portfolio::new(
+                clock.clone(),
+                cache.clone(),
+                None,
+            )));
+            let risk_engine = Rc::new(RefCell::new(RiskEngine::new(
+                RiskEngineConfig::default(),
+                portfolio.borrow().clone_shallow(),
+                clock.clone(),
+                cache.clone(),
+            )));
+            let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(
+                clock.clone(),
+                cache.clone(),
+                Some(ExecutionEngineConfig::default()),
+            )));
+            RiskEngine::register_msgbus_handlers(&risk_engine);
+            ExecutionEngine::register_msgbus_handlers(&exec_engine);
+
+            let parent = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(trader_id)
+                .strategy_id(strategy_id)
+                .instrument_id(instrument_id)
+                .client_order_id(parent_order_id)
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1000"))
+                .exec_algorithm_id(exec_algorithm_id)
+                .exec_spawn_id(parent_order_id)
+                .build();
+            let child = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(trader_id)
+                .strategy_id(strategy_id)
+                .instrument_id(instrument_id)
+                .client_order_id(child_order_id)
+                .side(OrderSide::NoOrderSide)
+                .quantity(Quantity::from("100"))
+                .exec_algorithm_id(exec_algorithm_id)
+                .exec_spawn_id(child_order_id)
+                .build();
+
+            let config = ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(exec_algorithm_id),
+                ..Default::default()
+            };
+            let mut exec_algorithm = TestExecAlgorithm::new(config);
+            exec_algorithm.submit_on_accept = Some(child);
+            let mut trader = Trader::new(
+                trader_id,
+                instance_id,
+                Environment::Backtest,
+                clock_factory,
+                cache.clone(),
+                portfolio,
+            );
+            trader.add_exec_algorithm(exec_algorithm).unwrap();
+            trader.start_components().unwrap();
+
+            cache
+                .borrow_mut()
+                .add_order(parent.clone(), None, None, false)
+                .unwrap();
+            let submit = SubmitOrder::new(
+                trader_id,
+                None,
+                strategy_id,
+                instrument_id,
+                parent.client_order_id(),
+                parent.init_event().clone(),
+                Some(exec_algorithm_id),
+                None,
+                None,
+                UUID4::new(),
+                clock.borrow().timestamp_ns(),
+                None,
+            );
+            get_actor_unchecked::<TestExecAlgorithm>(&exec_algorithm_id.inner())
+                .execute(TradingCommand::SubmitOrder(submit))
+                .unwrap();
+
+            let submitted = OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(parent.client_order_id())
+                    .account_id(account_id)
+                    .build(),
+            );
+            let accepted = OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(parent.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            );
+            msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), submitted);
+            msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), accepted);
+
+            {
+                let cache = cache.borrow();
+                let parent = cache.order(&parent.client_order_id()).unwrap();
+                let child = cache.order(&child_order_id).unwrap();
+                let exec_algorithm =
+                    get_actor_unchecked::<TestExecAlgorithm>(&exec_algorithm_id.inner());
+
+                assert!(!trading_cmd_queue_is_empty());
+                assert_eq!(risk_engine.borrow().command_count(), 0);
+                assert_eq!(exec_engine.borrow().event_count(), 2);
+                assert_eq!(parent.status(), OrderStatus::Accepted);
+                assert_eq!(parent.event_count(), 3);
+                assert_eq!(child.status(), OrderStatus::Initialized);
+                assert_eq!(child.event_count(), 1);
+                assert_eq!(exec_algorithm.accepted_events, 1);
+                assert_eq!(exec_algorithm.denied_events, 0);
+                assert!(exec_algorithm.submit_on_accept.is_none());
+            }
+
+            drain_trading_cmd_queue();
+
+            {
+                let cache = cache.borrow();
+                let parent = cache.order(&parent.client_order_id()).unwrap();
+                let child = cache.order(&child_order_id).unwrap();
+                let exec_algorithm =
+                    get_actor_unchecked::<TestExecAlgorithm>(&exec_algorithm_id.inner());
+
+                assert!(trading_cmd_queue_is_empty());
+                assert_eq!(risk_engine.borrow().command_count(), 1);
+                assert_eq!(exec_engine.borrow().event_count(), 3);
+                assert_eq!(parent.status(), OrderStatus::Accepted);
+                assert_eq!(parent.event_count(), 3);
+                assert_eq!(child.status(), OrderStatus::Denied);
+                assert_eq!(child.event_count(), 2);
+                assert_eq!(
+                    child.last_event().message(),
+                    Some("INVALID_ORDER_SIDE: NO_ORDER_SIDE".into())
+                );
+                assert_eq!(exec_algorithm.accepted_events, 1);
+                assert_eq!(exec_algorithm.denied_events, 1);
+                assert!(exec_algorithm.submit_on_accept.is_none());
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[rstest]
@@ -3771,7 +3978,7 @@ class StateComponent:
                 b"python-strategy-loaded".to_vec(),
             )]);
             let (database, control) = TestCacheDatabaseControl::create();
-            control.set_actor_state(ComponentId::from(actor_id.as_str()), &actor_load);
+            control.set_actor_state(actor_id, &actor_load);
             control.set_strategy_state(strategy_id, &strategy_load);
 
             let (
@@ -3799,7 +4006,7 @@ class StateComponent:
                 ..Default::default()
             }));
             actor.set_python_instance(py_actor.clone_ref(py));
-            let actor_clock = trader.create_component_clock(ComponentId::from(actor_id.as_str()));
+            let actor_clock = trader.create_component_clock(ComponentId::from(actor_id));
             actor
                 .register(trader_id, actor_clock, cache.clone())
                 .unwrap();
@@ -3813,8 +4020,7 @@ class StateComponent:
                 ..Default::default()
             }));
             strategy.set_python_instance(py_strategy.clone_ref(py));
-            let strategy_clock =
-                trader.create_component_clock(ComponentId::from(strategy_id.as_str()));
+            let strategy_clock = trader.create_component_clock(ComponentId::from(strategy_id));
             strategy
                 .register(trader_id, strategy_clock, cache, portfolio)
                 .unwrap();
@@ -3864,10 +4070,7 @@ class StateComponent:
             );
             assert_eq!(actor_calls, vec!["on_load", "on_save"]);
             assert_eq!(strategy_calls, vec!["on_load", "on_save"]);
-            assert_eq!(
-                control.actor_state(&ComponentId::from(actor_id.as_str())),
-                Some(actor_save)
-            );
+            assert_eq!(control.actor_state(&actor_id), Some(actor_save));
             assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
         });
     }

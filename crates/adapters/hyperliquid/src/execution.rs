@@ -37,7 +37,7 @@ use nautilus_core::{
     MUTEX_POISONED, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType},
@@ -184,8 +184,8 @@ use crate::{
         ExecutionReport, NautilusWsMessage,
         client::HyperliquidWebSocketClient,
         dispatch::{
-            DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event,
-            dispatch_order_fill, promote_replacement_from_query,
+            DispatchOutcome, WsDispatchState, dispatch_order_event, dispatch_order_fill,
+            promote_replacement_from_query,
         },
     },
 };
@@ -214,7 +214,7 @@ impl HyperliquidExecutionClient {
 
     /// Returns a reference to the shared WebSocket dispatch state.
     ///
-    /// Exposes the identity map, pending-modify markers, and cached venue
+    /// Exposes the context map, pending-modify markers, and cached venue
     /// order ids used by the two-tier dispatch contract. The state is
     /// read-write via an [`Arc`]; callers must not mutate it directly, but
     /// it is useful for inspection in tests and for live debugging.
@@ -345,9 +345,9 @@ impl HyperliquidExecutionClient {
                 continue;
             }
 
-            self.restore_order_identity(&parent, &parent_request);
+            self.restore_order_context(&parent, &parent_request);
             for child in &active_children {
-                self.restore_order_identity(&child.order, &child.request);
+                self.restore_order_context(&child.order, &child.request);
             }
 
             let has_staged_children = !staged_children.is_empty();
@@ -373,24 +373,15 @@ impl HyperliquidExecutionClient {
         ready_parent_ids
     }
 
-    fn restore_order_identity(&self, order: &OrderAny, request: &HyperliquidExecPlaceOrderRequest) {
+    fn restore_order_context(&self, order: &OrderAny, request: &HyperliquidExecPlaceOrderRequest) {
         let client_order_id = order.client_order_id();
         let cloid = request.cloid.expect("order conversion must set a CLOID");
         self.http_client
             .cache_client_order_id_cloid(client_order_id, cloid);
         self.ws_client
             .cache_cloid_mapping(Ustr::from(&cloid.to_hex()), client_order_id);
-        self.ws_dispatch_state.register_identity(
-            client_order_id,
-            OrderIdentity {
-                strategy_id: order.strategy_id(),
-                instrument_id: order.instrument_id(),
-                order_side: order.order_side(),
-                order_type: order.order_type(),
-                quantity: order.quantity(),
-                price: order.price(),
-            },
-        );
+        self.ws_dispatch_state
+            .register_context(OrderContext::from(order));
 
         if let Some(venue_order_id) = order.venue_order_id() {
             self.ws_dispatch_state
@@ -479,8 +470,8 @@ impl HyperliquidExecutionClient {
         })
     }
 
-    fn register_order_identity(&self, order: &OrderAny) {
-        register_order_identity_into(&self.ws_dispatch_state, order);
+    fn register_order_context(&self, order: &OrderAny) {
+        register_order_context_into(&self.ws_dispatch_state, order);
     }
 
     async fn ensure_instruments_initialized_async(&self) -> anyhow::Result<()> {
@@ -532,7 +523,7 @@ impl HyperliquidExecutionClient {
         // await_account_registered on unfunded wallets.
         let ts_event = self.clock.get_time_ns();
         self.emitter
-            .emit_account_state(balances, margins, true, ts_event);
+            .emit_account_state(balances, margins, true, ts_event, None);
 
         log::debug!("Account state updated successfully");
         Ok(())
@@ -725,9 +716,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -869,7 +861,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         self.ws_client
             .cache_cloid_mapping(Ustr::from(&cloid.to_hex()), order.client_order_id());
 
-        self.register_order_identity(&order);
+        self.register_order_context(&order);
 
         self.emitter.emit_order_submitted(&order);
 
@@ -984,7 +976,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 .cache_client_order_id_cloid(order.client_order_id(), cloid);
             self.ws_client
                 .cache_cloid_mapping(Ustr::from(&cloid.to_hex()), order.client_order_id());
-            self.register_order_identity(order);
+            self.register_order_context(order);
             self.emitter.emit_order_submitted(order);
         }
 
@@ -1566,7 +1558,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 parse_combined_account_balances_and_margins(&perp_state, &spot_state)
                     .context("failed to parse combined account balances and margins")?;
             let ts_event = clock.get_time_ns();
-            emitter.emit_account_state(balances, margins, true, ts_event);
+            emitter.emit_account_state(balances, margins, true, ts_event, None);
 
             Ok(())
         });
@@ -2081,8 +2073,8 @@ impl HyperliquidExecutionClient {
                                     }
                                     ExecutionReport::Fill(report) => {
                                         report.client_order_id.filter(|client_order_id| {
-                                            let Some(identity) =
-                                                dispatch_state.lookup_identity(client_order_id)
+                                            let Some(context) =
+                                                dispatch_state.lookup_context(client_order_id)
                                             else {
                                                 return false;
                                             };
@@ -2091,7 +2083,7 @@ impl HyperliquidExecutionClient {
                                                 .unwrap_or_else(|| {
                                                     Quantity::zero(report.last_qty.precision)
                                                 });
-                                            previous + report.last_qty >= identity.quantity
+                                            previous + report.last_qty >= context.quantity
                                         })
                                     }
                                     _ => None,
@@ -2100,8 +2092,8 @@ impl HyperliquidExecutionClient {
                                 let active_child_fill = match &report {
                                     ExecutionReport::Fill(report) => {
                                         report.client_order_id.and_then(|client_order_id| {
-                                            dispatch_state.lookup_identity(&client_order_id).map(
-                                                |identity| {
+                                            dispatch_state.lookup_context(&client_order_id).map(
+                                                |context| {
                                                     (
                                                         client_order_id,
                                                         dispatch_state
@@ -2111,7 +2103,7 @@ impl HyperliquidExecutionClient {
                                                                     report.last_qty.precision,
                                                                 )
                                                             }),
-                                                        identity.quantity,
+                                                        context.quantity,
                                                     )
                                                 },
                                             )
@@ -2525,7 +2517,7 @@ async fn submit_cancel_action(
     }
 }
 
-/// Registers an order's identity in the dispatch state so its subsequent
+/// Registers an order's context in the dispatch state so its subsequent
 /// WebSocket lifecycle can route through the typed-event path.
 ///
 /// Quote-quantity orders submit a quote amount (e.g. 100 USD) but the venue
@@ -2533,22 +2525,14 @@ async fn submit_cancel_action(
 /// order is fully filled would leave the order stuck "open" forever, so they
 /// flow through the untracked path and the engine reconciles them from
 /// status reports instead.
-fn register_order_identity_into(state: &WsDispatchState, order: &OrderAny) {
-    if order.is_quote_quantity() {
+fn register_order_context_into(state: &WsDispatchState, order: &OrderAny) {
+    let context = OrderContext::from(order);
+    if context.is_quote_quantity {
         return;
     }
-    state.register_identity(
-        order.client_order_id(),
-        OrderIdentity {
-            strategy_id: order.strategy_id(),
-            instrument_id: order.instrument_id(),
-            order_side: order.order_side(),
-            order_type: order.order_type(),
-            quantity: order.quantity(),
-            price: order.price(),
-        },
-    );
-    state.mark_submission_pending(order.client_order_id());
+
+    state.register_context(context);
+    state.mark_submission_pending(context.identity.client_order_id);
 }
 
 fn order_normal_tpsl_submission(
@@ -2756,7 +2740,7 @@ async fn post_order_batch(
         }
         Err(e) => {
             // The batch may have landed. WebSocket events or startup
-            // reconciliation must resolve every identity after transport loss.
+            // reconciliation must resolve every order after transport loss.
             log::error!("{label} WebSocket post request failed: {e}");
         }
     }
@@ -2787,7 +2771,7 @@ fn spawn_staged_children(
         let cloid = request.cloid.expect("order conversion must set a CLOID");
         http_client.cache_client_order_id_cloid(order.client_order_id(), cloid);
         ws_client.cache_cloid_mapping(Ustr::from(&cloid.to_hex()), order.client_order_id());
-        register_order_identity_into(&dispatch_state, order);
+        register_order_context_into(&dispatch_state, order);
         emitter.emit_order_submitted(order);
     }
 
@@ -3253,7 +3237,10 @@ mod tests {
 
     use nautilus_common::messages::{ExecutionEvent, execution::GenerateOrderStatusReports};
     use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
-    use nautilus_live::ExecutionEventEmitter;
+    use nautilus_live::{
+        ExecutionEventEmitter,
+        execution::context::{OrderContext, OrderIdentity},
+    };
     use nautilus_model::{
         enums::{
             AccountType, ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
@@ -3274,10 +3261,10 @@ mod tests {
 
     use super::{
         CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
-        OrderIdentity, PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
+        PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
         build_ouo_resize_request, can_fast_cancel_order, determine_order_list_grouping,
         filter_order_status_reports_for_command, handle_execution_report,
-        register_order_identity_into, split_fast_cancel_requests, validate_order_for_hyperliquid,
+        register_order_context_into, split_fast_cancel_requests, validate_order_for_hyperliquid,
     };
     use crate::{
         common::enums::HyperliquidEnvironment,
@@ -3333,14 +3320,25 @@ mod tests {
         HyperliquidHttpClient::new(HyperliquidEnvironment::Testnet, 1, None).unwrap()
     }
 
-    fn test_identity() -> OrderIdentity {
-        OrderIdentity {
-            strategy_id: StrategyId::from("S-001"),
-            instrument_id: InstrumentId::from(TEST_INSTRUMENT_ID),
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Limit,
+    // Matches the order built by `limit_order_with_flags` so registration
+    // tests can assert the stored context by equality.
+    fn test_context(client_order_id: ClientOrderId) -> OrderContext {
+        OrderContext {
+            identity: OrderIdentity {
+                client_order_id,
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from(TEST_INSTRUMENT_ID),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
             quantity: Quantity::from("0.0001"),
             price: Some(Price::from("56730.0")),
+            trigger_price: None,
+            trigger_type: None,
+            time_in_force: TimeInForce::Gtc,
+            is_post_only: false,
+            is_reduce_only: false,
+            is_quote_quantity: false,
         }
     }
 
@@ -3897,29 +3895,25 @@ mod tests {
     }
 
     #[rstest]
-    fn test_register_order_identity_registers_regular_order() {
+    fn test_register_order_context_registers_regular_order() {
         let state = WsDispatchState::new();
+        let client_order_id = ClientOrderId::from("O-REG-001");
         let order = limit_order_with_flags("O-REG-001", false, false);
 
-        register_order_identity_into(&state, &order);
+        register_order_context_into(&state, &order);
 
-        let found = state
-            .lookup_identity(&ClientOrderId::from("O-REG-001"))
-            .expect("identity should be registered");
-        assert_eq!(found.strategy_id, StrategyId::from("S-001"));
-        assert_eq!(found.instrument_id, InstrumentId::from(TEST_INSTRUMENT_ID));
-        assert_eq!(found.order_side, OrderSide::Buy);
-        assert_eq!(found.order_type, OrderType::Limit);
-        assert_eq!(found.quantity, Quantity::from("0.0001"));
-        assert_eq!(found.price, Some(Price::from("56730.0")));
+        assert_eq!(
+            state.lookup_context(&client_order_id),
+            Some(test_context(client_order_id)),
+        );
     }
 
     #[rstest]
-    fn test_register_order_identity_skips_quote_quantity_order() {
+    fn test_register_order_context_skips_quote_quantity_order() {
         let state = WsDispatchState::new();
         let order = limit_order_with_flags("O-QQ-001", true, false);
 
-        register_order_identity_into(&state, &order);
+        register_order_context_into(&state, &order);
 
         // Quote-quantity orders flow through the untracked path so the engine
         // reconciles them from status reports; registering would make the
@@ -3927,7 +3921,7 @@ mod tests {
         // quote-unit tracked quantity and leave the order stuck "open".
         assert!(
             state
-                .lookup_identity(&ClientOrderId::from("O-QQ-001"))
+                .lookup_context(&ClientOrderId::from("O-QQ-001"))
                 .is_none()
         );
     }
@@ -3944,7 +3938,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-SKIP");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         // Prime state so the later CANCELED(old_voi) is classified as stale.
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("new-voi"));
@@ -3969,7 +3963,7 @@ mod tests {
             Some(cid)
         );
         // Identity is still tracked (the skip path did not clean up).
-        assert!(state.lookup_identity(&cid).is_some());
+        assert!(state.lookup_context(&cid).is_some());
     }
 
     #[rstest]
@@ -3983,7 +3977,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-CANCEL");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("v-cancel"));
 
@@ -4021,7 +4015,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-WS-REJ");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         state.mark_submission_pending(cid);
         ws_client.cache_cloid_mapping(cloid_for("O-HER-WS-REJ"), cid);
 
@@ -4076,7 +4070,7 @@ mod tests {
         let cid = ClientOrderId::from("O-HER-POST-REJ");
         let cloid = cloid_for("O-HER-POST-REJ");
         let order = limit_order_with_flags("O-HER-POST-REJ", false, true);
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         ws_client.cache_cloid_mapping(cloid, cid);
 
         let http_client = make_http_client();
@@ -4129,7 +4123,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-FILL");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("v-fill"));
 
@@ -4186,10 +4180,14 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-BUF");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("old-voi"));
-        state.mark_pending_modify(cid, VenueOrderId::new("old-voi"), test_identity().quantity);
+        state.mark_pending_modify(
+            cid,
+            VenueOrderId::new("old-voi"),
+            test_context(cid).quantity,
+        );
 
         ws_client.cache_cloid_mapping(cloid_for("O-HER-BUF"), cid);
 
@@ -4259,9 +4257,9 @@ mod tests {
         let target_total = Quantity::from("0.00020");
         let venue_remaining = Quantity::from("0.00015");
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("old-voi"));
         state.mark_pending_modify(cid, VenueOrderId::new("old-voi"), target_total);
@@ -4297,11 +4295,11 @@ mod tests {
             other => panic!("expected OrderUpdated, found {other:?}"),
         }
 
-        // identity.quantity drives the terminal-fill threshold; must match target_total.
-        let identity = state
-            .lookup_identity(&cid)
-            .expect("identity should still be tracked");
-        assert_eq!(identity.quantity, target_total);
+        // context.quantity drives the terminal-fill threshold; must match target_total.
+        let context = state
+            .lookup_context(&cid)
+            .expect("context should still be tracked");
+        assert_eq!(context.quantity, target_total);
 
         assert!(state.pending_modify(&cid).is_none());
         assert!(state.pending_modify_target_qty(&cid).is_none());
@@ -4321,7 +4319,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-CR-EXT");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("old-voi"));
 
@@ -4385,9 +4383,9 @@ mod tests {
         let old_voi = "445117664938";
         let new_voi = "445117686214";
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new(old_voi));
 
@@ -4453,9 +4451,9 @@ mod tests {
         let old_voi = "445117664938";
         let new_voi = "445117686214";
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new(old_voi));
         // Modify dispatched while nothing had filled: request sized at the full target
@@ -4514,9 +4512,9 @@ mod tests {
         let cid = ClientOrderId::from("O-HER-4154-NOFILL");
         let target_total = Quantity::from("1.000");
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
         state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
@@ -4560,9 +4558,9 @@ mod tests {
         let target_total = Quantity::from("1.000");
         let new_voi = "445117686214";
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
         state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
@@ -4612,9 +4610,9 @@ mod tests {
         let cid = ClientOrderId::from("O-HER-4154-EXACT");
         let target_total = Quantity::from("1.000");
 
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
         state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
@@ -4657,9 +4655,9 @@ mod tests {
 
         // State after the first corrective: marker re-armed on the prior
         // replacement, stashed request reduced to 0.835, 0.165 already filled.
-        let mut identity = test_identity();
-        identity.quantity = target_total;
-        state.register_identity(cid, identity);
+        let mut context = test_context(cid);
+        context.quantity = target_total;
+        state.register_context(context);
         state.insert_accepted(cid);
         state.record_venue_order_id(cid, VenueOrderId::new("445117686214"));
         state.mark_pending_modify(cid, VenueOrderId::new("445117686214"), target_total);
@@ -4733,7 +4731,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-OPEN");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         ws_client.cache_cloid_mapping(cloid_for("O-HER-OPEN"), cid);
 
         let report = make_status_report(Some("O-HER-OPEN"), "v-open", OrderStatus::Accepted);
@@ -4765,7 +4763,7 @@ mod tests {
         let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
 
         let cid = ClientOrderId::from("O-HER-ACC");
-        state.register_identity(cid, test_identity());
+        state.register_context(test_context(cid));
         ws_client.cache_cloid_mapping(cloid_for("O-HER-ACC"), cid);
 
         let report = make_status_report(Some("O-HER-ACC"), "v-acc", OrderStatus::Accepted);

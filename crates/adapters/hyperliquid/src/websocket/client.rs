@@ -112,10 +112,7 @@ pub(super) enum AssetContextDataType {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -258,7 +255,7 @@ impl HyperliquidWebSocketClient {
             proxy_url: self.proxy_url.clone(),
         };
         let client =
-            WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;
+            WebSocketClient::connect(cfg, Some(message_handler), None, vec![], None).await?;
 
         // Create channels for handler communication
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
@@ -1564,9 +1561,76 @@ impl HyperliquidWebSocketClient {
     ///
     /// Note: `userEvents` already includes fills, so we don't subscribe to `userFills`
     /// separately to avoid duplicate fill messages.
+    ///
+    /// This does **not** include opt-in TWAP custom-data channels
+    /// (`userTwapHistory` / `userTwapSliceFills`).
     pub async fn subscribe_all_user_channels(&self, user: &str) -> anyhow::Result<()> {
         self.subscribe_order_updates(user).await?;
         self.subscribe_user_events(user).await?;
+        Ok(())
+    }
+
+    /// Subscribe to TWAP history for a user address (`userTwapHistory`).
+    ///
+    /// Opt-in custom data. The address need not be the adapter trading account.
+    pub async fn subscribe_user_twap_history(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapHistory {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Unsubscribe from TWAP history for a user address.
+    pub async fn unsubscribe_user_twap_history(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapHistory {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Subscribe to TWAP slice fills for a user address (`userTwapSliceFills`).
+    ///
+    /// Opt-in custom data. The address need not be the adapter trading account.
+    pub async fn subscribe_user_twap_slice_fills(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapSliceFills {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Unsubscribe from TWAP slice fills for a user address.
+    pub async fn unsubscribe_user_twap_slice_fills(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapSliceFills {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
         Ok(())
     }
 

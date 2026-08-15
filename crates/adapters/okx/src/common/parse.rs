@@ -18,6 +18,7 @@
 use std::str::FromStr;
 
 use anyhow::Context;
+use jiff::Timestamp;
 pub use nautilus_core::serialization::{
     deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
     deserialize_optional_string_to_u64, deserialize_string_to_u64,
@@ -326,6 +327,45 @@ pub fn parse_client_order_id(value: &str) -> Option<ClientOrderId> {
     }
 }
 
+pub(crate) fn parse_parent_client_order_id(
+    algo_client_order_id: Option<&str>,
+    client_order_id: &str,
+) -> Option<ClientOrderId> {
+    // OKX keeps the submitted algo client ID when it creates a triggered child order.
+    algo_client_order_id
+        .and_then(parse_client_order_id)
+        .or_else(|| parse_client_order_id(client_order_id))
+}
+
+pub(crate) fn is_order_status_report_more_advanced(
+    candidate: &OrderStatusReport,
+    current: &OrderStatusReport,
+) -> bool {
+    if candidate.filled_qty != current.filled_qty {
+        return candidate.filled_qty > current.filled_qty;
+    }
+
+    let candidate_priority = order_status_priority(candidate.order_status);
+    let current_priority = order_status_priority(current.order_status);
+    if candidate_priority != current_priority {
+        return candidate_priority > current_priority;
+    }
+
+    candidate.ts_last > current.ts_last
+}
+
+const fn order_status_priority(status: OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Initialized | OrderStatus::Submitted | OrderStatus::Emulated => 0,
+        OrderStatus::Released | OrderStatus::Denied => 1,
+        OrderStatus::Accepted | OrderStatus::PendingUpdate | OrderStatus::PendingCancel => 2,
+        OrderStatus::Triggered => 3,
+        OrderStatus::PartiallyFilled => 4,
+        OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => 5,
+        OrderStatus::Filled | OrderStatus::Voided => 6,
+    }
+}
+
 /// Converts a millisecond-based timestamp (as returned by OKX) into
 /// [`UnixNanos`].
 #[must_use]
@@ -340,15 +380,14 @@ pub fn parse_millisecond_timestamp(timestamp_ms: u64) -> UnixNanos {
 /// Returns an error if the string is not a valid RFC 3339 datetime or if the
 /// timestamp cannot be represented in nanoseconds.
 pub fn parse_rfc3339_timestamp(timestamp: &str) -> anyhow::Result<UnixNanos> {
-    let dt = chrono::DateTime::parse_from_rfc3339(timestamp)?;
-    let nanos = dt.timestamp_nanos_opt().ok_or_else(|| {
-        anyhow::anyhow!("Failed to extract nanoseconds from timestamp: {timestamp}")
-    })?;
-
+    let dt = timestamp.parse::<Timestamp>()?;
+    let nanos = dt.as_nanosecond();
     if nanos < 0 {
         anyhow::bail!("Negative nanosecond timestamp from: {timestamp}");
     }
-    Ok(UnixNanos::from(nanos as u64))
+    let nanos = u64::try_from(nanos)
+        .with_context(|| format!("Timestamp is outside the UnixNanos range: {timestamp}"))?;
+    Ok(UnixNanos::from(nanos))
 }
 
 /// Converts a textual price to a [`Price`] using the given precision.
@@ -783,26 +822,11 @@ pub fn parse_order_status_report(
         _ => TimeInForce::Gtc,
     };
 
-    let mut client_order_id = if order.cl_ord_id.is_empty() {
-        None
-    } else {
-        Some(ClientOrderId::new(order.cl_ord_id.as_str()))
-    };
-
+    let client_order_id = parse_parent_client_order_id(
+        order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
+        order.cl_ord_id.as_str(),
+    );
     let mut linked_ids = Vec::new();
-
-    if let Some(algo_cl_ord_id) = order
-        .algo_cl_ord_id
-        .as_ref()
-        .filter(|value| !value.as_str().is_empty())
-    {
-        let algo_client_id = ClientOrderId::new(algo_cl_ord_id.as_str());
-        match &client_order_id {
-            Some(existing) if existing == &algo_client_id => {}
-            Some(_) => linked_ids.push(algo_client_id),
-            None => client_order_id = Some(algo_client_id),
-        }
-    }
 
     if let Some(attach_algo_cl_ord_id) = order
         .attach_algo_cl_ord_id
@@ -2811,8 +2835,8 @@ pub fn parse_account_state(
     ))
 }
 
-/// Converts an optional `UnixNanos` to an optional `DateTime<Utc>`.
-pub fn nanos_to_datetime(value: Option<UnixNanos>) -> Option<chrono::DateTime<chrono::Utc>> {
+/// Converts an optional `UnixNanos` to an optional `Timestamp`.
+pub fn nanos_to_datetime(value: Option<UnixNanos>) -> Option<jiff::Timestamp> {
     value.map(|nanos| nanos.to_datetime_utc())
 }
 
@@ -4298,6 +4322,39 @@ mod tests {
         assert_eq!(order_report.order_side, OrderSide::Buy);
         assert_eq!(order_report.order_type, OrderType::Market);
         assert_eq!(order_report.order_status, OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn test_parse_triggered_order_history_preserves_parent_identity() {
+        let json_data = load_test_json("http_get_orders_history.json");
+        let response: OKXResponse<OKXOrderHistory> = serde_json::from_str(&json_data).unwrap();
+        let mut okx_order = response
+            .data
+            .first()
+            .expect("Test data must have an order")
+            .clone();
+        okx_order.cl_ord_id = Ustr::from("706620792746729474_0");
+        okx_order.algo_cl_ord_id = Some(Ustr::from("STOP003BTCUSDT20250120"));
+        okx_order.ord_id = Ustr::from("706620792746729999");
+
+        let order_report = parse_order_status_report(
+            &okx_order,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            2,
+            8,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            order_report.client_order_id,
+            Some(ClientOrderId::from("STOP003BTCUSDT20250120"))
+        );
+        assert_eq!(
+            order_report.venue_order_id,
+            VenueOrderId::from("706620792746729999")
+        );
     }
 
     #[rstest]

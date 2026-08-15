@@ -79,7 +79,7 @@ impl PolymarketInstrumentProviderConfig {
     /// This mirrors the Python adapter's `instrument_config` layering so scoped
     /// market bootstrap can migrate naturally to the Rust/pyO3 live path.
     #[new]
-    #[pyo3(signature = (load_all=None, load_ids=None, filters=None, event_slugs=None, market_slugs=None, event_slug_builder=None, log_warnings=None, use_gamma_markets=None))]
+    #[pyo3(signature = (load_all=None, load_ids=None, filters=None, event_slugs=None, market_slugs=None, event_slug_builder=None, log_warnings=None, use_gamma_markets=None, series_ids=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         load_all: Option<bool>,
@@ -90,6 +90,7 @@ impl PolymarketInstrumentProviderConfig {
         event_slug_builder: Option<PolymarketUpDownEventSlugConfig>,
         log_warnings: Option<bool>,
         use_gamma_markets: Option<bool>,
+        series_ids: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let config = Self {
@@ -99,6 +100,7 @@ impl PolymarketInstrumentProviderConfig {
             event_slugs,
             market_slugs,
             event_slug_builder,
+            series_ids,
             log_warnings: log_warnings.unwrap_or(default.log_warnings),
             use_gamma_markets: use_gamma_markets.unwrap_or(default.use_gamma_markets),
         };
@@ -128,7 +130,7 @@ impl PolymarketDataClientConfig {
     /// and are skipped during serialization; they default to empty/`None` and must be
     /// installed programmatically after deserialization.
     #[new]
-    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None, transport_backend=None, reconnect_test_after_secs=None, drop_quotes_missing_side=None, proxy_url=None))]
+    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None, transport_backend=None, reconnect_test_after_secs=None, drop_quotes_missing_side=None, proxy_url=None, compute_effective_deltas=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_config: Option<PolymarketInstrumentProviderConfig>,
@@ -156,11 +158,13 @@ impl PolymarketDataClientConfig {
         reconnect_test_after_secs: Option<u64>,
         drop_quotes_missing_side: Option<bool>,
         proxy_url: Option<String>,
+        compute_effective_deltas: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
 
         let config = Self {
             instrument_config,
+            filters: Vec::new(),
             base_url_http,
             base_url_ws,
             base_url_rtds,
@@ -175,10 +179,11 @@ impl PolymarketDataClientConfig {
                 default.update_instruments_interval_mins,
             ),
             subscribe_new_markets: subscribe_new_markets.unwrap_or(default.subscribe_new_markets),
-            drop_quotes_missing_side: drop_quotes_missing_side
-                .unwrap_or(default.drop_quotes_missing_side),
+            new_market_filter: None,
             new_market_fetch_max_concurrency: new_market_fetch_max_concurrency
                 .unwrap_or(default.new_market_fetch_max_concurrency),
+            drop_quotes_missing_side: drop_quotes_missing_side
+                .unwrap_or(default.drop_quotes_missing_side),
             auto_load_missing_instruments: auto_load_missing_instruments
                 .unwrap_or(default.auto_load_missing_instruments),
             auto_load_debounce_ms: auto_load_debounce_ms.unwrap_or(default.auto_load_debounce_ms),
@@ -194,10 +199,10 @@ impl PolymarketDataClientConfig {
                 .unwrap_or(default.resolve_poll_grace_secs),
             resolve_poll_max_wait_secs: resolve_poll_max_wait_secs
                 .unwrap_or(default.resolve_poll_max_wait_secs),
-            filters: Vec::new(),
-            new_market_filter: None,
             transport_backend: transport_backend.unwrap_or(default.transport_backend),
             reconnect_test_after_secs,
+            compute_effective_deltas: compute_effective_deltas
+                .unwrap_or(default.compute_effective_deltas),
         };
         config
             .validated_proxy_url()
@@ -402,6 +407,19 @@ mod tests {
             let config = construct_data_client_config(py, None, Some(&kwargs));
 
             assert!(!config.drop_quotes_missing_side);
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_constructor_sets_compute_effective_deltas() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("compute_effective_deltas", true).unwrap();
+
+            let config = construct_data_client_config(py, None, Some(&kwargs));
+
+            assert!(config.compute_effective_deltas);
         });
     }
 

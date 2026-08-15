@@ -17,7 +17,7 @@
 //! [`PyMessageBus`] wrapper that routes Python events through the Rust
 //! thread-local [`MessageBus`] via the Any-based dispatch path.
 
-use std::{any::Any, fmt::Debug, rc::Rc};
+use std::{any::Any, fmt::Debug, rc::Rc, sync::LazyLock};
 
 use ahash::AHashMap;
 use nautilus_core::{UUID4, python::to_pyruntime_err};
@@ -28,15 +28,88 @@ use ustr::Ustr;
 use crate::{
     enums::SerializationEncoding,
     msgbus::{
-        self as msgbus_api, BusMessage, MessageBus, MessageBusConfig,
+        self as msgbus_api, BusMessage, MessageBus, MessageBusBackingFactory, MessageBusConfig,
         core::Subscription,
         get_message_bus,
         matching::is_matching,
         mstr::{Endpoint, MStr, Pattern, Topic},
         typed_handler::{Handler, ShareableMessageHandler, TypedHandler},
     },
-    python::config_error_to_pyvalue_err,
+    python::{
+        config_error_to_pyvalue_err,
+        factory::{FactoryExtractor, FactoryRegistry},
+    },
 };
+
+/// Function type for extracting a Python object into a boxed message bus backing factory.
+pub type MessageBusFactoryExtractor = FactoryExtractor<dyn MessageBusBackingFactory>;
+
+/// Registry for Python message bus backing factory extractors.
+#[derive(Debug)]
+pub struct MessageBusFactoryRegistry {
+    inner: FactoryRegistry<dyn MessageBusBackingFactory>,
+}
+
+impl MessageBusFactoryRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: FactoryRegistry::new("message bus factory"),
+        }
+    }
+
+    // panics-doc-ok (transitive via FactoryRegistry mutex locking)
+    /// Registers an extractor for a Python factory type name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a different extractor is already registered for the type name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn register(
+        &self,
+        type_name: String,
+        extractor: MessageBusFactoryExtractor,
+    ) -> anyhow::Result<()> {
+        self.inner.register(type_name, extractor)
+    }
+
+    // panics-doc-ok (transitive via FactoryRegistry mutex locking)
+    /// Extracts a Python object into a boxed message bus backing factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no extractor is registered for the Python type or extraction fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn extract(
+        &self,
+        py: Python<'_>,
+        factory: Py<PyAny>,
+    ) -> PyResult<Box<dyn MessageBusBackingFactory>> {
+        self.inner.extract(py, factory)
+    }
+}
+
+impl Default for MessageBusFactoryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GLOBAL_MSGBUS_FACTORY_REGISTRY: LazyLock<MessageBusFactoryRegistry> =
+    LazyLock::new(MessageBusFactoryRegistry::new);
+
+/// Returns the global Python message bus backing factory registry.
+#[must_use]
+pub fn get_global_msgbus_factory_registry() -> &'static MessageBusFactoryRegistry {
+    &GLOBAL_MSGBUS_FACTORY_REGISTRY
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -273,14 +346,10 @@ fn make_handler(py: Python<'_>, callable: Py<PyAny>) -> PyResult<ShareableMessag
 
 /// Python message bus backed by the Rust thread-local [`MessageBus`].
 ///
-/// Provides the same API as the legacy Cython `MessageBus` while routing all
-/// messages through the single Rust bus. Python custom events travel through
-/// the Any-based dispatch path via [`PyMessage`] wrappers.
-#[pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
-    name = "MessageBus",
-    unsendable
-)]
+/// Publish, subscribe, and request/response calls from Python route through the
+/// single Rust bus. Python custom events travel through the Any-based dispatch
+/// path via [`PyMessage`] wrappers.
+#[pyclass(module = "nautilus_trader.common", name = "MessageBus", unsendable)]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 pub struct PyMessageBus {
     trader_id: TraderId,
@@ -734,6 +803,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_message_bus_factory_registry_compatibility_constructors() {
+        let registry = MessageBusFactoryRegistry::new();
+        let default_registry = MessageBusFactoryRegistry::default();
+
+        assert_eq!(format!("{registry:?}"), format!("{default_registry:?}"));
+        assert!(format!("{registry:?}").contains("message bus factory"));
+    }
 
     #[rstest]
     fn message_bus_config_py_new_maps_validate_error_to_value_error() {

@@ -43,8 +43,8 @@ use crate::{
         },
         query::{
             BalanceAllowance, BatchCancelResponse, CancelMarketOrdersParams, CancelResponse,
-            GetBalanceAllowanceParams, GetOrdersParams, GetTradesParams, OrderResponse,
-            PaginatedResponse,
+            ClobVersionResponse, GetBalanceAllowanceParams, GetOrdersParams, GetTradesParams,
+            OrderResponse, PaginatedResponse,
         },
         rate_limits::{PolymarketRateLimiter, RateLimitHeaders, TradingBucket},
     },
@@ -56,13 +56,14 @@ const CURSOR_END: &str = "LTE=";
 
 const PATH_ORDERS: &str = "/data/orders";
 const PATH_TRADES: &str = "/data/trades";
+const PATH_VERSION: &str = "/version";
 const PATH_BALANCE_ALLOWANCE: &str = "/balance-allowance";
 const PATH_BALANCE_ALLOWANCE_UPDATE: &str = "/balance-allowance/update";
 const PATH_POST_ORDER: &str = "/order";
 const PATH_POST_ORDERS: &str = "/orders";
 const PATH_CANCEL_ALL: &str = "/cancel-all";
 const PATH_CANCEL_MARKET_ORDERS: &str = "/cancel-market-orders";
-const PATH_HEARTBEATS: &str = "/heartbeats";
+const PATH_HEARTBEATS: &str = "/v1/heartbeats";
 
 const CLOB_CANCEL_BATCH_LIMIT: usize = 1_000;
 
@@ -90,14 +91,13 @@ struct HeartbeatRequest<'a> {
 #[derive(Deserialize)]
 struct HeartbeatWireResponse {
     heartbeat_id: Option<String>,
-    status: Option<String>,
 }
 
 /// Outcome from an authenticated CLOB order-safety heartbeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeartbeatResponse {
-    /// The heartbeat was acknowledged, with an optional next ID for chaining.
-    Acknowledged(Option<String>),
+    /// The heartbeat was acknowledged and the venue returned the next ID for chaining.
+    Acknowledged(String),
     /// The supplied ID was stale and the venue returned the current ID.
     Resynchronize(String),
 }
@@ -359,10 +359,11 @@ impl PolymarketClobHttpClient {
                 .await;
 
             if rate_limited {
-                Err(Error::rate_limit(
+                Err(Error::rate_limit_from_body(
                     path,
                     cost,
                     rate_limit_headers.retry_after_ms(),
+                    &response.body,
                 ))
             } else {
                 Err(Error::from_status_code(
@@ -371,6 +372,11 @@ impl PolymarketClobHttpClient {
                 ))
             }
         }
+    }
+
+    /// Returns the CLOB protocol version reported by the venue.
+    pub async fn get_version(&self) -> Result<ClobVersionResponse> {
+        self.send_get::<(), _>(PATH_VERSION, None, false).await
     }
 
     /// Sends an authenticated order-safety heartbeat.
@@ -394,22 +400,33 @@ impl PolymarketClobHttpClient {
             .await
             .map_err(Error::from_http_client)?;
 
+        if response.status.as_u16() == 429 {
+            let rate_limit_headers = RateLimitHeaders::parse(&response.headers);
+            return Err(Error::rate_limit_from_body(
+                PATH_HEARTBEATS,
+                0,
+                rate_limit_headers.retry_after_ms(),
+                &response.body,
+            ));
+        }
+
         let wire = serde_json::from_slice::<HeartbeatWireResponse>(&response.body);
+        let next_id = |wire: HeartbeatWireResponse| {
+            wire.heartbeat_id
+                .filter(|heartbeat_id| !heartbeat_id.is_empty())
+        };
+
         if response.status.is_success() {
-            let wire = wire.map_err(Error::Serde)?;
-            if let Some(heartbeat_id) = wire.heartbeat_id.filter(|id| !id.is_empty()) {
-                return Ok(HeartbeatResponse::Acknowledged(Some(heartbeat_id)));
+            if let Some(heartbeat_id) = next_id(wire.map_err(Error::Serde)?) {
+                return Ok(HeartbeatResponse::Acknowledged(heartbeat_id));
             }
 
-            if wire.status.as_deref() == Some("ok") {
-                return Ok(HeartbeatResponse::Acknowledged(None));
-            }
             return Err(Error::exchange("Heartbeat acknowledgment was invalid"));
         }
 
         if response.status.as_u16() == 400
             && let Ok(wire) = wire
-            && let Some(heartbeat_id) = wire.heartbeat_id.filter(|id| !id.is_empty())
+            && let Some(heartbeat_id) = next_id(wire)
         {
             return Ok(HeartbeatResponse::Resynchronize(heartbeat_id));
         }
@@ -425,31 +442,32 @@ impl PolymarketClobHttpClient {
         &self,
         mut params: GetOrdersParams,
     ) -> Result<Vec<PolymarketOpenOrder>> {
-        if params.next_cursor.is_none() {
-            params.next_cursor = Some(CURSOR_START.to_string());
-        }
         let mut all = Vec::new();
 
         loop {
+            let cursor = params
+                .next_cursor
+                .get_or_insert_with(|| CURSOR_START.to_string())
+                .clone();
             let page: PaginatedResponse<PolymarketOpenOrder> =
                 self.send_get(PATH_ORDERS, Some(&params), true).await?;
             all.extend(page.data);
-            if page.next_cursor == CURSOR_END {
+            let Some(next_cursor) = cursor_next(PATH_ORDERS, &cursor, page.next_cursor)? else {
                 break;
-            }
-            params.next_cursor = Some(page.next_cursor);
+            };
+            params.next_cursor = Some(next_cursor);
         }
         Ok(all)
     }
 
-    /// Fetches a single open order by ID, returning `None` for empty/null responses.
+    /// Fetches a single order by ID, returning `None` for empty/null responses.
     pub async fn get_order_optional(&self, order_id: &str) -> Result<Option<PolymarketOpenOrder>> {
         let path = format!("/data/order/{order_id}");
         self.send_get_optional::<(), _>(&path, None::<&()>, true)
             .await
     }
 
-    /// Fetches a single open order by ID.
+    /// Fetches a single order by ID.
     ///
     /// Returns an error if the order is not found (empty/null response).
     pub async fn get_order(&self, order_id: &str) -> Result<PolymarketOpenOrder> {
@@ -463,19 +481,20 @@ impl PolymarketClobHttpClient {
         &self,
         mut params: GetTradesParams,
     ) -> Result<Vec<PolymarketTradeReport>> {
-        if params.next_cursor.is_none() {
-            params.next_cursor = Some(CURSOR_START.to_string());
-        }
         let mut all = Vec::new();
 
         loop {
+            let cursor = params
+                .next_cursor
+                .get_or_insert_with(|| CURSOR_START.to_string())
+                .clone();
             let page: PaginatedResponse<PolymarketTradeReport> =
                 self.send_get(PATH_TRADES, Some(&params), true).await?;
             all.extend(page.data);
-            if page.next_cursor == CURSOR_END {
+            let Some(next_cursor) = cursor_next(PATH_TRADES, &cursor, page.next_cursor)? else {
                 break;
-            }
-            params.next_cursor = Some(page.next_cursor);
+            };
+            params.next_cursor = Some(next_cursor);
         }
         Ok(all)
     }
@@ -734,6 +753,24 @@ impl PolymarketClobPublicClient {
         );
 
         Ok(book)
+    }
+}
+
+fn cursor_next(
+    endpoint: &'static str,
+    cursor: &str,
+    next_cursor: Option<String>,
+) -> Result<Option<String>> {
+    let next_cursor = next_cursor
+        .ok_or_else(|| Error::decode(format!("{endpoint} response omitted next_cursor")))?;
+    if next_cursor.is_empty() || next_cursor == CURSOR_END {
+        Ok(None)
+    } else if next_cursor == cursor {
+        Err(Error::decode(format!(
+            "{endpoint} pagination cursor did not advance from {cursor:?}"
+        )))
+    } else {
+        Ok(Some(next_cursor))
     }
 }
 

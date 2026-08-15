@@ -70,6 +70,7 @@ use handlers::{
 use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
+    clients::SocketReconnectLookup,
     clock::Clock,
     logging::{RECV, RES},
     messages::data::{
@@ -813,6 +814,26 @@ impl DataEngine {
     #[must_use]
     pub fn get_clients_mut(&mut self) -> Vec<&mut DataClientAdapter> {
         self.clients.values_mut().collect()
+    }
+
+    /// Resolves a reconnectable socket endpoint owned by a registered data client.
+    #[must_use]
+    pub fn socket_reconnect_lookup(
+        &self,
+        client_id: &ClientId,
+        endpoint: Ustr,
+    ) -> SocketReconnectLookup {
+        let Some(client) = self.clients.get(client_id) else {
+            return SocketReconnectLookup::ClientNotFound;
+        };
+        let Some(registry) = client.socket_reconnect_registry() else {
+            return SocketReconnectLookup::Unsupported;
+        };
+
+        registry.get(endpoint).map_or(
+            SocketReconnectLookup::EndpointNotFound,
+            SocketReconnectLookup::Handle,
+        )
     }
 
     pub fn get_client(
@@ -1745,7 +1766,7 @@ impl DataEngine {
 
         match data {
             Data::Delta(delta) => self.handle_delta(delta),
-            Data::Deltas(deltas) => self.handle_deltas(deltas.into_inner()),
+            Data::Deltas(deltas) => self.handle_deltas(*deltas),
             Data::Depth10(depth) => self.handle_depth10(*depth),
             Data::Quote(quote) => {
                 self.handle_quote(quote);
@@ -1753,15 +1774,15 @@ impl DataEngine {
             }
             Data::Trade(trade) => self.handle_trade(trade),
             Data::Bar(bar) => self.handle_bar(bar),
-            Data::MarkPriceUpdate(mark_price) => {
+            Data::MarkPrice(mark_price) => {
                 self.handle_mark_price(mark_price);
                 self.drain_deferred_commands();
             }
-            Data::IndexPriceUpdate(index_price) => {
+            Data::IndexPrice(index_price) => {
                 self.handle_index_price(index_price);
                 self.drain_deferred_commands();
             }
-            Data::FundingRateUpdate(funding_rate) => {
+            Data::FundingRate(funding_rate) => {
                 self.handle_funding_rate(funding_rate);
                 self.drain_deferred_commands();
             }
@@ -1821,14 +1842,14 @@ impl DataEngine {
 
         match data {
             Data::Delta(delta) => self.handle_delta_pipeline(delta),
-            Data::Deltas(deltas) => self.handle_deltas_pipeline(&deltas.into_inner()),
+            Data::Deltas(deltas) => self.handle_deltas_pipeline(&deltas),
             Data::Depth10(depth) => self.handle_depth10_pipeline(*depth),
             Data::Quote(quote) => self.handle_quote_pipeline(quote),
             Data::Trade(trade) => self.handle_trade_pipeline(trade),
             Data::Bar(bar) => self.handle_bar_pipeline(bar),
-            Data::MarkPriceUpdate(mark_price) => self.handle_mark_price_pipeline(mark_price),
-            Data::IndexPriceUpdate(index_price) => self.handle_index_price_pipeline(index_price),
-            Data::FundingRateUpdate(funding_rate) => {
+            Data::MarkPrice(mark_price) => self.handle_mark_price_pipeline(mark_price),
+            Data::IndexPrice(index_price) => self.handle_index_price_pipeline(index_price),
+            Data::FundingRate(funding_rate) => {
                 self.handle_funding_rate_pipeline(funding_rate);
             }
             Data::OptionGreeks(greeks) => self.handle_option_greeks_pipeline(greeks),
@@ -1993,8 +2014,9 @@ impl DataEngine {
         let (parent_start, parent_end) = parent_request_window(parent.as_ref());
         let rebuilt = rebuild_pipeline_response(parent_id, parent.as_ref(), legs);
 
-        // If the rebuild failed (mixed-variant or unsupported-variant legs), drop the
-        // associated `RequestJoin` so its staging maps do not leak. Without this the
+        // If the rebuild failed (mixed-variant, unsupported-variant, or mixed-instrument
+        // `BookDeltas` legs), drop the associated `RequestJoin` so its staging maps do not
+        // leak. Without this the
         // original join request stays in `pending_join_requests` and its
         // `parent_join_request_id` mapping stays live, neither of which will ever
         // resolve through normal flow.
@@ -2030,7 +2052,6 @@ impl DataEngine {
     // Replays a day-start snapshot forward to the request's original start: when the first delta
     // is an F_SNAPSHOT on a UTC day boundary, rebuilds the book from the pre-start deltas and
     // replaces them with one snapshot keyed at the original start, then forwards the rest.
-    // Mirrors the Cython `_handle_order_book_deltas_snapshot_replay`.
     fn book_deltas_snapshot_replay(&self, resp: &mut BookDeltasResponse) {
         let Some(original_start_ns) = resp.start else {
             return;
@@ -2123,7 +2144,7 @@ impl DataEngine {
 
         let now_ns = self.clock.borrow().timestamp_ns();
         let now_dt = now_ns.to_datetime_utc();
-        let zero = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(0);
+        let zero = jiff::Timestamp::UNIX_EPOCH;
         let start = req.start.unwrap_or(zero).min(now_dt);
         let end = req.end.unwrap_or(now_dt).min(now_dt);
         let dated = req.with_dates(Some(start), Some(end), now_ns);
@@ -4216,7 +4237,7 @@ impl DataEngine {
             let time_bars_origin_offset = config
                 .time_bars_origin_offset
                 .get(&bar_type.spec().aggregation)
-                .map(|duration| chrono::TimeDelta::from_std(*duration).unwrap_or_default());
+                .map(|duration| jiff::SignedDuration::try_from(*duration).unwrap_or_default());
 
             Box::new(TimeBarAggregator::new(
                 bar_type,
@@ -4434,7 +4455,6 @@ impl DataEngine {
             return Ok(());
         }
 
-        // Setup time bar aggregator if needed (matches Cython _setup_bar_aggregator)
         self.setup_bar_aggregator(bar_type, false, request_id)?;
 
         aggregator.borrow_mut().set_is_running(true);
@@ -4491,7 +4511,7 @@ impl DataEngine {
         }
     }
 
-    /// Sets up a bar aggregator, matching Cython `_setup_bar_aggregator` logic.
+    /// Sets up a bar aggregator.
     ///
     /// This method handles historical mode, message bus subscriptions, and time bar aggregator setup.
     fn setup_bar_aggregator(
@@ -5347,10 +5367,8 @@ fn build_continuous_future_unsubscribe_command(
     }
 }
 
-fn datetime_to_unix_nanos(datetime: chrono::DateTime<chrono::Utc>) -> anyhow::Result<UnixNanos> {
-    let timestamp = datetime
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow::anyhow!("datetime is outside the supported nanosecond range"))?;
+fn datetime_to_unix_nanos(datetime: jiff::Timestamp) -> anyhow::Result<UnixNanos> {
+    let timestamp = datetime.as_nanosecond();
     let timestamp = u64::try_from(timestamp)
         .context("datetime is before the UNIX epoch and cannot be represented as UnixNanos")?;
     Ok(UnixNanos::from(timestamp))
@@ -5453,8 +5471,10 @@ fn log_if_empty_response<T, I: Display>(data: &[T], id: &I, correlation_id: &UUI
 /// Concatenates same-variant leg payloads into a single rebuilt response keyed by `parent_id`.
 ///
 /// Returns `None` when legs are mixed-variant or empty; pipelines only group legs of the same
-/// variant. The rebuilt response inherits `start` and `end` from the parent request when the
-/// parent is a `RequestJoin`; otherwise leg bounds are preserved on the first leg.
+/// variant. `BookDeltas` legs additionally return `None` when their wrapper instruments differ,
+/// since a book-delta batch is keyed by one instrument and cannot carry another's children.
+/// The rebuilt response inherits `start` and `end` from the parent request when the parent is a
+/// `RequestJoin`; otherwise leg bounds are preserved on the first leg.
 fn rebuild_pipeline_response(
     parent_id: UUID4,
     parent: Option<&RequestCommand>,
@@ -5586,6 +5606,24 @@ fn rebuild_pipeline_response(
                     log::error!("Mixed-variant legs in pipeline {parent_id}");
                     return None;
                 };
+
+                // A book-delta batch is keyed by one instrument, so legs for different
+                // instruments cannot be concatenated into a single response. Matched by
+                // value as well as identity, mirroring `OrderBookDeltas::new_checked`,
+                // since legs crossing the FFI boundary do not share an intern pool.
+                let same_instrument = other.instrument_id == acc.instrument_id
+                    || (other.instrument_id.symbol.as_str() == acc.instrument_id.symbol.as_str()
+                        && other.instrument_id.venue.as_str() == acc.instrument_id.venue.as_str());
+
+                if !same_instrument {
+                    log::error!(
+                        "Mixed-instrument BookDeltas legs in pipeline {parent_id}: {} and {}",
+                        acc.instrument_id,
+                        other.instrument_id,
+                    );
+                    return None;
+                }
+
                 acc.data.extend(other.data);
             }
             acc.data.sort_by_key(|d| d.ts_init);
@@ -5687,8 +5725,8 @@ fn parent_request_window(
     )
 }
 
-fn datetime_to_unix_nanos_or_zero(dt: chrono::DateTime<chrono::Utc>) -> UnixNanos {
-    UnixNanos::from(u64::try_from(dt.timestamp_nanos_opt().unwrap_or(0).max(0)).unwrap_or(0))
+fn datetime_to_unix_nanos_or_zero(dt: jiff::Timestamp) -> UnixNanos {
+    UnixNanos::from(u64::try_from(dt.as_nanosecond().max(0)).unwrap_or(0))
 }
 
 fn empty_response_like(

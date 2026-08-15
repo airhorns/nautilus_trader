@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
-use ahash::{AHashMap, AHashSet};
+use ahash::{AHashMap, AHashSet, RandomState};
 use bytes::Bytes;
 use nautilus_core::{UUID4, UnixNanos};
 #[cfg(feature = "defi")]
@@ -30,12 +30,13 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{
         Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, QuoteTick, TradeTick,
+        MarkPriceUpdate, QuoteTick, TradeTick, greeks::OptionGreekValues,
+        option_chain::OptionGreeks,
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, AssetClass, BookType, ContingencyType,
-        InstrumentClass, LiquiditySide, MarketStatusAction, OmsType, OptionKind, OrderSide,
-        OrderStatus, OrderType, PositionSide, PriceType, TimeInForce, TriggerType,
+        GreeksConvention, InstrumentClass, LiquiditySide, MarketStatusAction, OmsType, OptionKind,
+        OrderSide, OrderStatus, OrderType, PositionSide, PriceType, TimeInForce, TriggerType,
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEmulated,
@@ -48,8 +49,8 @@ use nautilus_model::{
         position::snapshot::PositionSnapshot,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OrderListId, PositionId, StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
+        PositionId, StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
     instruments::{
         CurrencyPair, Instrument, InstrumentAny, OptionContract, SyntheticInstrument, stubs::*,
@@ -477,6 +478,79 @@ fn test_build_index_restores_bidirectional_venue_order_id_lookup(
 }
 
 #[rstest]
+fn test_build_index_preserves_orderless_position_strategy_bucket(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+) {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let client_order_id = order.client_order_id();
+    let strategy_id = order.strategy_id();
+    let position_id = PositionId::new("P-ORDERLESS-BUILD-INDEX");
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::new("T-ORDERLESS-BUILD-INDEX")),
+        Some(position_id),
+        Some(Price::from("1.00001")),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let position = Position::new(&instrument, fill.into());
+
+    cache
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    assert!(!cache.order_exists(&client_order_id));
+    assert_eq!(cache.position_id(&client_order_id), None);
+    assert!(
+        cache
+            .index
+            .strategy_orders
+            .get(&strategy_id)
+            .is_some_and(|orders| orders.is_empty())
+    );
+    assert!(
+        cache
+            .index
+            .position_orders
+            .get(&position_id)
+            .is_some_and(|orders| orders.is_empty())
+    );
+    assert!(cache.orders_for_position(&position_id).is_empty());
+    assert!(cache.check_integrity());
+
+    cache.clear_index();
+    cache.build_index();
+
+    assert!(!cache.order_exists(&client_order_id));
+    assert_eq!(cache.position_id(&client_order_id), None);
+    assert!(
+        cache
+            .index
+            .strategy_orders
+            .get(&strategy_id)
+            .is_some_and(|orders| orders.is_empty())
+    );
+    assert!(
+        cache
+            .index
+            .position_orders
+            .get(&position_id)
+            .is_some_and(|orders| orders.is_empty())
+    );
+    assert!(cache.orders_for_position(&position_id).is_empty());
+    assert!(cache.check_integrity());
+}
+
+#[rstest]
 fn test_oms_type_returns_actual_position_oms(mut cache: Cache) {
     let position = snapshot_test_position();
     let position_id = position.id;
@@ -550,8 +624,7 @@ fn test_cache_positions_skips_malformed_position_oms() {
             Bytes::from_static(b"invalid"),
         )]),
         positions: AHashMap::from([(position_id, position)]),
-        fail_add: false,
-        fail_update_order: false,
+        ..Default::default()
     };
     let mut cache = Cache::default();
     cache.set_database(Box::new(database));
@@ -670,6 +743,164 @@ fn test_get_xrate_from_bars_selects_latest_bar_per_side(audusd_sim: CurrencyPair
 }
 
 #[rstest]
+#[case((0, 0, 0, 0))]
+#[case((1, 2, 3, 4))]
+#[case((5, 6, 7, 8))]
+#[case((10, 20, 30, 40))]
+fn test_get_xrate_builds_quote_keys_from_instrument_currencies(
+    #[case] seeds: (u64, u64, u64, u64),
+) {
+    let mut cache = Cache {
+        instruments: AHashMap::with_hasher(RandomState::with_seeds(
+            seeds.0, seeds.1, seeds.2, seeds.3,
+        )),
+        ..Default::default()
+    };
+
+    let btcusdt = currency_pair_btcusdt();
+    let mut btcusdt_perpetual = crypto_perpetual_ethusdt();
+    btcusdt_perpetual.id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    btcusdt_perpetual.base_currency = Currency::BTC();
+    let mut btcusdt_no_quote = btcusdt.clone();
+    btcusdt_no_quote.id = InstrumentId::from("BTCUSDT.BYBIT");
+    let mut btcusdt_zero_quote = btcusdt.clone();
+    btcusdt_zero_quote.id = InstrumentId::from("BTCUSDT.OKX");
+    let mut btcusdt_zero_quote_unique = btcusdt.clone();
+    btcusdt_zero_quote_unique.id = InstrumentId::from("BTCUSDT.KRAKEN");
+    let mut btcusdt_perpetual_a = btcusdt_perpetual.clone();
+    btcusdt_perpetual_a.id = InstrumentId::from("BTCUSDT-A.BYBIT");
+    let mut btcusdt_perpetual_z = btcusdt_perpetual.clone();
+    btcusdt_perpetual_z.id = InstrumentId::from("BTCUSDT-Z.BYBIT");
+    let mut btcusdt_perpetual_okx = btcusdt_perpetual.clone();
+    btcusdt_perpetual_okx.id = InstrumentId::from("BTCUSDT-PERP.OKX");
+    let mut audusd = audusd_sim();
+    audusd.id = InstrumentId::from("AUD/USD.BINANCE");
+    let mut aapl = equity_aapl();
+    aapl.id = InstrumentId::from("AAPL.BINANCE");
+
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(btcusdt.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CryptoPerpetual(btcusdt_perpetual.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(btcusdt_no_quote))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(btcusdt_zero_quote.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(
+            btcusdt_zero_quote_unique.clone(),
+        ))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CryptoPerpetual(btcusdt_perpetual_a.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CryptoPerpetual(btcusdt_perpetual_z.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CryptoPerpetual(
+            btcusdt_perpetual_okx.clone(),
+        ))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(audusd.clone()))
+        .unwrap();
+    cache
+        .add_instrument(InstrumentAny::Equity(aapl.clone()))
+        .unwrap();
+
+    let add_quote = |cache: &mut Cache, instrument_id, bid: &str, ask: &str| {
+        cache
+            .add_quote(QuoteTick {
+                instrument_id,
+                bid_price: Price::from(bid),
+                ask_price: Price::from(ask),
+                bid_size: Quantity::from(1),
+                ask_size: Quantity::from(1),
+                ..Default::default()
+            })
+            .unwrap();
+    };
+
+    add_quote(&mut cache, btcusdt.id, "4.00", "4.00");
+    add_quote(&mut cache, btcusdt_perpetual.id, "5.00", "5.00");
+    add_quote(&mut cache, btcusdt_perpetual_a.id, "6.00", "6.00");
+    add_quote(&mut cache, btcusdt_perpetual_z.id, "7.00", "7.00");
+    add_quote(&mut cache, btcusdt_zero_quote.id, "0.00", "0.00");
+    add_quote(&mut cache, btcusdt_zero_quote_unique.id, "0.00", "9.00");
+    add_quote(&mut cache, btcusdt_perpetual_okx.id, "8.00", "8.00");
+    add_quote(&mut cache, audusd.id, "0.80000", "1.00000");
+    add_quote(&mut cache, aapl.id, "200.00", "201.00");
+
+    let venue = Venue::from("BINANCE");
+    let (bid_quotes, ask_quotes) = cache.build_quote_table(&venue);
+
+    assert_eq!(
+        bid_quotes,
+        AHashMap::from([
+            (Ustr::from("BTC/USDT"), dec!(4.00)),
+            (Ustr::from("AUD/USD"), dec!(0.80000)),
+        ])
+    );
+    assert_eq!(
+        ask_quotes,
+        AHashMap::from([
+            (Ustr::from("BTC/USDT"), dec!(4.00)),
+            (Ustr::from("AUD/USD"), dec!(1.00000)),
+        ])
+    );
+    assert_eq!(
+        cache.get_xrate(venue, Currency::BTC(), Currency::USDT(), PriceType::Mid),
+        Some(dec!(4.00))
+    );
+    assert_eq!(
+        cache.get_xrate(venue, Currency::USDT(), Currency::BTC(), PriceType::Mid),
+        Some(dec!(0.25))
+    );
+    assert_eq!(
+        cache.get_xrate(venue, Currency::AUD(), Currency::USD(), PriceType::Mid),
+        Some(dec!(0.90000))
+    );
+
+    let fallback_venue = Venue::from("BYBIT");
+    assert_eq!(
+        cache.get_xrate(
+            fallback_venue,
+            Currency::BTC(),
+            Currency::USDT(),
+            PriceType::Mid
+        ),
+        Some(dec!(6.00))
+    );
+
+    assert_eq!(
+        cache.get_xrate(
+            Venue::from("OKX"),
+            Currency::BTC(),
+            Currency::USDT(),
+            PriceType::Mid
+        ),
+        Some(dec!(8.00))
+    );
+
+    assert_eq!(
+        cache
+            .try_get_xrate(
+                Venue::from("KRAKEN"),
+                Currency::BTC(),
+                Currency::USDT(),
+                PriceType::Mid
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[rstest]
 #[case(false, true)]
 #[case(true, false)]
 fn test_get_xrate_after_reset_follows_instrument_lifecycle(
@@ -738,6 +969,46 @@ fn test_reset_clears_mark_xrate_even_when_instruments_retained(audusd_sim: Curre
 }
 
 #[rstest]
+fn test_reset_clears_option_greeks_even_when_instruments_retained(audusd_sim: CurrencyPair) {
+    let config = CacheConfig::builder()
+        .drop_instruments_on_reset(false)
+        .build()
+        .unwrap();
+    let mut cache = Cache::new(Some(config), None);
+
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
+        .unwrap();
+    let option_greeks = OptionGreeks {
+        instrument_id: audusd_sim.id,
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: 0.55,
+            gamma: 0.03,
+            vega: 0.12,
+            theta: -0.05,
+            rho: 0.01,
+        },
+        mark_iv: Some(0.25),
+        bid_iv: Some(0.24),
+        ask_iv: Some(0.26),
+        underlying_price: Some(1.00020),
+        open_interest: Some(1000.0),
+        ts_event: UnixNanos::from(9),
+        ts_init: UnixNanos::from(10),
+    };
+    cache.add_option_greeks(option_greeks);
+    assert_eq!(cache.option_greeks(&audusd_sim.id), Some(&option_greeks));
+
+    cache.reset();
+
+    // Instruments are retained, but option greeks are market-derived state
+    // and must not carry into the next run
+    assert!(cache.instrument(&audusd_sim.id).is_some());
+    assert!(cache.option_greeks(&audusd_sim.id).is_none());
+}
+
+#[rstest]
 fn test_dispose_when_empty(mut cache: Cache) {
     cache.dispose();
 }
@@ -775,6 +1046,78 @@ fn test_has_backing_after_set_database() {
 #[rstest]
 fn test_cache_orders_when_no_database(mut cache: Cache) {
     assert!(futures::executor::block_on(cache.cache_orders()).is_ok());
+}
+
+#[rstest]
+fn test_cache_all_filters_legacy_order_position_without_backing_order(audusd_sim: CurrencyPair) {
+    let valid_order_id = ClientOrderId::from("O-VALID");
+    let stale_order_id = ClientOrderId::from("SPREAD-LEG-STALE");
+    let valid_position_id = PositionId::from("P-VALID");
+    let stale_position_id = PositionId::from("P-STALE");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim.id)
+        .client_order_id(valid_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    order.set_position_id(Some(valid_position_id));
+    let database = SnapshotBlobTestDatabase {
+        orders: AHashMap::from([(valid_order_id, order)]),
+        order_positions: AHashMap::from([
+            (valid_order_id, valid_position_id),
+            (stale_order_id, stale_position_id),
+        ]),
+        ..Default::default()
+    };
+    let mut cache = Cache::new(None, Some(Box::new(database)));
+
+    futures::executor::block_on(cache.cache_all()).expect("cache all");
+
+    assert_eq!(cache.position_id(&valid_order_id), Some(&valid_position_id));
+    assert_eq!(cache.position_id(&stale_order_id), None);
+    cache.build_index();
+    assert_eq!(cache.position_id(&stale_order_id), None);
+    assert!(cache.check_integrity());
+
+    futures::executor::block_on(cache.cache_all()).expect("cache all again");
+    assert_eq!(cache.position_id(&valid_order_id), Some(&valid_position_id));
+    assert_eq!(cache.position_id(&stale_order_id), None);
+}
+
+#[rstest]
+fn test_cache_orders_filters_legacy_order_position_without_backing_order(audusd_sim: CurrencyPair) {
+    let valid_order_id = ClientOrderId::from("O-VALID");
+    let stale_order_id = ClientOrderId::from("SPREAD-LEG-STALE");
+    let valid_position_id = PositionId::from("P-VALID");
+    let stale_position_id = PositionId::from("P-STALE");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim.id)
+        .client_order_id(valid_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    order.set_position_id(Some(valid_position_id));
+    let database = SnapshotBlobTestDatabase {
+        orders: AHashMap::from([(valid_order_id, order)]),
+        order_positions: AHashMap::from([
+            (valid_order_id, valid_position_id),
+            (stale_order_id, stale_position_id),
+        ]),
+        ..Default::default()
+    };
+    let mut cache = Cache::new(None, Some(Box::new(database)));
+
+    futures::executor::block_on(cache.cache_orders()).expect("cache orders");
+
+    assert_eq!(cache.position_id(&valid_order_id), Some(&valid_position_id));
+    assert_eq!(cache.position_id(&stale_order_id), None);
+    cache.build_index();
+    assert_eq!(cache.position_id(&stale_order_id), None);
+    assert!(cache.check_integrity());
+
+    futures::executor::block_on(cache.cache_orders()).expect("cache orders again");
+    assert_eq!(cache.position_id(&valid_order_id), Some(&valid_position_id));
+    assert_eq!(cache.position_id(&stale_order_id), None);
 }
 
 #[rstest]
@@ -3914,16 +4257,77 @@ fn test_update_account_state_grows_event_log_in_place(mut cache: Cache) {
 }
 
 #[rstest]
-#[should_panic(expected = "sole owner")]
-fn test_take_account_panics_when_cell_aliased(mut cache: Cache) {
+fn test_update_account_state_creates_wallet_account(mut cache: Cache) {
+    let account_id = AccountId::from("WALLET-001");
+    let event = AccountState::new(
+        account_id,
+        AccountType::Wallet,
+        vec![
+            AccountBalance::new(
+                Money::from("10 ETH"),
+                Money::from("0 ETH"),
+                Money::from("10 ETH"),
+            ),
+            AccountBalance::new(
+                Money::from("25000 USDC"),
+                Money::from("0 USDC"),
+                Money::from("25000 USDC"),
+            ),
+        ],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    );
+
+    cache.update_account_state(&event).unwrap();
+
+    let cached = cache.account(&account_id).unwrap();
+    assert!(matches!(&*cached, AccountAny::Wallet(_)));
+    assert_eq!(cached.events(), vec![event]);
+
+    let balances = cached.balances();
+    assert_eq!(
+        balances.get(&Currency::ETH()).map(|b| b.total),
+        Some(Money::from("10 ETH"))
+    );
+    assert_eq!(
+        balances.get(&Currency::USDC()).map(|b| b.total),
+        Some(Money::from("25000 USDC"))
+    );
+}
+
+#[rstest]
+fn test_take_account_preserves_cell_when_aliased(mut cache: Cache) {
     let account = AccountAny::default();
     let account_id = account.id();
-    cache.add_account(account).unwrap();
+    cache.add_account(account.clone()).unwrap();
 
     // Manufacture an aliased SharedCell handle by cloning the inner Rc.
-    // This violates the sole-owner invariant; take_account must panic.
+    // This violates the sole-owner invariant; take_account must preserve the cache entry.
     let _alias = cache.accounts.get(&account_id).unwrap().clone();
-    let _ = cache.take_account(&account_id);
+    let result = cache.take_account(&account_id);
+
+    assert_eq!(result, None);
+    assert_eq!(*cache.account(&account_id).unwrap(), account);
+}
+
+#[rstest]
+fn test_take_account_preserves_cell_when_aliased_and_borrowed(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    cache.add_account(account.clone()).unwrap();
+    let alias = cache.accounts.get(&account_id).unwrap().clone();
+    let borrow = alias.borrow_mut();
+
+    let result = cache.take_account(&account_id);
+
+    assert_eq!(cache.account_owned(&account_id), None);
+    drop(borrow);
+    assert_eq!(result, None);
+    assert_eq!(*cache.account(&account_id).unwrap(), account);
 }
 
 #[rstest]
@@ -5968,7 +6372,7 @@ fn test_purge_closed_orders_does_not_purge_order_list_with_open_orders() {
     let ts_now = UnixNanos::from(1_000_000_000_000);
     cache.purge_closed_orders(ts_now, 0);
 
-    // Order1 purged, order2 and list remain (order2 still in cache)
+    // Order1 purged; order2 and list remain (order2 still in cache)
     assert!(!cache.order_exists(&order1.client_order_id()));
     assert!(cache.order_exists(&order2.client_order_id()));
     assert!(cache.order_list_exists(&order_list_id));
@@ -6833,7 +7237,9 @@ fn snapshot_test_position() -> Position {
 #[derive(Default)]
 struct SnapshotBlobTestDatabase {
     general: AHashMap<String, Bytes>,
+    orders: AHashMap<ClientOrderId, OrderAny>,
     positions: AHashMap<PositionId, Position>,
+    order_positions: AHashMap<ClientOrderId, PositionId>,
     fail_add: bool,
     fail_update_order: bool,
 }
@@ -6844,9 +7250,7 @@ impl SnapshotBlobTestDatabase {
         general.insert(key, value);
         Self {
             general,
-            positions: AHashMap::new(),
-            fail_add: false,
-            fail_update_order: false,
+            ..Default::default()
         }
     }
 
@@ -6860,17 +7264,14 @@ impl SnapshotBlobTestDatabase {
         Self {
             general,
             positions,
-            fail_add: false,
-            fail_update_order: false,
+            ..Default::default()
         }
     }
 
     fn fail_add() -> Self {
         Self {
-            general: AHashMap::new(),
-            positions: AHashMap::new(),
             fail_add: true,
-            fail_update_order: false,
+            ..Default::default()
         }
     }
 
@@ -6893,7 +7294,11 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        Ok(CacheMap::default())
+        Ok(CacheMap {
+            orders: self.orders.clone(),
+            positions: self.positions.clone(),
+            ..Default::default()
+        })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
@@ -6917,7 +7322,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
     }
 
     async fn load_orders(&self) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
-        Ok(AHashMap::new())
+        Ok(self.orders.clone())
     }
 
     async fn load_positions(&self) -> anyhow::Result<AHashMap<PositionId, Position>> {
@@ -6925,7 +7330,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
     }
 
     fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
-        Ok(AHashMap::new())
+        Ok(self.order_positions.clone())
     }
 
     fn load_index_order_client(&self) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
@@ -6965,7 +7370,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(None)
     }
 
-    fn load_actor(&self, _component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
+    fn load_actor(&self, _actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
         Ok(AHashMap::new())
     }
 
@@ -7081,7 +7486,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(())
     }
 
-    fn delete_actor(&self, _component_id: &ComponentId) -> anyhow::Result<()> {
+    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -7119,7 +7524,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
 
     fn update_actor(
         &self,
-        _component_id: &ComponentId,
+        _actor_id: &ActorId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
         Ok(())

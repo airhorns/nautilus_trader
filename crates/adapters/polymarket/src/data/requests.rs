@@ -81,6 +81,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
         clob_public_client: client.clob_public_client.clone(),
         filters: client.provider.filters(),
         order_books: client.order_books.clone(),
+        latest_delta_ts: client.latest_delta_ts.clone(),
         last_quotes: client.last_quotes.clone(),
         active_quote_subs: client.active_quote_subs.clone(),
         active_delta_subs: client.active_delta_subs.clone(),
@@ -92,8 +93,9 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
         new_market_fetch_semaphore: client.new_market_fetch_semaphore.clone(),
         rtds_feed: client.rtds_feed.clone(),
         subscribe_new_markets: client.config.subscribe_new_markets,
-        drop_quotes_missing_side: client.config.drop_quotes_missing_side,
         new_market_filter: client.config.new_market_filter.clone(),
+        drop_quotes_missing_side: client.config.drop_quotes_missing_side,
+        compute_effective_deltas: client.config.compute_effective_deltas,
         cancellation_token: client.cancellation_token.clone(),
     };
 

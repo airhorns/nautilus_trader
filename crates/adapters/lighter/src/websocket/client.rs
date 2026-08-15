@@ -211,6 +211,10 @@ impl LighterWebSocketClient {
         self.connection_epoch.load().load(Ordering::Acquire)
     }
 
+    pub(crate) fn connection_epoch_atomic(&self) -> Arc<AtomicU64> {
+        self.connection_epoch.load_full()
+    }
+
     /// Waits until the underlying connection reports active, or returns an
     /// error after the configured WebSocket timeout.
     ///
@@ -311,7 +315,6 @@ impl LighterWebSocketClient {
         let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler(
             cfg,
             message_handler,
-            None,
             None,
             ws_message_rate_limiter(&self.url),
         )

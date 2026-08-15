@@ -17,15 +17,15 @@
 import pandas as pd
 
 from nautilus_trader.adapters.okx import OKX
+from nautilus_trader.adapters.okx import OKXContractType
 from nautilus_trader.adapters.okx import OKXDataClientConfig
+from nautilus_trader.adapters.okx import OKXEnvironment
+from nautilus_trader.adapters.okx import OKXInstrumentType
 from nautilus_trader.adapters.okx import OKXLiveDataClientFactory
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.core.nautilus_pyo3 import OKXContractType
-from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
-from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
@@ -117,7 +117,7 @@ config_tester = DataTesterConfig(
     ],
     # subscribe_book_deltas=True,
     # subscribe_book_depth=True,
-    # subscribe_book_at_interval=True,  # Only legacy Cython wrapped book (not PyO3)
+    # subscribe_book_at_interval=True,
     subscribe_quotes=True,
     subscribe_trades=True,
     subscribe_mark_prices=True,
@@ -128,12 +128,11 @@ config_tester = DataTesterConfig(
     # subscribe_instrument_status=True,
     # subscribe_instrument_close=True,
     # request_bars=True,
-    # book_group_size=Decimal("1"),  # Only PyO3 wrapped book (not legacy Cython)
+    # book_group_size=Decimal("1"),  # Not yet supported: order book grouping is unimplemented
     # book_depth=5,
     # book_levels_to_print=50,
     # book_interval_ms=100,
     # manage_book=True,
-    # use_pyo3_book=True,
     # request_instruments=True,
     request_bars=True,
     # request_trades=True,

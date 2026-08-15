@@ -25,9 +25,9 @@ set -euo pipefail
 # Audit-relevant paths. Keep in sync with the `security_audit_paths` anchor in
 # .github/workflows/security-audit.yml.
 #   - Lock files                Cargo.lock, crates/**/fuzz/Cargo.lock,
-#                               uv.lock, python/uv.lock
+#                               python/uv.lock
 #   - Manifests                 Cargo.toml, crates/(...)?Cargo.toml,
-#                               pyproject.toml, python/pyproject.toml
+#                               python/pyproject.toml
 #   - Audit policy              deny.toml, .cargo/deny-fuzz.toml, osv-scanner.toml,
 #                               .cargo/audit.toml, .supply-chain/*, .zizmor.yml
 #   - Toolchain config          .cargo/config.toml, rust-toolchain.toml,
@@ -41,6 +41,11 @@ emit() {
   echo "audit_needed=$1" >> "$GITHUB_OUTPUT"
   echo "audit_needed=$1 ($2)"
 }
+
+if [[ "$EVENT_NAME" == "push" && "${FORCE_SECURITY_AUDIT:-false}" == "true" ]]; then
+  emit true "required for wheel publication"
+  exit 0
+fi
 
 case "$EVENT_NAME" in
   schedule | workflow_dispatch)
@@ -84,13 +89,16 @@ pattern='^('
 pattern+='Cargo\.(lock|toml)'
 pattern+='|crates/(.*/)?Cargo\.toml'
 pattern+='|crates/.*/fuzz/Cargo\.lock'
-pattern+='|uv\.lock|pyproject\.toml'
 pattern+='|\.pre-commit-config\.yaml'
 pattern+='|python/(uv\.lock|pyproject\.toml)'
 pattern+='|deny\.toml|\.cargo/deny-fuzz\.toml|osv-scanner\.toml|\.supply-chain/.*|\.zizmor\.yml'
 pattern+='|tools\.toml|\.cargo/(config|audit)\.toml|rust-toolchain\.toml'
 pattern+='|scripts/(cargo-tool-version|rust-toolchain|uv-version)\.sh'
-pattern+='|scripts/ci/security-audit-gate\.sh'
+pattern+='|scripts/purge-orphan-dev-wheels\.sh'
+pattern+='|scripts/ci/('
+pattern+='check-security-audit-result|check-security-gate-result|plan-wheel-publication|publish-wheels.*'
+pattern+='|security-audit-gate|test-publish-wheels|update-pyproject-version|validate-wheel-artifacts'
+pattern+=')\.(sh|bash)'
 pattern+='|\.github/actions/.*'
 pattern+='|\.github/workflows/.*'
 pattern+=')$'
