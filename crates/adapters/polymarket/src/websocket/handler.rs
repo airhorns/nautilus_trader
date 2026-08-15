@@ -283,7 +283,8 @@ impl FeedHandler {
         match self.channel {
             WsChannel::Market => {
                 if let Ok(msgs) = serde_json::from_str::<Vec<&RawValue>>(text) {
-                    msgs.into_iter()
+                    let parsed = msgs
+                        .into_iter()
                         .filter_map(|raw| match MarketWsMessage::parse(raw.get()) {
                             Ok(msg) => Some(PolymarketWsMessage::Market(msg)),
                             Err(e) => {
@@ -291,7 +292,8 @@ impl FeedHandler {
                                 None
                             }
                         })
-                        .collect()
+                        .collect();
+                    coalesce_adjacent_price_changes(parsed)
                 } else {
                     match MarketWsMessage::parse(text) {
                         Ok(msg) => vec![PolymarketWsMessage::Market(msg)],
@@ -427,6 +429,28 @@ impl FeedHandler {
     }
 }
 
+fn coalesce_adjacent_price_changes(messages: Vec<PolymarketWsMessage>) -> Vec<PolymarketWsMessage> {
+    let mut coalesced = Vec::with_capacity(messages.len());
+    for message in messages {
+        let PolymarketWsMessage::Market(MarketWsMessage::PriceChange(mut next)) = message else {
+            coalesced.push(message);
+            continue;
+        };
+        if let Some(PolymarketWsMessage::Market(MarketWsMessage::PriceChange(current))) =
+            coalesced.last_mut()
+            && current.market == next.market
+            && current.timestamp == next.timestamp
+        {
+            current.price_changes.append(&mut next.price_changes);
+        } else {
+            coalesced.push(PolymarketWsMessage::Market(MarketWsMessage::PriceChange(
+                next,
+            )));
+        }
+    }
+    coalesced
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Mutex, time::Duration};
@@ -469,6 +493,20 @@ mod tests {
             AuthTracker::new(),
             false,
             false,
+        )
+    }
+
+    fn price_change_json(market: &str, asset_id: &str, timestamp: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"event_type":"price_change","market":"{market}","#,
+                r#""price_changes":[{{"asset_id":"{asset_id}","price":"0.37","#,
+                r#""side":"BUY","size":"12.5","hash":"hash-{asset_id}"}}],"#,
+                r#""timestamp":"{timestamp}"}}"#,
+            ),
+            market = market,
+            asset_id = asset_id,
+            timestamp = timestamp,
         )
     }
 
@@ -623,6 +661,74 @@ mod tests {
         assert_eq!(trade.size, "4.25");
         assert_eq!(trade.timestamp, "1700000000003");
         assert_eq!(trade.transaction_hash.as_deref(), Some("0xtrade-hash"));
+    }
+
+    #[rstest]
+    fn test_parse_market_batch_coalesces_adjacent_price_changes(market_handler: FeedHandler) {
+        let text = format!(
+            "[{},{}]",
+            price_change_json("market-a", "asset-a", "1700000000001"),
+            price_change_json("market-a", "asset-b", "1700000000001"),
+        );
+
+        let messages = market_handler.parse_messages(&text);
+
+        assert_eq!(messages.len(), 1);
+        let PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes)) = &messages[0] else {
+            panic!("Expected a coalesced price change");
+        };
+        assert_eq!(quotes.market.as_str(), "market-a");
+        assert_eq!(quotes.timestamp, "1700000000001");
+        assert_eq!(quotes.price_changes.len(), 2);
+        assert_eq!(quotes.price_changes[0].asset_id.as_str(), "asset-a");
+        assert_eq!(quotes.price_changes[1].asset_id.as_str(), "asset-b");
+    }
+
+    #[rstest]
+    fn test_parse_market_batch_preserves_price_change_boundaries(market_handler: FeedHandler) {
+        let trade = concat!(
+            r#"{"event_type":"last_trade_price","market":"market-b","#,
+            r#""asset_id":"asset-b","fee_rate_bps":"0","price":"0.63","#,
+            r#""side":"SELL","size":"4.25","timestamp":"1700000000002"}"#,
+        );
+        let text = format!(
+            "[{},{},{},{},{}]",
+            price_change_json("market-a", "asset-a", "1700000000001"),
+            price_change_json("market-a", "asset-b", "1700000000002"),
+            price_change_json("market-b", "asset-c", "1700000000002"),
+            trade,
+            price_change_json("market-b", "asset-d", "1700000000002"),
+        );
+
+        let messages = market_handler.parse_messages(&text);
+
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(
+            &messages[0],
+            PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes))
+                if quotes.market.as_str() == "market-a"
+                    && quotes.timestamp == "1700000000001"
+        ));
+        assert!(matches!(
+            &messages[1],
+            PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes))
+                if quotes.market.as_str() == "market-a"
+                    && quotes.timestamp == "1700000000002"
+        ));
+        assert!(matches!(
+            &messages[2],
+            PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes))
+                if quotes.market.as_str() == "market-b"
+        ));
+        assert!(matches!(
+            &messages[3],
+            PolymarketWsMessage::Market(MarketWsMessage::LastTradePrice(_))
+        ));
+        assert!(matches!(
+            &messages[4],
+            PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes))
+                if quotes.price_changes[0].asset_id.as_str() == "asset-d"
+        ));
     }
 
     #[rstest]
