@@ -49,6 +49,7 @@ use nautilus_core::{
     datetime::{datetime_to_unix_nanos, unix_nanos_to_iso8601},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControl;
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate, TradeTick},
     enums::{BarAggregation, BookType, OrderSide},
@@ -75,7 +76,9 @@ use crate::{
         models::{HyperliquidCandle, HyperliquidFundingHistoryEntry, HyperliquidL2Book},
         parse::parse_recent_trade,
     },
-    websocket::{client::HyperliquidWebSocketClient, messages::NautilusWsMessage},
+    websocket::{
+        DATA_STREAMS_ENDPOINT, client::HyperliquidWebSocketClient, messages::NautilusWsMessage,
+    },
 };
 
 #[derive(Debug)]
@@ -139,6 +142,11 @@ impl HyperliquidDataClient {
             config.transport_backend,
             config.proxy_url.clone(),
         );
+        let ws_client = ws_client.with_socket_control(SocketControl::new(
+            client_id,
+            Some(*HYPERLIQUID_VENUE),
+            DATA_STREAMS_ENDPOINT,
+        ));
         let mut stream_health_monitor = MarketDataStreamHealthMonitor::new(
             Duration::from_secs(config.stale_stream_receive_timeout_secs),
             Duration::from_secs(config.stale_stream_warning_cooldown_secs),
@@ -2810,7 +2818,7 @@ mod tests {
             btc_perp_id(),
             Price::from("104300.0"),
             Quantity::from("0.01000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(tid.to_string()),
             UnixNanos::from(ts_ns),
             UnixNanos::from(ts_ns),

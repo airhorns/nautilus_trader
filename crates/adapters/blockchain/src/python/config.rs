@@ -21,7 +21,7 @@ use nautilus_core::string::secret::REDACTED;
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::{
     defi::{Chain, DexType},
-    identifiers::{AccountId, TraderId},
+    identifiers::AccountId,
 };
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
@@ -168,9 +168,8 @@ impl BlockchainExecutionClientConfig {
     /// Configuration for blockchain execution clients.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id, client_id, chain, wallet_address, http_rpc_url, signer_private_key_env, router_addresses, weth_address, max_fee_per_gas_wei, base_fee_buffer_bps, gas_limit, gas_buffer_bps, tokens=None, rpc_requests_per_second=None, unlimited_approval=false, postgres_cache_database_config=None, transport_backend=None))]
+    #[pyo3(signature = (client_id, chain, wallet_address, http_rpc_url, signer_private_key_env, router_addresses, weth_address, max_fee_per_gas_wei, base_fee_buffer_bps, gas_limit, gas_buffer_bps, tokens=None, rpc_requests_per_second=None, unlimited_approval=false, postgres_cache_database_config=None, transport_backend=None, *, allowed_token_pairs=None, slippage_bps=None, max_slippage_bps=None, max_order_amount=None, deadline_seconds=None, max_quote_age_blocks=None, receipt_timeout_secs=None))]
     fn py_new(
-        trader_id: TraderId,
         client_id: AccountId,
         #[gen_stub(
             override_type(
@@ -199,9 +198,15 @@ impl BlockchainExecutionClientConfig {
         )]
         postgres_cache_database_config: Option<PostgresConnectOptions>,
         transport_backend: Option<TransportBackend>,
+        allowed_token_pairs: Option<Vec<(String, String)>>,
+        slippage_bps: Option<u32>,
+        max_slippage_bps: Option<u32>,
+        max_order_amount: Option<u64>,
+        deadline_seconds: Option<u64>,
+        max_quote_age_blocks: Option<u64>,
+        receipt_timeout_secs: Option<u64>,
     ) -> Self {
         Self::builder()
-            .trader_id(trader_id)
             .client_id(client_id)
             .chain(chain.clone())
             .wallet_address(wallet_address)
@@ -213,6 +218,13 @@ impl BlockchainExecutionClientConfig {
             .base_fee_buffer_bps(base_fee_buffer_bps)
             .gas_limit(gas_limit)
             .gas_buffer_bps(gas_buffer_bps)
+            .maybe_allowed_token_pairs(allowed_token_pairs)
+            .maybe_slippage_bps(slippage_bps)
+            .maybe_max_slippage_bps(max_slippage_bps)
+            .maybe_max_order_amount(max_order_amount)
+            .maybe_deadline_seconds(deadline_seconds)
+            .maybe_max_quote_age_blocks(max_quote_age_blocks)
+            .maybe_receipt_timeout_secs(receipt_timeout_secs)
             .maybe_tokens(tokens)
             .maybe_rpc_requests_per_second(rpc_requests_per_second)
             .unlimited_approval(unlimited_approval)
@@ -221,10 +233,11 @@ impl BlockchainExecutionClientConfig {
             .build()
     }
 
-    /// Returns the trader ID.
+    /// Returns the allowed (input token, output token) address pairs.
     #[getter]
-    const fn trader_id(&self) -> TraderId {
-        self.trader_id
+    #[gen_stub(override_return_type(type_repr = "list[tuple[str, str]] | None",))]
+    fn allowed_token_pairs(&self) -> Option<Vec<(String, String)>> {
+        self.allowed_token_pairs.clone()
     }
 
     /// Returns the account ID.

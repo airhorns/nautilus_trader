@@ -169,6 +169,8 @@ pub struct GammaMarket {
     pub description: Option<String>,
     /// Market start date (ISO 8601).
     pub start_date: Option<String>,
+    /// Event window start time (ISO 8601).
+    pub event_start_time: Option<String>,
     /// Market end date (ISO 8601).
     pub end_date: Option<String>,
     /// Whether market is active.
@@ -183,12 +185,19 @@ pub struct GammaMarket {
     pub uma_resolution_statuses: Option<String>,
     /// Source used to resolve the market.
     pub resolution_source: Option<String>,
+    /// Crypto market resolution configuration.
+    pub crypto_market_config: Option<CryptoMarketConfig>,
     /// Whether CLOB is accepting orders.
     pub accepting_orders: Option<bool>,
     /// Whether order book trading is enabled.
     pub enable_order_book: Option<bool>,
     /// Minimum price increment.
-    pub order_price_min_tick_size: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_json_number",
+        serialize_with = "serialize_optional_decimal_as_json_number"
+    )]
+    pub order_price_min_tick_size: Option<Decimal>,
     /// Minimum order size.
     #[serde(
         default,
@@ -249,11 +258,12 @@ pub struct GammaMarket {
     pub neg_risk_market_id: Option<String>,
     /// Fee schedule for this market.
     pub fee_schedule: Option<FeeSchedule>,
-    /// Game ID for sport markets. `null` and `-1` both mean "no game" and
-    /// surface as `None`. Reference shape:
+    /// Game ID for sport markets, kept verbatim because Gamma emits both
+    /// numeric and composite `<uuid>:<away>:<home>` forms. `null` and `-1`
+    /// both mean "no game" and surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
     /// Events linked to this gamma market.
     pub events: Option<Vec<GammaEvent>>,
 }
@@ -277,6 +287,29 @@ pub struct FeeSchedule {
         deserialize_with = "deserialize_decimal_from_json_number"
     )]
     pub rebate_rate: Decimal,
+}
+
+/// Crypto market resolution configuration returned by Gamma.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketConfig {
+    pub id: String,
+    pub asset: String,
+    pub duration: String,
+    pub twap_enabled: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_i64"
+    )]
+    pub twap_lookback_seconds: Option<i64>,
+}
+
+fn deserialize_optional_non_null_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    i64::deserialize(deserializer).map(Some)
 }
 
 /// An event response from the Gamma API `GET /events`.
@@ -316,11 +349,12 @@ pub struct GammaEvent {
     pub neg_risk_market_id: Option<String>,
     /// Whether event is featured.
     pub featured: Option<bool>,
-    /// Game ID for sport markets. `null` and `-1` both mean "no game" and
-    /// surface as `None`. Reference shape:
+    /// Game ID for sport markets, kept verbatim because Gamma emits both
+    /// numeric and composite `<uuid>:<away>:<home>` forms. `null` and `-1`
+    /// both mean "no game" and surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
 }
 
 /// A tag from the Gamma API `GET /tags`.
@@ -351,7 +385,8 @@ pub struct SearchResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct TickSizeResponse {
     /// Minimum tick size (price increment) for a token.
-    pub minimum_tick_size: f64,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
+    pub minimum_tick_size: Decimal,
 }
 
 /// Fee rate response from CLOB `GET /fee-rate`.
@@ -757,7 +792,39 @@ mod tests {
 
         // one market has no game_id
         assert!(map_handicap.game_id.is_none());
-        assert_eq!(money_line.game_id, Some(1_427_074));
+        assert_eq!(money_line.game_id.as_deref(), Some("1427074"));
+    }
+
+    #[rstest]
+    fn test_gamma_event_composite_sports_game_id() {
+        // Live Gamma record from issue #4771: the event carries a numeric
+        // `gameId` while its first market carries a composite one.
+        let events: Vec<GammaEvent> = load("gamma_event_sports_composite_game_id.json");
+
+        assert_eq!(events.len(), 1);
+
+        let event = &events[0];
+
+        assert_eq!(event.id, "835109");
+        assert_eq!(event.game_id.as_deref(), Some("287011684"));
+        assert_eq!(event.markets.len(), 2);
+        assert_eq!(event.markets[0].id, "3524358");
+        assert_eq!(
+            event.markets[0].game_id.as_deref(),
+            Some("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX")
+        );
+        assert_eq!(event.markets[1].id, "3554041");
+        assert_eq!(event.markets[1].game_id, None);
+
+        // Re-serialization feeds the Python loader, so the key stays a string
+        // even where Gamma sent a number.
+        let encoded = serde_json::to_value(event).unwrap();
+
+        assert_eq!(encoded["gameId"], serde_json::json!("287011684"));
+        assert_eq!(
+            encoded["markets"][0]["gameId"],
+            serde_json::json!("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX")
+        );
     }
 
     #[rstest]
@@ -772,9 +839,99 @@ mod tests {
     }
 
     #[rstest]
+    fn test_gamma_market_crypto_market_config_fields() {
+        let market: GammaMarket = load("gamma_market_crypto_twap.json");
+        let config = market.crypto_market_config.as_ref().unwrap();
+
+        assert_eq!(config.id, "btc-5m-twap-60");
+        assert_eq!(config.asset, "btc");
+        assert_eq!(config.duration, "5m");
+        assert!(config.twap_enabled);
+        assert_eq!(config.twap_lookback_seconds, Some(60));
+        assert_eq!(
+            market.resolution_source.as_deref(),
+            Some("https://data.chain.link/streams/btc-usd-twap-60s-streams")
+        );
+        assert_eq!(
+            market.event_start_time.as_deref(),
+            Some("2026-08-22T16:00:00Z")
+        );
+    }
+
+    #[rstest]
+    fn test_crypto_market_config_absent_twap_lookback_serializes_omitted() {
+        let crypto_market_config = serde_json::json!({
+            "id": "btc-5m",
+            "asset": "btc",
+            "duration": "5m",
+            "twapEnabled": false,
+        });
+
+        let config: CryptoMarketConfig = serde_json::from_value(crypto_market_config).unwrap();
+        let encoded = serde_json::to_value(config).unwrap();
+
+        assert!(encoded.get("twapLookbackSeconds").is_none());
+    }
+
+    #[rstest]
+    fn test_crypto_market_config_rejects_null_twap_lookback() {
+        let crypto_market_config = serde_json::json!({
+            "id": "btc-5m",
+            "asset": "btc",
+            "duration": "5m",
+            "twapEnabled": false,
+            "twapLookbackSeconds": null,
+        });
+
+        let result = serde_json::from_value::<CryptoMarketConfig>(crypto_market_config);
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case(serde_json::json!(-37))]
+    #[case(serde_json::json!(i64::MIN))]
+    #[case(serde_json::json!(i64::MAX))]
+    fn test_crypto_market_config_signed_twap_lookback_roundtrip(
+        #[case] twap_lookback_seconds: serde_json::Value,
+    ) {
+        let crypto_market_config = serde_json::json!({
+            "id": "eth-15m",
+            "asset": "eth",
+            "duration": "15m",
+            "twapEnabled": true,
+            "twapLookbackSeconds": twap_lookback_seconds,
+        });
+
+        let config: CryptoMarketConfig = serde_json::from_value(crypto_market_config).unwrap();
+        let encoded = serde_json::to_value(config).unwrap();
+
+        assert_eq!(encoded["twapLookbackSeconds"], twap_lookback_seconds);
+    }
+
+    #[rstest]
+    fn test_crypto_market_config_rejects_twap_lookback_above_i64_max() {
+        let crypto_market_config = serde_json::json!({
+            "id": "eth-15m",
+            "asset": "eth",
+            "duration": "15m",
+            "twapEnabled": true,
+            "twapLookbackSeconds": 9_223_372_036_854_775_808u64,
+        });
+
+        let result = serde_json::from_value::<CryptoMarketConfig>(crypto_market_config);
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
     fn test_gamma_market_enriched_fields() {
         let market: GammaMarket = load("gamma_market.json");
 
+        assert_eq!(
+            market.event_start_time.as_deref(),
+            Some("2026-03-12T09:20:00Z")
+        );
         assert_eq!(market.best_bid, Some(0.5));
         assert_eq!(market.best_ask, Some(0.51));
         assert_eq!(market.spread, Some(0.009));
@@ -818,6 +975,8 @@ mod tests {
         assert!(market.competitive.is_none());
         assert!(market.category.is_none());
         assert!(market.neg_risk_market_id.is_none());
+        assert!(market.crypto_market_config.is_none());
+        assert!(market.event_start_time.is_none());
     }
 
     #[rstest]
@@ -1096,6 +1255,17 @@ mod tests {
         assert!(response.tokens[0].winner);
         assert_eq!(response.tokens[1].outcome, "No");
         assert!(!response.tokens[1].winner);
+    }
+
+    #[rstest]
+    fn test_tick_size_response_preserves_json_number() {
+        let response: TickSizeResponse =
+            serde_json::from_str(r#"{"minimum_tick_size":0.1234567890123456789012345678}"#)
+                .unwrap();
+        let precise =
+            rust_decimal::Decimal::from_str_exact("0.1234567890123456789012345678").unwrap();
+
+        assert_eq!(response.minimum_tick_size, precise);
     }
 
     #[rstest]

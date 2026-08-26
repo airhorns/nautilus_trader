@@ -15,13 +15,13 @@
 
 //! Python bindings for OKX configuration.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::{OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXRegion, OKXVipLevel},
-    config::{OKXDataClientConfig, OKXExecClientConfig},
+    config::{OKXDataClientConfig, OKXExecutionClientConfig},
 };
 
 #[pymethods]
@@ -123,11 +123,10 @@ impl OKXDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl OKXExecClientConfig {
+impl OKXExecutionClientConfig {
     /// Configuration for the OKX execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         instrument_types = None,
         environment = None,
@@ -150,7 +149,6 @@ impl OKXExecClientConfig {
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         instrument_types: Option<Vec<OKXInstrumentType>>,
         environment: Option<OKXEnvironment>,
@@ -173,7 +171,6 @@ impl OKXExecClientConfig {
     ) -> Self {
         let defaults = Self::default();
         Self {
-            trader_id,
             account_id,
             api_key,
             api_secret,
@@ -188,7 +185,6 @@ impl OKXExecClientConfig {
             environment: environment.unwrap_or(defaults.environment),
             region: region.unwrap_or(defaults.region),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
-            use_fills_channel: defaults.use_fills_channel,
             use_mm_mass_cancel: defaults.use_mm_mass_cancel,
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
@@ -208,7 +204,7 @@ impl OKXExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        stringify!(OKXExecClientConfig).to_string()
+        stringify!(OKXExecutionClientConfig).to_string()
     }
 }
 
@@ -257,8 +253,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_py_new_load_spreads() {
-        let config = OKXExecClientConfig::py_new(
-            TraderId::from("TRADER-001"),
+        let config = OKXExecutionClientConfig::py_new(
             AccountId::from("OKX-001"),
             None,
             None,

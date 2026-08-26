@@ -1,7 +1,7 @@
 # Adapters
 
 Adapters connect data providers and trading venues to NautilusTrader. They translate
-venue‑specific protocols into the domain objects and events used by the data and execution engines.
+venue-specific protocols into the domain objects and events used by the data and execution engines.
 Official Python adapters are available from `nautilus_trader.adapters`; the
 [integration guides](../integrations/index.md) document their supported capabilities.
 
@@ -41,7 +41,7 @@ flowchart LR
 | Component            | Purpose                                                   |
 | -------------------- | --------------------------------------------------------- |
 | `HttpClient`         | REST API communication.                                   |
-| `WebSocketClient`    | Real‑time streaming connection.                           |
+| `WebSocketClient`    | Real-time streaming connection.                           |
 | `InstrumentProvider` | Loads and parses instrument definitions from the venue.   |
 | `DataClient`         | Handles market data subscriptions and requests.           |
 | `ExecutionClient`    | Handles order submission, modification, and cancellation. |
@@ -49,7 +49,7 @@ flowchart LR
 ## Configuration and routing
 
 Each adapter exposes configuration types and factories for the clients it supports. Configs select
-venue‑specific settings such as the product, environment, credentials, and instrument loading
+venue-specific settings such as the product, environment, credentials, and instrument loading
 policy. Factories construct the clients when a `LiveNode` is built. Actors and strategies then use
 the common Nautilus APIs rather than calling adapter transports directly.
 
@@ -57,8 +57,11 @@ A node can register multiple data and execution clients. Pass `client_id` from a
 when a specific client must handle a request, subscription, or order. Without an explicit client,
 the data and execution engines use the venue and default routes configured by the node.
 
-:::note
-Python v2 will eventually provide a custom‑adapter API that matches Python v1.
+:::note[Custom adapter support]
+The public Python API does not yet define an interface for implementing an out-of-tree adapter
+entirely in Python. An out-of-tree Python adapter surface is planned. Custom venue integrations
+currently use the Rust adapter traits. See the
+[Python concept guide](python.md#support-boundaries).
 :::
 
 ## Instrument providers
@@ -75,7 +78,7 @@ An `InstrumentProvider` serves two use cases:
 
 ### Research and backtesting
 
-This example loads one Binance USD‑M instrument through the public Python v2 API:
+This example loads one Binance USD-M instrument through the public Python API:
 
 ```python
 import asyncio
@@ -129,12 +132,14 @@ BinanceInstrumentProviderConfig(
 `load_ids` contains Nautilus instrument IDs, including the venue suffix, rather than raw venue
 symbols.
 
-Instrument‑loading settings, defaults, and filters vary by integration. Check the relevant
+Instrument-loading settings, defaults, and filters vary by integration. Check the relevant
 integration guide before copying a config between adapters.
 
-Subscriptions and order submission do not load instruments by themselves. Configure the adapter
-to load each required instrument at startup, or request it explicitly and wait until it reaches the
-cache before using it.
+Subscriptions, order submission, and execution reconciliation do not load instruments by themselves.
+Configure the adapter to load each required instrument at startup, or request it explicitly and wait
+until it reaches the cache before using it. For how reconciliation treats a report whose instrument
+is not loaded, see
+[instrument availability](reconciliation.md#instrument-availability).
 
 ## Data clients
 
@@ -143,7 +148,7 @@ and normalize incoming data into Nautilus types.
 
 ### Requesting data
 
-Actors and strategies can request data using built‑in methods. Data returns via callbacks:
+Actors and strategies can request data using built-in methods. Data returns via callbacks:
 
 ```python
 from collections.abc import Sequence
@@ -172,7 +177,7 @@ class MyStrategy(Strategy):
 
 ### Subscribing to data
 
-For real‑time data, use subscription methods:
+For real-time data, use subscription methods:
 
 ```python
 from nautilus_trader.model import Bar
@@ -203,14 +208,20 @@ request and subscription methods with their corresponding callbacks.
 ## Execution clients
 
 Execution clients handle order management for a venue. They translate Nautilus order commands
-into venue‑specific API calls and process execution reports back into Nautilus events.
+into venue-specific API calls and process execution reports back into Nautilus events.
 
-Key responsibilities:
+Responsibilities:
 
 - Submit, modify, and cancel orders.
 - Process fills and execution reports.
 - Reconcile order state with the venue.
 - Handle account and position updates.
+
+Execution clients can declare the lower time limit applied to historical reconciliation and whether
+the required order, fill, and position sources completed. When an adapter supplies this contract,
+the engine can recover authoritative order state without applying historical position or portfolio
+economics that the available evidence cannot support. See
+[Bounded history safety](reconciliation.md#bounded-history-safety).
 
 Order commands and venue results are asynchronous. `OrderSubmitted` means that the adapter has
 started the submission path, not that the venue has accepted the order. A transport failure can

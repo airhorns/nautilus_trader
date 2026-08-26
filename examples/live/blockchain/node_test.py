@@ -17,7 +17,9 @@
 Python version of the Rust node_test.rs blockchain adapter demo.
 
 This demonstrates the complete PyO3 interface for DeFi blockchain functionality,
-mirroring the capabilities shown in crates/adapters/blockchain/bin/node_test.rs
+mirroring the capabilities shown in crates/adapters/blockchain/bin/node_test.rs. Running
+this example connects to the configured RPC endpoint and starts pool subscriptions
+immediately. Set `ENVIO_API_TOKEN` for HyperSync access.
 
 """
 
@@ -34,7 +36,6 @@ from nautilus_trader.model import DexType
 from nautilus_trader.model import TraderId
 
 
-RUN_NODE = False
 ENVIRONMENT = Environment.LIVE
 TRADER_ID = TraderId.from_str("TESTER-001")
 NODE_NAME = "TESTER-001"
@@ -47,6 +48,12 @@ USE_POSTGRES_CACHE = False
 
 
 def main() -> None:
+    """
+    Run the example.
+    """
+    if not os.getenv("ENVIO_API_TOKEN"):
+        raise SystemExit("ENVIO_API_TOKEN must be set for HyperSync access")
+
     print(f"Environment: {ENVIRONMENT}")
     print(f"Trader ID: {TRADER_ID}")
     print(f"Node name: {NODE_NAME}")
@@ -99,10 +106,7 @@ def main() -> None:
 
     node.add_actor_from_config(actor_config)
 
-    if RUN_NODE:
-        node.run()
-    else:
-        print("Built Blockchain node. Set RUN_NODE = True to connect.")
+    node.run()
 
 
 if __name__ == "__main__":

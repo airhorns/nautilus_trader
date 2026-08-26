@@ -22,6 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+build-info-event-store = []
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -82,7 +83,6 @@ bytes = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
-itoa = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }

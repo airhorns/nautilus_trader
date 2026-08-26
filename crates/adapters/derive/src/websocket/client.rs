@@ -35,9 +35,10 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::UUID4;
+use nautilus_live::SocketControl;
 use nautilus_network::{
     mode::ConnectionMode,
-    ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
+    ratelimiter::clock::MonotonicClock,
     websocket::{
         AuthTracker, TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
     },
@@ -54,8 +55,8 @@ use super::{
     },
     messages::{
         DeriveWsChannel, WsLoginParams, WsLoginResult, WsSubscribeParams, WsSubscribeResult,
-        WsUnsubscribeParams, WsUnsubscribeResult, methods, orderbook_channel, rate_limit_key_for,
-        ticker_channel, trades_channel,
+        WsUnsubscribeParams, WsUnsubscribeResult, methods, orderbook_channel, ticker_channel,
+        trades_channel,
     },
 };
 use crate::{
@@ -67,20 +68,21 @@ use crate::{
         },
         enums::DeriveEnvironment,
         rate_limit::{
-            self, DERIVE_CANCEL_ALL_RATE_KEY, DERIVE_CANCEL_BY_LABEL_RATE_KEY,
-            DERIVE_MATCHING_RATE_KEY,
+            DeriveRateLimiter, FixedWindowLimiter, FixedWindowLimits, RateClass,
+            rate_class_for_method,
         },
         urls,
     },
     http::{
         models::{
-            DeriveCancelByLabelResult, DeriveEmptyResult, DeriveOpenOrdersResult, DeriveOrder,
-            DeriveOrderResult, DeriveReplaceOutcome, DeriveReplaceResult,
+            DeriveCancelByInstrumentResult, DeriveCancelByLabelResult, DeriveEmptyResult,
+            DeriveOpenOrdersResult, DeriveOrder, DeriveOrderResult, DeriveReplaceOutcome,
+            DeriveReplaceResult,
         },
         query::{
-            DeriveCancelAllParams, DeriveCancelByLabelParams, DeriveCancelParams,
-            DeriveCancelTriggerOrderParams, DeriveGetTriggerOrdersParams, DeriveOrderParams,
-            DeriveReplaceParams, DeriveTriggerOrderParams,
+            DeriveCancelAllParams, DeriveCancelByInstrumentParams, DeriveCancelByLabelParams,
+            DeriveCancelParams, DeriveCancelTriggerOrderParams, DeriveGetTriggerOrdersParams,
+            DeriveOrderParams, DeriveReplaceParams, DeriveTriggerOrderParams,
         },
     },
     signing::auth::build_ws_login,
@@ -122,10 +124,9 @@ impl Debug for DeriveWsCredentials {
     }
 }
 
-// Rate limiter keyed by request kind (matching vs non-matching), shared with the
-// command handles so each frame is paced in the caller's task before it is
-// enqueued for the feed handler.
-type WsRateLimiter = RateLimiter<Ustr, MonotonicClock>;
+// Fixed-window rate limiter shared with the command handles so each frame is
+// paced in the caller's task before it is enqueued for the feed handler.
+type WsRateLimiter = DeriveRateLimiter;
 
 const MAX_SESSION_RECOVERY_ATTEMPTS: u32 = 3;
 const SUBSCRIPTION_ACCEPTED_STATUSES: &[&str] = &["ok"];
@@ -157,6 +158,7 @@ pub struct DeriveWebSocketClient {
     request_timeout: Duration,
     conn_id: Arc<ArcSwap<String>>,
     rate_limiter: Arc<WsRateLimiter>,
+    socket_control: Option<SocketControl>,
 }
 
 /// Cloneable command handle for Derive public market data subscriptions.
@@ -189,6 +191,8 @@ pub struct DeriveWsExecutionHandle {
 #[derive(Debug)]
 pub(crate) struct MatchingRateLimitReservation {
     method: &'static str,
+    instrument_name: Ustr,
+    window: u32,
 }
 
 impl DeriveWebSocketClient {
@@ -202,15 +206,22 @@ impl DeriveWebSocketClient {
         proxy_url: Option<String>,
     ) -> Self {
         let url = url.unwrap_or_else(|| urls::ws_url(environment).to_string());
-        Self::build(url, transport_backend, proxy_url, None, None)
+        Self::build(
+            url,
+            transport_backend,
+            proxy_url,
+            None,
+            FixedWindowLimits::websocket(None, None),
+        )
     }
 
     /// Builds a client that will issue `public/login` on connect and replay
     /// it after each reconnect.
     ///
-    /// `max_matching_requests_per_second` sets the matching-engine rate limit
-    /// for order writes; `None` applies the Trader-tier default. See
-    /// [`crate::common::rate_limit`].
+    /// `max_matching_requests_per_second` sets the account-wide matching
+    /// allowance for order writes and `max_per_instrument_matching_requests_per_second`
+    /// the independent per-instrument allowance; `None` applies the Trader-tier
+    /// default of each. See [`crate::common::rate_limit`].
     #[must_use]
     pub fn with_credentials(
         url: Option<String>,
@@ -219,16 +230,14 @@ impl DeriveWebSocketClient {
         proxy_url: Option<String>,
         credentials: DeriveWsCredentials,
         max_matching_requests_per_second: Option<u32>,
+        max_per_instrument_matching_requests_per_second: Option<u32>,
     ) -> Self {
         let url = url.unwrap_or_else(|| urls::ws_url(environment).to_string());
-        let matching_quota = rate_limit::matching_quota(max_matching_requests_per_second);
-        Self::build(
-            url,
-            transport_backend,
-            proxy_url,
-            Some(credentials),
-            Some(matching_quota),
-        )
+        let limits = FixedWindowLimits::websocket(
+            max_matching_requests_per_second,
+            max_per_instrument_matching_requests_per_second,
+        );
+        Self::build(url, transport_backend, proxy_url, Some(credentials), limits)
     }
 
     fn build(
@@ -236,7 +245,7 @@ impl DeriveWebSocketClient {
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
         credentials: Option<DeriveWsCredentials>,
-        matching_quota: Option<Quota>,
+        limits: FixedWindowLimits,
     ) -> Self {
         let connection_mode = Arc::new(ArcSwap::new(Arc::new(AtomicU8::new(
             ConnectionMode::Closed as u8,
@@ -246,28 +255,12 @@ impl DeriveWebSocketClient {
         // Placeholder channel; replaced by connect() before commands are issued.
         let (placeholder_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
-        // Matching writes and custom cancellation methods use keyed quotas;
-        // login, subscription, and reads use the non-matching default. Handles
-        // pace each frame in the caller's task before enqueueing, so the feed
-        // handler never sleeps.
-        let mut keyed_quotas = vec![
-            (
-                Ustr::from(DERIVE_CANCEL_ALL_RATE_KEY),
-                rate_limit::cancel_all_quota(),
-            ),
-            (
-                Ustr::from(DERIVE_CANCEL_BY_LABEL_RATE_KEY),
-                rate_limit::cancel_by_label_quota(),
-            ),
-        ];
-
-        if let Some(quota) = matching_quota {
-            keyed_quotas.push((Ustr::from(DERIVE_MATCHING_RATE_KEY), quota));
-        }
-        let rate_limiter = Arc::new(RateLimiter::new_with_quota(
-            Some(rate_limit::websocket_non_matching_quota()),
-            keyed_quotas,
-        ));
+        // Matching writes draw on the account-wide and per-instrument
+        // allowances; custom cancellation methods have their own windows and
+        // login, subscription, and reads use the non-matching allowance.
+        // Handles pace each frame in the caller's task before enqueueing, so
+        // the feed handler never sleeps.
+        let rate_limiter = Arc::new(FixedWindowLimiter::new(limits, MonotonicClock {}));
         Self {
             url,
             transport_backend,
@@ -287,7 +280,15 @@ impl DeriveWebSocketClient {
             request_timeout: WS_REQUEST_TIMEOUT,
             conn_id: Arc::new(ArcSwap::from_pointee(UUID4::new().to_string())),
             rate_limiter,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Returns the configured WebSocket URL.
@@ -351,14 +352,15 @@ impl DeriveWebSocketClient {
         let cfg = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(WS_HEARTBEAT_SECS),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(RECONNECT_TIMEOUT.as_millis() as u64),
+            heartbeat_interval_secs: Some(WS_HEARTBEAT_SECS),
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(RECONNECT_TIMEOUT.as_millis() as u64),
             reconnect_delay_initial_ms: Some(RECONNECT_BASE_BACKOFF.as_millis() as u64),
             reconnect_delay_max_ms: Some(RECONNECT_MAX_BACKOFF.as_millis() as u64),
             reconnect_backoff_factor: Some(RECONNECT_BACKOFF_FACTOR),
             reconnect_jitter_ms: Some(RECONNECT_JITTER_MS),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: Some(WS_HEARTBEAT_TIMEOUT.as_secs()),
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -366,13 +368,13 @@ impl DeriveWebSocketClient {
         // Rate limiting runs caller-side via `self.rate_limiter` before frames
         // are enqueued, so the network client's own limiter is left unconfigured
         // and never sleeps inside the single feed-handler task.
-        let client = WebSocketClient::connect_with_heartbeat_timeout(
+        let client = WebSocketClient::connect_with_state_sink(
             cfg,
-            WS_HEARTBEAT_TIMEOUT,
             Some(message_handler),
             None,
             vec![],
             None,
+            self.socket_control.as_ref().map(SocketControl::sink),
         )
         .await
         .map_err(|e| DeriveWsError::transport(e.to_string()))?;
@@ -391,6 +393,7 @@ impl DeriveWebSocketClient {
 
         let connection_mode = client.connection_mode_atomic();
         let connection_epoch = client.connection_epoch_atomic();
+        let reconnect_handle = client.reconnect_handle();
         self.connection_mode.store(Arc::clone(&connection_mode));
         self.connection_epoch.store(Arc::clone(&connection_epoch));
         log::debug!("Derive WebSocket connected: {}", self.url);
@@ -399,6 +402,10 @@ impl DeriveWebSocketClient {
             return Err(DeriveWsError::transport(format!(
                 "failed to send SetClient command: {e}",
             )));
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let signal = Arc::clone(&self.signal);
@@ -590,6 +597,10 @@ impl DeriveWebSocketClient {
             .store(UNAUTHENTICATED_CONNECTION_EPOCH, Ordering::Release);
         self.subscriptions.clear();
         self.signal.store(false, Ordering::Relaxed);
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     /// Disconnects the WebSocket connection and awaits the handler task.
@@ -1002,7 +1013,7 @@ impl DeriveWsExecutionHandle {
     /// outcome is ambiguous.
     pub async fn submit_order(&self, params: &DeriveOrderParams) -> Result<DeriveOrder> {
         let reservation = self
-            .reserve_matching_request(methods::PRIVATE_ORDER)
+            .reserve_matching_request(methods::PRIVATE_ORDER, &params.instrument_name)
             .await?;
         self.submit_order_after_rate_limit(params, reservation)
             .await
@@ -1015,6 +1026,7 @@ impl DeriveWsExecutionHandle {
     ) -> Result<DeriveOrder> {
         self.ensure_authenticated(methods::PRIVATE_ORDER)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_ORDER);
+        self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: DeriveOrderResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
@@ -1039,7 +1051,10 @@ impl DeriveWsExecutionHandle {
         params: &DeriveTriggerOrderParams,
     ) -> Result<DeriveOrder> {
         let reservation = self
-            .reserve_matching_request(methods::PRIVATE_TRIGGER_ORDER)
+            .reserve_matching_request(
+                methods::PRIVATE_TRIGGER_ORDER,
+                &params.order.instrument_name,
+            )
             .await?;
         self.submit_trigger_order_after_rate_limit(params, reservation)
             .await
@@ -1052,6 +1067,7 @@ impl DeriveWsExecutionHandle {
     ) -> Result<DeriveOrder> {
         self.ensure_authenticated(methods::PRIVATE_TRIGGER_ORDER)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_TRIGGER_ORDER);
+        self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: DeriveOrderResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
@@ -1074,7 +1090,7 @@ impl DeriveWsExecutionHandle {
     /// outcome is ambiguous.
     pub async fn modify_order(&self, params: &DeriveReplaceParams) -> Result<DeriveReplaceOutcome> {
         let reservation = self
-            .reserve_matching_request(methods::PRIVATE_REPLACE)
+            .reserve_matching_request(methods::PRIVATE_REPLACE, &params.order.instrument_name)
             .await?;
         self.modify_order_after_rate_limit(params, reservation)
             .await
@@ -1087,6 +1103,7 @@ impl DeriveWsExecutionHandle {
     ) -> Result<DeriveReplaceOutcome> {
         self.ensure_authenticated(methods::PRIVATE_REPLACE)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_REPLACE);
+        self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: DeriveReplaceResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
@@ -1113,15 +1130,41 @@ impl DeriveWsExecutionHandle {
     pub async fn cancel_order(&self, params: &DeriveCancelParams) -> Result<()> {
         self.require_authenticated(methods::PRIVATE_CANCEL).await?;
         let cmd_tx = self.cmd_tx.read().await.clone();
-        let _: DeriveEmptyResult = send_request(
+        let _: DeriveEmptyResult = send_request_for_instrument(
             &self.rate_limiter,
             &cmd_tx,
             methods::PRIVATE_CANCEL,
             params,
             self.request_timeout,
+            params.instrument_name,
         )
         .await?;
         Ok(())
+    }
+
+    /// Cancels every open order for one instrument via `private/cancel_by_instrument`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveWsError::JsonRpc`] for venue rejections and
+    /// [`DeriveWsError::Transport`] / [`DeriveWsError::Timeout`] when the
+    /// outcome is ambiguous.
+    pub async fn cancel_by_instrument(
+        &self,
+        params: &DeriveCancelByInstrumentParams,
+    ) -> Result<DeriveCancelByInstrumentResult> {
+        self.require_authenticated(methods::PRIVATE_CANCEL_BY_INSTRUMENT)
+            .await?;
+        let cmd_tx = self.cmd_tx.read().await.clone();
+        send_request_typed_for_instrument(
+            &self.rate_limiter,
+            &cmd_tx,
+            methods::PRIVATE_CANCEL_BY_INSTRUMENT,
+            params,
+            self.request_timeout,
+            params.instrument_name,
+        )
+        .await
     }
 
     /// Cancels a single trigger order via `private/cancel_trigger_order`.
@@ -1224,16 +1267,33 @@ impl DeriveWsExecutionHandle {
     pub(crate) async fn reserve_matching_request(
         &self,
         operation: &'static str,
+        instrument_name: &Ustr,
     ) -> Result<MatchingRateLimitReservation> {
         self.require_authenticated(operation).await?;
-        debug_assert_eq!(
-            rate_limit_key_for(operation),
-            Ustr::from(DERIVE_MATCHING_RATE_KEY),
-        );
-        let rate_keys = [Ustr::from(DERIVE_MATCHING_RATE_KEY)];
-        self.rate_limiter.await_keys_ready(Some(&rate_keys)).await;
+        debug_assert_eq!(rate_class_for_method(operation), RateClass::Matching);
+        let window = self
+            .rate_limiter
+            .await_class_ready(RateClass::Matching, Some(instrument_name))
+            .await;
         self.ensure_authenticated(operation)?;
-        Ok(MatchingRateLimitReservation { method: operation })
+        Ok(MatchingRateLimitReservation {
+            method: operation,
+            instrument_name: *instrument_name,
+            window,
+        })
+    }
+
+    // Signing between the reservation and the reserved send can cross a
+    // window boundary; a rolled window re-acquires so the departure draws on
+    // its own window's cells.
+    async fn refresh_matching_reservation(&self, reservation: &MatchingRateLimitReservation) {
+        self.rate_limiter
+            .ensure_window_current(
+                RateClass::Matching,
+                Some(&reservation.instrument_name),
+                reservation.window,
+            )
+            .await;
     }
 
     fn ensure_authenticated(&self, operation: &'static str) -> Result<()> {
@@ -1268,7 +1328,11 @@ impl DeriveWsExecutionHandle {
 // `Timeout`; both leave a state-changing write's outcome ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRateLimit {
-    Await,
+    /// Pace the request now, against the class buckets plus the carried
+    /// instrument's per-instrument bucket when present.
+    Await(Option<Ustr>),
+    /// A matching reservation already consumed the cells; do not pace or
+    /// consume again.
     Reserved,
 }
 
@@ -1288,7 +1352,32 @@ where
         method,
         params,
         timeout,
-        RequestRateLimit::Await,
+        RequestRateLimit::Await(None),
+        None,
+    )
+    .await
+}
+
+// Awaits the venue's raw `result` for a matching write that carries an
+// instrument, pacing it against the account-wide and per-instrument buckets.
+async fn send_raw_for_instrument<P>(
+    rate_limiter: &WsRateLimiter,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    method: &'static str,
+    params: &P,
+    timeout: Duration,
+    instrument_name: Ustr,
+) -> Result<Value>
+where
+    P: Serialize + ?Sized,
+{
+    send_raw_with_rate_limit(
+        rate_limiter,
+        cmd_tx,
+        method,
+        params,
+        timeout,
+        RequestRateLimit::Await(Some(instrument_name)),
         None,
     )
     .await
@@ -1330,9 +1419,10 @@ where
 {
     let params = serde_json::to_value(params)?;
 
-    if rate_limit == RequestRateLimit::Await {
-        let rate_keys = [rate_limit_key_for(method)];
-        rate_limiter.await_keys_ready(Some(&rate_keys)).await;
+    if let RequestRateLimit::Await(instrument_name) = rate_limit {
+        rate_limiter
+            .await_class_ready(rate_class_for_method(method), instrument_name.as_ref())
+            .await;
     }
 
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1373,12 +1463,69 @@ where
     R: Default + DeserializeOwned,
 {
     let value = send_raw(rate_limiter, cmd_tx, method, params, timeout).await?;
-    let typed = if value.is_null() {
-        R::default()
+    decode_default_result(value)
+}
+
+// Same as `send_request` for a matching write that carries an instrument, so
+// the venue's per-instrument allowance is paced alongside the global one.
+async fn send_request_for_instrument<P, R>(
+    rate_limiter: &WsRateLimiter,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    method: &'static str,
+    params: &P,
+    timeout: Duration,
+    instrument_name: Ustr,
+) -> Result<R>
+where
+    P: Serialize + ?Sized,
+    R: Default + DeserializeOwned,
+{
+    let value = send_raw_for_instrument(
+        rate_limiter,
+        cmd_tx,
+        method,
+        params,
+        timeout,
+        instrument_name,
+    )
+    .await?;
+    decode_default_result(value)
+}
+
+// Keep strict result decoding while reserving both matching buckets
+async fn send_request_typed_for_instrument<P, R>(
+    rate_limiter: &WsRateLimiter,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    method: &'static str,
+    params: &P,
+    timeout: Duration,
+    instrument_name: Ustr,
+) -> Result<R>
+where
+    P: Serialize + ?Sized,
+    R: DeserializeOwned,
+{
+    let value = send_raw_for_instrument(
+        rate_limiter,
+        cmd_tx,
+        method,
+        params,
+        timeout,
+        instrument_name,
+    )
+    .await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn decode_default_result<R>(value: Value) -> Result<R>
+where
+    R: Default + DeserializeOwned,
+{
+    if value.is_null() {
+        Ok(R::default())
     } else {
-        serde_json::from_value(value)?
-    };
-    Ok(typed)
+        Ok(serde_json::from_value(value)?)
+    }
 }
 
 async fn send_request_on_connection<P, R>(
@@ -1399,18 +1546,12 @@ where
         method,
         params,
         timeout,
-        RequestRateLimit::Await,
+        RequestRateLimit::Await(None),
         Some(connection_epoch),
     )
     .await?;
 
-    let typed = if value.is_null() {
-        R::default()
-    } else {
-        serde_json::from_value(value)?
-    };
-
-    Ok(typed)
+    decode_default_result(value)
 }
 
 // Decodes the result with no `Default` fallback, for `private/order` and
@@ -1734,11 +1875,10 @@ fn subscription_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
-
     use rstest::rstest;
 
     use super::*;
+    use crate::common::rate_limit::RateBucket;
 
     #[rstest]
     fn test_public_client_defaults_to_environment_url() {
@@ -1767,6 +1907,7 @@ mod tests {
                 "0x2ae8be44db8a590d20bffbe3b6872df9b569147d3bf6801a35a28281a4816bbd",
             )
             .unwrap(),
+            None,
             None,
         );
         let execution = client.execution_handle();
@@ -1797,6 +1938,7 @@ mod tests {
                 "0x2ae8be44db8a590d20bffbe3b6872df9b569147d3bf6801a35a28281a4816bbd",
             )
             .unwrap(),
+            None,
             None,
         );
         let execution = client.execution_handle();
@@ -1861,6 +2003,7 @@ mod tests {
             None,
             creds,
             None,
+            None,
         );
         assert!(client.url().contains("demo"));
         assert!(!client.is_authenticated());
@@ -1891,7 +2034,8 @@ mod tests {
         // Keep the receiver alive so the request enqueues, but never reply: the
         // bounded await must surface a Timeout rather than hang forever.
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let rate_limiter: WsRateLimiter = RateLimiter::new_with_quota(None, Vec::new());
+        let rate_limiter: WsRateLimiter =
+            FixedWindowLimiter::new(FixedWindowLimits::websocket(None, None), MonotonicClock {});
         let err = send_raw(
             &rate_limiter,
             &cmd_tx,
@@ -1920,7 +2064,8 @@ mod tests {
                 let _ = response_tx.send(Ok(Value::Null));
             }
         });
-        let rate_limiter: WsRateLimiter = RateLimiter::new_with_quota(None, Vec::new());
+        let rate_limiter: WsRateLimiter =
+            FixedWindowLimiter::new(FixedWindowLimits::websocket(None, None), MonotonicClock {});
         let result: Result<DeriveOrderResult> = send_request_typed(
             &rate_limiter,
             &cmd_tx,
@@ -1935,15 +2080,14 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_reserved_send_does_not_wait_for_or_consume_second_quota_cell() {
-        let matching_key = Ustr::from(DERIVE_MATCHING_RATE_KEY);
-        let quota = Quota::per_second(NonZeroU32::new(1).unwrap())
-            .unwrap()
-            .allow_burst(NonZeroU32::new(1).unwrap());
         let rate_limiter: WsRateLimiter =
-            RateLimiter::new_with_quota(None, vec![(matching_key, quota)]);
-        rate_limiter
-            .check_key(&matching_key)
-            .expect("reservation consumes the only quota cell");
+            FixedWindowLimiter::new(FixedWindowLimits::websocket(None, None), MonotonicClock {});
+
+        for _ in 0..5 {
+            rate_limiter
+                .check_bucket(RateBucket::Matching)
+                .expect("reservation consumes the matching window");
+        }
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         tokio::spawn(async move {
             if let Some(HandlerCommand::Request { response_tx, .. }) = cmd_rx.recv().await {
@@ -1967,7 +2111,7 @@ mod tests {
 
         assert_eq!(response, serde_json::json!({"accepted": true}));
         assert!(
-            rate_limiter.check_key(&matching_key).is_err(),
+            rate_limiter.check_bucket(RateBucket::Matching).is_err(),
             "reserved send must not consume a second cell",
         );
     }

@@ -51,6 +51,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{Data, InstrumentStatus, TradeTick},
     enums::{BookType, MarketStatusAction},
@@ -75,6 +76,7 @@ use crate::{
         query::LighterOrderBookOrdersQuery,
     },
     websocket::{
+        DATA_STREAMS_ENDPOINT,
         client::LighterWebSocketClient,
         messages::{LighterMarketSelection, LighterWsChannel, NautilusWsMessage},
     },
@@ -101,6 +103,7 @@ pub struct LighterDataClient {
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
     registry: Arc<MarketRegistry>,
+    socket_factory: SocketControlFactory,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: TaskHandles,
@@ -122,6 +125,7 @@ impl LighterDataClient {
     pub fn new(client_id: ClientId, config: LighterDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*LIGHTER_VENUE));
 
         let credential = if config.has_credentials() {
             // Mirror `has_credentials()`: a blank or whitespace-only `private_key`
@@ -156,7 +160,7 @@ impl LighterDataClient {
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry));
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry), &socket_factory);
 
         Ok(Self {
             clock,
@@ -166,6 +170,7 @@ impl LighterDataClient {
             http_client,
             ws_client,
             registry,
+            socket_factory,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
             tasks: TaskHandles::default(),
@@ -192,21 +197,28 @@ impl LighterDataClient {
     fn create_ws_client(
         config: &LighterDataClientConfig,
         registry: Arc<MarketRegistry>,
+        socket_factory: &SocketControlFactory,
     ) -> LighterWebSocketClient {
-        LighterWebSocketClient::new(
+        let ws_client = LighterWebSocketClient::new(
             Some(config.ws_url()),
             config.environment,
             registry,
             config.transport_backend,
             config.ws_timeout_secs,
             config.proxy_url.clone(),
-        )
+        );
+
+        ws_client.with_socket_control(socket_factory.control(DATA_STREAMS_ENDPOINT))
     }
 
     fn take_ws_client(&mut self) -> LighterWebSocketClient {
         std::mem::replace(
             &mut self.ws_client,
-            Self::create_ws_client(&self.config, Arc::clone(&self.registry)),
+            Self::create_ws_client(
+                &self.config,
+                Arc::clone(&self.registry),
+                &self.socket_factory,
+            ),
         )
     }
 
@@ -2480,7 +2492,7 @@ mod tests {
                 assert_eq!(tick.instrument_id, instrument_id);
                 assert_eq!(tick.price, Price::from("2361.31"));
                 assert_eq!(tick.size, Quantity::from("0.0005"));
-                assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+                assert_eq!(tick.aggressor_side, AggressorSide::Sell);
                 assert_eq!(tick.trade_id.to_string(), "19211490282");
             }
             event => panic!("expected trades response, was {event:?}"),
@@ -2663,7 +2675,7 @@ mod tests {
                 instrument_id,
                 Price::from("1.0"),
                 Quantity::from("1.0"),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::new(trade_id),
                 UnixNanos::from(ts_event),
                 UnixNanos::from(ts_event + 1),

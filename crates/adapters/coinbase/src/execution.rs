@@ -40,7 +40,7 @@ use nautilus_core::{
     MUTEX_POISONED, Params, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TriggerType},
@@ -64,7 +64,7 @@ use crate::{
         credential::CoinbaseCredential,
         enums::{CoinbaseProductType, CoinbaseWsChannel},
     },
-    config::CoinbaseExecClientConfig,
+    config::CoinbaseExecutionClientConfig,
     http::{
         client::CoinbaseHttpClient,
         error::Error as CoinbaseHttpError,
@@ -272,7 +272,7 @@ impl CumulativeStateMap {
 pub struct CoinbaseExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: CoinbaseExecClientConfig,
+    config: CoinbaseExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: CoinbaseHttpClient,
     ws_user: CoinbaseWebSocketClient,
@@ -300,7 +300,7 @@ impl CoinbaseExecutionClient {
     /// HTTP / WebSocket client cannot be constructed.
     pub fn new(
         core: ExecutionClientCore,
-        config: CoinbaseExecClientConfig,
+        config: CoinbaseExecutionClientConfig,
     ) -> anyhow::Result<Self> {
         let credential =
             CoinbaseCredential::resolve(config.api_key.as_deref(), config.api_secret.as_deref())
@@ -340,7 +340,12 @@ impl CoinbaseExecutionClient {
             credential,
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*COINBASE_VENUE),
+            "coinbase-user-streams",
+        ));
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(

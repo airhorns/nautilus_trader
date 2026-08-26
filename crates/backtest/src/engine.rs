@@ -30,8 +30,8 @@ use nautilus_common::{
     actor::{DataActor, DataActorNative},
     cache::Cache,
     clock::{Clock, TestClock},
-    component::Component,
-    enums::LogColor,
+    component::{Component, component_state},
+    enums::{ComponentState, LogColor},
     log_info,
     logging::{
         logging_clock_set_realtime_mode, logging_clock_set_static_mode,
@@ -54,7 +54,7 @@ use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, HasTsInit},
     enums::{AccountType, AggregationSource, BookType},
-    identifiers::{AccountId, ClientId, InstrumentId, TraderId, Venue},
+    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny},
     position::Position,
     types::Price,
@@ -282,6 +282,7 @@ impl BacktestEngine {
 
         let routing = Some(config.routing);
         let frozen_account = Some(config.frozen_account);
+        let use_message_queue = config.use_message_queue;
 
         let exchange =
             SimulatedExchange::new(config, self.kernel.cache.clone(), self.kernel.clock.clone())?;
@@ -298,6 +299,12 @@ impl BacktestEngine {
             routing,
             frozen_account,
         );
+
+        if !use_message_queue {
+            exchange
+                .borrow_mut()
+                .set_event_handler(exec_client.order_event_handler());
+        }
 
         exchange
             .borrow_mut()
@@ -964,6 +971,12 @@ impl BacktestEngine {
 
         self.settle_venues(ts_now);
 
+        for strategy_id in self.running_strategy_ids() {
+            log::error!(
+                "Strategy {strategy_id} is still RUNNING after the backtest end sequence; its stop did not complete",
+            );
+        }
+
         let save_result = self.kernel.save_trader_state();
         self.kernel.portfolio.borrow_mut().finalize_equity_curve();
 
@@ -980,6 +993,28 @@ impl BacktestEngine {
 
         self.log_post_run();
         save_result
+    }
+
+    /// Returns registered strategies whose state resolves to `Running` after the end sequence.
+    ///
+    /// Known causes include a stop deferred for a managed market exit that never completed,
+    /// and an earlier component stop failure making `Trader::stop_components` return before
+    /// reaching the strategy - so callers must report the state observed rather than
+    /// attribute a cause.
+    fn running_strategy_ids(&self) -> Vec<StrategyId> {
+        self.kernel
+            .trader
+            .borrow()
+            .strategy_ids()
+            .into_iter()
+            .filter(|strategy_id| match component_state(&strategy_id.inner()) {
+                Ok(state) => matches!(state, ComponentState::Running),
+                Err(e) => {
+                    log::warn!("Cannot resolve stop state for strategy {strategy_id}: {e}");
+                    false
+                }
+            })
+            .collect()
     }
 
     /// Reset the backtest engine.
@@ -2156,7 +2191,7 @@ mod tests {
         enums::Environment,
         messages::{
             data::{DataCommand, UnsubscribeCommand},
-            execution::{SubmitOrder, TradingCommand},
+            execution::{ModifyOrder, SubmitOrder, TradingCommand},
         },
         msgbus::{
             self, MessagingSwitchboard, TypedHandler,
@@ -2170,11 +2205,15 @@ mod tests {
             AccountType, BookType, MarketStatus, MarketStatusAction, OmsType, OrderSide,
             OrderStatus, OrderType, TriggerType,
         },
-        identifiers::{AccountId, ActorId, ClientId, PositionId, StrategyId, Venue},
+        events::OrderEventAny,
+        identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
-        orders::{Order, OrderAny, OrderTestBuilder},
+        orders::{
+            Order, OrderAny, OrderTestBuilder,
+            stubs::{OrderFilledTestBuilder, TestOrderEventStubs},
+        },
         types::{Money, Price, Quantity},
     };
     use nautilus_system::{KernelEventStore, RegisteredComponents};
@@ -2270,6 +2309,251 @@ mod tests {
             .unwrap();
         engine.add_venue(venue_config).unwrap();
         engine
+    }
+
+    fn create_immediate_engine(instrument: &CryptoPerpetual) -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument.id().venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .use_message_queue(false)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(instrument.clone()))
+            .unwrap();
+        engine
+            .venues
+            .get(&instrument.id().venue)
+            .unwrap()
+            .borrow_mut()
+            .initialize_account();
+        engine
+    }
+
+    fn create_engine_with_strategy(manage_stop: bool) -> (BacktestEngine, StrategyId) {
+        let mut engine = create_engine();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let strategy_id = StrategyId::from(if manage_stop {
+            "MANAGED-STOP-001"
+        } else {
+            "IMMEDIATE-STOP-001"
+        });
+        engine.add_instrument(&instrument).unwrap();
+        engine
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                manage_stop,
+                ..Default::default()
+            }))
+            .unwrap();
+
+        if manage_stop {
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(engine.trader_id())
+                .strategy_id(strategy_id)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.000"))
+                .build();
+            let fill = OrderFilledTestBuilder::new(&order, &instrument).build();
+            let OrderEventAny::Filled(fill) = fill else {
+                unreachable!();
+            };
+            let position = Position::new(&instrument, fill);
+            engine
+                .kernel
+                .cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Netting)
+                .unwrap();
+        }
+
+        (engine, strategy_id)
+    }
+
+    fn send_execution_command(command: TradingCommand) {
+        msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), command);
+    }
+
+    #[rstest]
+    fn test_immediate_submit_defers_order_events(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-SUBMIT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+
+        send_execution_command(TradingCommand::SubmitOrder(SubmitOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            order.exec_algorithm_id(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )));
+
+        {
+            let cache = engine.kernel.cache.borrow();
+            let cached_order = cache.order(&order.client_order_id()).unwrap();
+            assert_eq!(cached_order.status(), OrderStatus::Initialized);
+            assert_eq!(cached_order.event_count(), 1);
+        }
+
+        engine.drain_command_queues();
+
+        let cache = engine.kernel.cache.borrow();
+        let cached_order = cache.order(&order.client_order_id()).unwrap();
+        let events = cached_order.events();
+        assert!(matches!(events[1], OrderEventAny::Submitted(_)));
+        assert!(matches!(events[2], OrderEventAny::Accepted(_)));
+    }
+
+    #[rstest]
+    fn test_immediate_modify_submitted_order_defers_updated_event(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-MODIFY"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        let account_id = AccountId::from("BINANCE-001");
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+
+        send_execution_command(TradingCommand::ModifyOrder(ModifyOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            None,
+            Some(Quantity::from("2.000")),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+            None,
+        )));
+
+        {
+            let cache = engine.kernel.cache.borrow();
+            let cached_order = cache.order(&order.client_order_id()).unwrap();
+            assert_eq!(cached_order.quantity(), Quantity::from("1.000"));
+            assert!(matches!(
+                cached_order.events().last(),
+                Some(OrderEventAny::Submitted(_))
+            ));
+        }
+
+        engine.drain_command_queues();
+
+        let cache = engine.kernel.cache.borrow();
+        let order = cache.order(&order.client_order_id()).unwrap();
+        assert_eq!(order.quantity(), Quantity::from("2.000"));
+        assert!(matches!(
+            order.events().last(),
+            Some(OrderEventAny::Updated(_))
+        ));
+    }
+
+    #[rstest]
+    fn test_immediate_market_data_dispatches_fill_synchronously(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-QUOTE-FILL"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+
+        send_execution_command(TradingCommand::SubmitOrder(SubmitOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            order.exec_algorithm_id(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )));
+        engine.drain_command_queues();
+
+        let quote = QuoteTick::new(
+            order.instrument_id(),
+            Price::from("999.00"),
+            Price::from("1000.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        msgbus::send_quote(
+            format!(
+                "SimulatedExchange.process_new_quote.{}",
+                order.instrument_id().venue
+            )
+            .into(),
+            &quote,
+        );
+
+        let cache = engine.kernel.cache.borrow();
+        let cached_order = cache.order(&order.client_order_id()).unwrap();
+        assert_eq!(cached_order.status(), OrderStatus::Filled);
+        assert!(matches!(
+            cached_order.events().last(),
+            Some(OrderEventAny::Filled(_))
+        ));
     }
 
     #[rstest]
@@ -2656,6 +2940,53 @@ mod tests {
         assert!(engine.kernel.is_event_store_replay_configured());
         assert!(engine.kernel.is_event_store_replay());
         assert!(!engine.kernel.trader.borrow().is_running());
+    }
+
+    #[rstest]
+    fn test_end_reports_strategy_stranded_by_managed_stop() {
+        let (mut engine, strategy_id) = create_engine_with_strategy(true);
+
+        let result = engine.run(
+            Some(UnixNanos::from(0)),
+            Some(UnixNanos::from(1)),
+            None,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Running
+        );
+        assert_eq!(engine.running_strategy_ids(), vec![strategy_id]);
+    }
+
+    #[rstest]
+    fn test_end_reports_no_cleanly_stopped_strategies() {
+        let mut empty_engine = create_engine();
+        let empty_result = empty_engine.run(
+            Some(UnixNanos::from(0)),
+            Some(UnixNanos::from(1)),
+            None,
+            false,
+        );
+        assert!(empty_result.is_ok());
+        assert!(empty_engine.running_strategy_ids().is_empty());
+
+        let (mut engine, strategy_id) = create_engine_with_strategy(false);
+        let result = engine.run(
+            Some(UnixNanos::from(0)),
+            Some(UnixNanos::from(1)),
+            None,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert_ne!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Running
+        );
+        assert!(engine.running_strategy_ids().is_empty());
     }
 
     #[rstest]

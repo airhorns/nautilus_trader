@@ -32,7 +32,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::{SocketReconnectRegistry, log_not_implemented};
+use super::log_not_implemented;
 use crate::messages::execution::{
     BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
     GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -59,11 +59,6 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
-
-    /// Returns endpoint-level socket reconnect controls exposed by this client.
-    fn socket_reconnect_registry(&self) -> Option<&SocketReconnectRegistry> {
-        None
-    }
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {
@@ -405,9 +400,17 @@ pub trait ExecutionClient {
     ///
     /// Override this method to provide venue-specific commission logic
     /// for inferred fills generated during reconciliation.
+    /// The quantity, price, and liquidity side match the inferred fill event,
+    /// including any price derived for only the unbooked incremental quantity.
     ///
-    /// Returns `None` by default, signaling callers to use their own
-    /// generic commission formula.
+    /// Returns `Ok(None)` by default, signaling callers to use their own
+    /// generic commission formula. An error means the venue formula applies
+    /// but its result could not be represented, so callers must not substitute
+    /// a zero or generic commission for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the venue commission cannot be calculated or represented.
     #[expect(unused_variables)]
     fn calculate_commission(
         &self,
@@ -415,8 +418,8 @@ pub trait ExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
-        None
+    ) -> anyhow::Result<Option<Money>> {
+        Ok(None)
     }
 }
 

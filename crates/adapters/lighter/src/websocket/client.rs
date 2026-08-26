@@ -27,11 +27,13 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, mapref::entry::Entry};
 use nautilus_common::live::get_runtime;
+use nautilus_live::SocketControl;
 use nautilus_model::{
     identifiers::{AccountId, InstrumentId},
     instruments::InstrumentAny,
 };
 use nautilus_network::{
+    SocketStateSink,
     mode::ConnectionMode,
     websocket::{
         SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
@@ -42,7 +44,8 @@ use nautilus_network::{
 use crate::{
     common::{
         consts::{
-            DISCONNECT_TIMEOUT, HEARTBEAT_INTERVAL, RECONNECT_BASE_BACKOFF, RECONNECT_MAX_BACKOFF,
+            DISCONNECT_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RECONNECT_BASE_BACKOFF,
+            RECONNECT_MAX_BACKOFF,
         },
         enums::{LighterCandleResolution, LighterEnvironment},
         rate_limit::ws_message_rate_limiter,
@@ -95,6 +98,8 @@ pub struct LighterWebSocketClient {
     transport_backend: TransportBackend,
     ws_timeout_secs: u64,
     proxy_url: Option<String>,
+    socket_sink: Option<SocketStateSink>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for LighterWebSocketClient {
@@ -150,6 +155,8 @@ impl Clone for LighterWebSocketClient {
             transport_backend: self.transport_backend,
             ws_timeout_secs: self.ws_timeout_secs,
             proxy_url: self.proxy_url.clone(),
+            socket_sink: self.socket_sink.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -191,7 +198,23 @@ impl LighterWebSocketClient {
             transport_backend,
             ws_timeout_secs,
             proxy_url,
+            socket_sink: None,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting for the underlying transport.
+    #[must_use]
+    pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
+        self.socket_sink = Some(state_sink);
+        self
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Returns the resolved WebSocket URL.
@@ -300,23 +323,28 @@ impl LighterWebSocketClient {
         let cfg = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(HEARTBEAT_INTERVAL.as_secs()),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(self.ws_timeout_secs.saturating_mul(1_000).max(1)),
+            heartbeat_interval_secs: Some(HEARTBEAT_INTERVAL.as_secs()),
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(self.ws_timeout_secs.saturating_mul(1_000).max(1)),
             reconnect_delay_initial_ms: Some(RECONNECT_BASE_BACKOFF.as_millis() as u64),
             reconnect_delay_max_ms: Some(RECONNECT_MAX_BACKOFF.as_millis() as u64),
             reconnect_backoff_factor: Some(RECONNECT_BACKOFF_FACTOR),
             reconnect_jitter_ms: Some(RECONNECT_JITTER_MS),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: Some(HEARTBEAT_TIMEOUT.as_secs()),
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
         };
-        let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler(
+        let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler_and_state_sink(
             cfg,
             message_handler,
             None,
             ws_message_rate_limiter(&self.url),
+            self.socket_control
+                .as_ref()
+                .map(SocketControl::sink)
+                .or_else(|| self.socket_sink.clone()),
         )
         .await?;
 
@@ -333,8 +361,13 @@ impl LighterWebSocketClient {
         // connection active. Otherwise a clone observing `is_active()` could
         // race in and send a Subscribe before SetClient lands, and the
         // handler would drop the subscription because `inner == None`.
+        let reconnect_handle = client.reconnect_handle();
         if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
             anyhow::bail!("Failed to send SetClient command: {e}");
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let initial_instruments: Vec<(i16, InstrumentAny)> = self
@@ -467,6 +500,10 @@ impl LighterWebSocketClient {
 
         self.connection_mode
             .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         Ok(())
     }
 

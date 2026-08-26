@@ -30,11 +30,15 @@ use std::{
 use ahash::AHashMap;
 use axum::{
     Json, Router,
-    extract::Query,
-    http::HeaderMap,
-    response::IntoResponse,
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
@@ -44,7 +48,7 @@ use nautilus_common::{
         execution::{
             BatchCancelOrders, CancelOrder, ExecutionReport as CommonExecutionReport, ModifyOrder,
             QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
-            report::{GenerateFillReports, GenerateOrderStatusReports},
+            report::{GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports},
         },
     },
     testing::wait_until_async,
@@ -55,8 +59,8 @@ use nautilus_live::{
 };
 use nautilus_model::{
     enums::{
-        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TriggerType,
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSideSpecified, TimeInForce, TriggerType,
     },
     events::{
         OrderEventAny, OrderInitialized,
@@ -65,17 +69,18 @@ use nautilus_model::{
         },
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
-        VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId, Symbol,
+        TradeId, TraderId, VenueOrderId,
     },
     instruments::{
-        CryptoFuturesSpread, InstrumentAny,
+        CryptoFuturesSpread, Instrument, InstrumentAny,
         stubs::{
             crypto_option_btc_deribit, crypto_perpetual_ethusdt, currency_pair_btcusdt,
             currency_pair_ethusdt,
         },
     },
-    orders::{Order, OrderAny, OrderList, OrderTestBuilder},
+    orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
+    position::Position,
     reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price, Quantity},
 };
@@ -83,7 +88,9 @@ use nautilus_network::http::HttpClient;
 use nautilus_okx::{
     common::{
         consts::{
-            OKX_CLIENT_ID, OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_VENUE,
+            OKX_CLIENT_ID, OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE,
+            OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS, OKX_RECONCILIATION_LOOKBACK_MAX_MINS,
+            OKX_VENUE,
         },
         enums::{
             OKXInstrumentType, OKXMarginMode, OKXOrderStatus, OKXOrderType, OKXSide, OKXTradeMode,
@@ -91,7 +98,7 @@ use nautilus_okx::{
         models::OKXInstrument,
         parse::parse_instrument_any,
     },
-    config::OKXExecClientConfig,
+    config::OKXExecutionClientConfig,
     execution::OKXExecutionClient,
     http::{
         client::OKXResponse,
@@ -103,7 +110,11 @@ use nautilus_okx::{
             emit_algo_cancel_rejections, emit_batch_cancel_failure,
         },
         enums::{OKXWsChannel, OKXWsOperation},
-        messages::{ExecutionReport, OKXOrderMsg, OKXWebSocketArg, OKXWsFrame, OKXWsMessage},
+        error::OKXWsError,
+        messages::{
+            ExecutionReport, OKXLiquidationWarningMsg, OKXOrderMsg, OKXWebSocketArg, OKXWsFrame,
+            OKXWsMessage,
+        },
         parse::OrderStateSnapshot,
     },
 };
@@ -237,7 +248,7 @@ fn make_spread_order_msg(
     OKXSpreadOrder {
         sprd_id: Ustr::from("BCH-USDT_BCH-USDT-SWAP"),
         ord_id: Ustr::from(venue_order_id),
-        cl_ord_id: Ustr::from(client_order_id.as_str()),
+        cl_ord_id: client_order_id.inner(),
         tag: String::new(),
         side: OKXSide::Buy,
         ord_type: OKXOrderType::Limit,
@@ -335,11 +346,138 @@ async fn recv_query_order_report(
 #[rstest]
 fn test_ambiguous_submit_send_failure_does_not_emit_order_rejected() {
     let cid = ClientOrderId::new("O-submit-send-failure");
-    let (events, state) = dispatch_send_failed_response(OKXWsOperation::Order, cid);
+    let (events, state) = dispatch_send_failed_response(
+        OKXWsOperation::Order,
+        cid,
+        OKXWsError::SendFailed("send failed after retries".to_string()),
+    );
 
     assert!(
         !contains_order_event(&events, |event| matches!(event, OrderEventAny::Rejected(_))),
         "ambiguous submit failure should not emit OrderRejected: {events:?}"
+    );
+    assert!(state.order_identities.contains_key(&cid));
+}
+
+#[rstest]
+fn test_unsent_submit_send_failure_emits_order_rejected() {
+    let cid = ClientOrderId::new("O-submit-handler-unavailable");
+    let (events, state) = dispatch_send_failed_response(
+        OKXWsOperation::Order,
+        cid,
+        OKXWsError::HandlerUnavailable("channel closed".to_string()),
+    );
+
+    assert!(
+        contains_order_event(&events, |event| matches!(
+            event,
+            OrderEventAny::Rejected(rejected) if rejected.client_order_id == cid
+        )),
+        "unsent submit failure should emit OrderRejected: {events:?}"
+    );
+    assert!(!state.order_identities.contains_key(&cid));
+}
+
+#[rstest]
+fn test_unsent_batch_submit_send_failure_resolves_every_order() {
+    let cid_1 = ClientOrderId::new("O-batch-send-failure-1");
+    let cid_2 = ClientOrderId::new("O-batch-send-failure-2");
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    for cid in [cid_1, cid_2] {
+        state.order_identities.insert(
+            cid,
+            OrderIdentity {
+                client_order_id: cid,
+                instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+                strategy_id: StrategyId::from("STRATEGY-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+    }
+
+    dispatch_command_response(
+        OKXWsMessage::SendFailed {
+            request_id: "req-batch-send-failure".to_string(),
+            client_order_ids: vec![cid_1, cid_2],
+            op: Some(OKXWsOperation::BatchOrders),
+            error: OKXWsError::NoActiveClient,
+        },
+        &emitter,
+        &state,
+    );
+
+    let events = drain_events(&mut rx);
+
+    for cid in [cid_1, cid_2] {
+        assert!(
+            contains_order_event(&events, |event| matches!(
+                event,
+                OrderEventAny::Rejected(rejected) if rejected.client_order_id == cid
+            )),
+            "unsent batch submit should reject {cid}: {events:?}"
+        );
+        assert!(!state.order_identities.contains_key(&cid));
+    }
+}
+
+#[rstest]
+fn test_ambiguous_batch_submit_send_failure_emits_no_rejections() {
+    let cid_1 = ClientOrderId::new("O-batch-ambiguous-1");
+    let cid_2 = ClientOrderId::new("O-batch-ambiguous-2");
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    for cid in [cid_1, cid_2] {
+        state.order_identities.insert(
+            cid,
+            OrderIdentity {
+                client_order_id: cid,
+                instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+                strategy_id: StrategyId::from("STRATEGY-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+    }
+
+    dispatch_command_response(
+        OKXWsMessage::SendFailed {
+            request_id: "req-batch-ambiguous".to_string(),
+            client_order_ids: vec![cid_1, cid_2],
+            op: Some(OKXWsOperation::BatchOrders),
+            error: OKXWsError::SendFailed("connection reset".to_string()),
+        },
+        &emitter,
+        &state,
+    );
+
+    let events = drain_events(&mut rx);
+    assert!(
+        !contains_order_event(&events, |event| matches!(event, OrderEventAny::Rejected(_))),
+        "ambiguous batch submit failure should not emit rejections: {events:?}"
+    );
+
+    for cid in [cid_1, cid_2] {
+        assert!(state.order_identities.contains_key(&cid));
+    }
+}
+
+#[rstest]
+fn test_unsent_modify_send_failure_emits_order_modify_rejected() {
+    let cid = ClientOrderId::new("O-modify-handler-unavailable");
+    let (events, state) = dispatch_send_failed_response(
+        OKXWsOperation::AmendOrder,
+        cid,
+        OKXWsError::HandlerUnavailable("channel closed".to_string()),
+    );
+
+    assert!(
+        contains_order_event(&events, |event| matches!(
+            event,
+            OrderEventAny::ModifyRejected(rejected) if rejected.client_order_id == cid
+        )),
+        "unsent modify failure should emit OrderModifyRejected: {events:?}"
     );
     assert!(state.order_identities.contains_key(&cid));
 }
@@ -356,9 +494,42 @@ fn test_explicit_venue_submit_rejection_emits_order_rejected() {
 }
 
 #[rstest]
+fn test_retryable_venue_submit_code_does_not_emit_order_rejected() {
+    let cid = ClientOrderId::new("O-submit-system-busy");
+    let events = dispatch_venue_code_response(OKXWsOperation::Order, cid, "50013", "System busy");
+
+    assert!(
+        !contains_order_event(&events, |event| matches!(
+            event,
+            OrderEventAny::Rejected(rejected) if rejected.client_order_id == cid
+        )),
+        "retryable venue submit code should not emit OrderRejected: {events:?}"
+    );
+}
+
+#[rstest]
+fn test_missing_venue_submit_code_does_not_emit_order_rejected() {
+    let cid = ClientOrderId::new("O-submit-missing-scode");
+    let events =
+        dispatch_venue_code_response(OKXWsOperation::Order, cid, "", "All operations failed");
+
+    assert!(
+        !contains_order_event(&events, |event| matches!(
+            event,
+            OrderEventAny::Rejected(rejected) if rejected.client_order_id == cid
+        )),
+        "missing venue sCode should not emit OrderRejected: {events:?}"
+    );
+}
+
+#[rstest]
 fn test_ambiguous_cancel_send_failure_does_not_emit_order_cancel_rejected() {
     let cid = ClientOrderId::new("O-cancel-send-failure");
-    let (events, state) = dispatch_send_failed_response(OKXWsOperation::CancelOrder, cid);
+    let (events, state) = dispatch_send_failed_response(
+        OKXWsOperation::CancelOrder,
+        cid,
+        OKXWsError::SendFailed("send failed after retries".to_string()),
+    );
 
     assert!(
         !contains_order_event(&events, |event| matches!(
@@ -387,7 +558,11 @@ fn test_explicit_venue_cancel_rejection_emits_order_cancel_rejected() {
 #[rstest]
 fn test_ambiguous_modify_send_failure_does_not_emit_order_modify_rejected() {
     let cid = ClientOrderId::new("O-modify-send-failure");
-    let (events, state) = dispatch_send_failed_response(OKXWsOperation::AmendOrder, cid);
+    let (events, state) = dispatch_send_failed_response(
+        OKXWsOperation::AmendOrder,
+        cid,
+        OKXWsError::SendFailed("send failed after retries".to_string()),
+    );
 
     assert!(
         !contains_order_event(&events, |event| matches!(
@@ -607,6 +782,7 @@ async fn test_local_modify_validation_failure_emits_order_modify_rejected() {
 fn dispatch_send_failed_response(
     op: OKXWsOperation,
     client_order_id: ClientOrderId,
+    error: OKXWsError,
 ) -> (Vec<ExecutionEvent>, WsDispatchState) {
     let (emitter, mut rx) = test_emitter();
     let state = state_with_order_identity(client_order_id, InstrumentId::from("ETH-USDT-SWAP.OKX"));
@@ -614,9 +790,9 @@ fn dispatch_send_failed_response(
     dispatch_command_response(
         OKXWsMessage::SendFailed {
             request_id: "req-send-failure".to_string(),
-            client_order_id: Some(client_order_id),
+            client_order_ids: vec![client_order_id],
             op: Some(op),
-            error: "send failed after retries".to_string(),
+            error,
         },
         &emitter,
         &state,
@@ -629,6 +805,15 @@ fn dispatch_explicit_rejection_response(
     op: OKXWsOperation,
     client_order_id: ClientOrderId,
 ) -> Vec<ExecutionEvent> {
+    dispatch_venue_code_response(op, client_order_id, "51000", "Order rejected by venue")
+}
+
+fn dispatch_venue_code_response(
+    op: OKXWsOperation,
+    client_order_id: ClientOrderId,
+    s_code: &str,
+    s_msg: &str,
+) -> Vec<ExecutionEvent> {
     let (emitter, mut rx) = test_emitter();
     let state = state_with_order_identity(client_order_id, InstrumentId::from("ETH-USDT-SWAP.OKX"));
 
@@ -639,8 +824,8 @@ fn dispatch_explicit_rejection_response(
             code: "1".to_string(),
             msg: "All operations failed".to_string(),
             data: vec![json!({
-                "sCode": "51000",
-                "sMsg": "Order rejected by venue",
+                "sCode": s_code,
+                "sMsg": s_msg,
                 "clOrdId": client_order_id.as_str(),
                 "ordId": "12345",
             })],
@@ -1301,7 +1486,7 @@ fn test_dispatch_spread_order_live_update_emits_updated() {
 }
 
 #[rstest]
-fn test_dispatch_spread_order_fill_synthesizes_accepted_and_dedups_replay() {
+fn test_dispatch_spread_order_fill_fails_closed_without_fee() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
@@ -1327,23 +1512,13 @@ fn test_dispatch_spread_order_fill_synthesizes_accepted_and_dedups_replay() {
     );
 
     let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 2);
-    match (&events[0], &events[1]) {
-        (
-            ExecutionEvent::Order(OrderEventAny::Accepted(accepted)),
-            ExecutionEvent::Order(OrderEventAny::Filled(filled)),
-        ) => {
-            assert_eq!(accepted.client_order_id, cid);
-            assert_eq!(filled.client_order_id, cid);
-            assert_eq!(filled.trade_id, TradeId::new("TSPRD001"));
-            assert_eq!(filled.last_qty, Quantity::from("0.01"));
-            assert_eq!(filled.last_px, Price::from("1.0"));
-        }
-        other => panic!("Expected Accepted then Filled spread events, was {other:?}"),
-    }
-
-    assert!(state.order_identities.get(&cid).is_none());
-    assert!(state.contains_filled(&cid));
+    assert!(
+        events.is_empty(),
+        "WS sprd-orders omit fee so the fill must stay unprocessed, was {events:?}"
+    );
+    assert!(state.order_identities.get(&cid).is_some());
+    assert!(!state.contains_filled(&cid));
+    assert!(!state.check_and_insert_trade(TradeId::new("TSPRD001")));
 
     dispatch_spread_message(
         fill,
@@ -1355,7 +1530,8 @@ fn test_dispatch_spread_order_fill_synthesizes_accepted_and_dedups_replay() {
     );
 
     let replay_events = drain_events(&mut rx);
-    assert_eq!(replay_events.len(), 0);
+    assert!(replay_events.is_empty());
+    assert!(state.order_identities.get(&cid).is_some());
 }
 
 #[rstest]
@@ -1565,6 +1741,211 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
     }
     assert!(state.order_identities.is_empty());
     assert!(state.contains_filled(&client_order_id));
+}
+
+struct VenueFillCase {
+    fixture: &'static str,
+    raw_symbol: &'static str,
+    instrument_id: InstrumentId,
+    venue_order_id: &'static str,
+    trade_id: &'static str,
+    side: OrderSide,
+    qty: &'static str,
+    px: &'static str,
+    fee: &'static str,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "case constructor mirrors the venue fill fields"
+)]
+fn venue_fill_case(
+    fixture: &'static str,
+    raw_symbol: &'static str,
+    venue_order_id: &'static str,
+    trade_id: &'static str,
+    side: OrderSide,
+    qty: &'static str,
+    px: &'static str,
+    fee: &'static str,
+) -> VenueFillCase {
+    VenueFillCase {
+        fixture,
+        raw_symbol,
+        instrument_id: InstrumentId::from(format!("{raw_symbol}.OKX").as_str()),
+        venue_order_id,
+        trade_id,
+        side,
+        qty,
+        px,
+        fee,
+    }
+}
+
+#[rstest]
+#[case::liquidation(venue_fill_case(
+    "ws_orders_liquidation.json",
+    "BTC-USDT-SWAP",
+    "2497956918703120999",
+    "1518905999",
+    OrderSide::Sell,
+    "0.500",
+    "40000.00",
+    "20 USDT"
+))]
+#[case::adl(venue_fill_case(
+    "ws_orders_adl.json",
+    "ETH-USDT-SWAP",
+    "2497956918703121000",
+    "1518906000",
+    OrderSide::Buy,
+    "0.300",
+    "41000.00",
+    "12.3 USDT"
+))]
+fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCase) {
+    let (_, order_msgs) = load_order_messages(case.fixture);
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    let instruments = AtomicMap::new();
+    instruments.insert(
+        Ustr::from(case.raw_symbol),
+        order_instrument(OKXInstrumentType::Swap, case.instrument_id, case.raw_symbol),
+    );
+    let mut fee_cache = AHashMap::new();
+    let mut filled_qty_cache = AHashMap::new();
+    let mut order_state_cache = AHashMap::new();
+
+    dispatch_ws_message(
+        OKXWsMessage::Orders(order_msgs),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
+            // Venue-initiated flow (liquidation or ADL): no client order ID,
+            // surfaced as a fill report
+            assert_eq!(report.account_id, AccountId::from("OKX-001"));
+            assert_eq!(report.instrument_id, case.instrument_id);
+            assert_eq!(report.client_order_id, None);
+            assert_eq!(
+                report.venue_order_id,
+                VenueOrderId::new(case.venue_order_id)
+            );
+            assert_eq!(report.trade_id, TradeId::new(case.trade_id));
+            assert_eq!(report.order_side, case.side);
+            assert_eq!(report.last_qty, Quantity::from(case.qty));
+            assert_eq!(report.last_px, Price::from(case.px));
+            assert_eq!(report.commission, Money::from(case.fee));
+            assert_eq!(report.liquidity_side, LiquiditySide::Taker);
+        }
+        other => panic!("Expected venue-initiated fill report, was {other:?}"),
+    }
+}
+
+#[rstest]
+fn test_dispatch_positions_channel_emits_position_report() {
+    let content = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("ws_positions.json"),
+    )
+    .unwrap();
+    let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
+    let OKXWsFrame::Data { arg, data } = frame else {
+        panic!("Expected data frame");
+    };
+    assert_eq!(arg.channel, OKXWsChannel::Positions);
+
+    let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    let instruments = AtomicMap::new();
+    instruments.insert(
+        Ustr::from("BTC-USDT-SWAP"),
+        order_instrument(OKXInstrumentType::Swap, instrument_id, "BTC-USDT-SWAP"),
+    );
+    let mut fee_cache = AHashMap::new();
+    let mut filled_qty_cache = AHashMap::new();
+    let mut order_state_cache = AHashMap::new();
+
+    dispatch_ws_message(
+        OKXWsMessage::Positions(data),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ExecutionEvent::Report(CommonExecutionReport::Position(report)) => {
+            assert_eq!(report.account_id, AccountId::from("OKX-001"));
+            assert_eq!(report.instrument_id, instrument_id);
+            assert_eq!(report.position_side, PositionSideSpecified::Long);
+            assert_eq!(report.quantity, Quantity::from("0.500"));
+            assert_eq!(
+                report.venue_position_id,
+                Some(PositionId::new("12345-LONG"))
+            );
+        }
+        other => panic!("Expected position report, was {other:?}"),
+    }
+}
+
+#[rstest]
+fn test_dispatch_liquidation_warning_logs_only() {
+    let content = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("ws_liquidation_warning.json"),
+    )
+    .unwrap();
+    let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
+    let OKXWsFrame::Data { arg, data } = frame else {
+        panic!("Expected data frame");
+    };
+    assert_eq!(arg.channel, OKXWsChannel::LiquidationWarning);
+
+    let warnings: Vec<OKXLiquidationWarningMsg> = serde_json::from_value(data).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    let instruments = AtomicMap::new();
+    let mut fee_cache = AHashMap::new();
+    let mut filled_qty_cache = AHashMap::new();
+    let mut order_state_cache = AHashMap::new();
+
+    dispatch_ws_message(
+        OKXWsMessage::LiquidationWarnings(warnings),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+
+    // Risk warnings surface as logs only; no execution events
+    assert!(drain_events(&mut rx).is_empty());
 }
 
 #[rstest]
@@ -2325,6 +2706,32 @@ async fn test_trade_dedup_concurrent_inserts_only_one_wins() {
     );
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_dispatch_fill_reports_claim_trade_id_across_tasks() {
+    let (emitter, mut rx) = test_emitter();
+    let state = Arc::new(WsDispatchState::default());
+    let fill = make_fill_report_with_trade_id("O-001", "t-race-dispatch");
+    let mut handles = Vec::new();
+
+    for _ in 0..8 {
+        let emitter = emitter.clone();
+        let state = Arc::clone(&state);
+        let fill = fill.clone();
+        handles.push(tokio::spawn(async move {
+            dispatch_execution_reports(vec![ExecutionReport::Fill(fill)], &emitter, &state);
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    let events = drain_events(&mut rx);
+
+    assert_eq!(events.len(), 1, "exactly one fill should be emitted");
+    assert!(state.contains_trade(&TradeId::new("t-race-dispatch")));
+}
+
 fn load_test_data(filename: &str) -> serde_json::Value {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_data")
@@ -2345,6 +2752,20 @@ fn query_order_instrument() -> InstrumentAny {
     parse_instrument_any(raw, None, None, None, None, UnixNanos::default())
         .unwrap()
         .expect("expected parsed ETH-USDT-SWAP instrument")
+}
+
+fn btc_usdt_swap_instrument() -> InstrumentAny {
+    let response: OKXResponse<OKXInstrument> =
+        serde_json::from_value(load_test_data("http_get_instruments_swap.json")).unwrap();
+    let raw = response
+        .data
+        .iter()
+        .find(|instrument| instrument.inst_id == Ustr::from("BTC-USDT-SWAP"))
+        .expect("expected BTC-USDT-SWAP fixture");
+
+    parse_instrument_any(raw, None, None, None, None, UnixNanos::default())
+        .unwrap()
+        .expect("expected parsed BTC-USDT-SWAP instrument")
 }
 
 fn regular_order_detail_response(params: &HashMap<String, String>) -> serde_json::Value {
@@ -2413,6 +2834,17 @@ fn regular_order_detail_response(params: &HashMap<String, String>) -> serde_json
                 "filled",
                 "800.00",
             ),
+            "mass-triggered-child-venue-id" => (
+                "",
+                "",
+                "mass-triggered-child-venue-id",
+                "limit",
+                "filled",
+                "850.00",
+            ),
+            other if other.starts_with("mass-cap-child-") => {
+                ("", "", other, "limit", "filled", "850.00")
+            }
             "external-venue-id" => ("", "", "external-venue-id", "limit", "live", "2000.00"),
             other => panic!("unexpected regular order detail query: {other}"),
         };
@@ -2488,6 +2920,11 @@ fn algo_order_detail_response(params: &HashMap<String, String>) -> serde_json::V
             order["ordIdList"] = json!(["single-child-venue-id"]);
             order["slOrdPx"] = json!("800.00");
             order["state"] = json!("effective");
+        }
+        None if params.get("algoId").map(String::as_str) == Some("algo-venue-id") => {
+            order["algoClOrdId"] = json!("OQUERYALGO1");
+            order["ordId"] = json!("");
+            order["state"] = json!("live");
         }
         _ => {}
     }
@@ -2600,6 +3037,73 @@ fn create_exec_test_router() -> Router {
     )
 }
 
+#[derive(Clone, Default)]
+struct WsTeardownState {
+    opened: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
+}
+
+async fn handle_exec_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<WsTeardownState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_exec_ws_socket(socket, state))
+}
+
+async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState>) {
+    state.opened.fetch_add(1, Ordering::Relaxed);
+
+    while let Some(message) = socket.next().await {
+        let Ok(message) = message else { break };
+        if let Message::Text(text) = message
+            && text.contains("\"op\":\"login\"")
+            && socket
+                .send(Message::Text(
+                    "{\"event\":\"login\",\"code\":\"0\",\"msg\":\"\",\"connId\":\"test\"}"
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+        {
+            break;
+        }
+    }
+    state.closed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Serves instrument fixtures, a failing account balance endpoint, and
+/// WebSocket endpoints that stay open until the client closes them.
+async fn start_exec_session_failure_server() -> (SocketAddr, Arc<WsTeardownState>) {
+    let ws_state = Arc::new(WsTeardownState::default());
+    let router = Router::new()
+        .route(
+            "/ws/v5/private",
+            get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws_state)),
+        )
+        .route(
+            "/ws/v5/business",
+            get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws_state)),
+        )
+        .route(
+            "/api/v5/public/instruments",
+            get(|| async { Json(load_test_data("http_get_instruments_swap.json")) }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    (addr, ws_state)
+}
+
 #[derive(Default)]
 struct ReportRouteState {
     regular_order_pending_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
@@ -2609,6 +3113,7 @@ struct ReportRouteState {
     spread_order_pending_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     spread_order_history_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     regular_fill_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
+    regular_fill_history_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     spread_trade_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
 }
 
@@ -2712,6 +3217,7 @@ fn create_exec_report_test_router(state: Arc<ReportRouteState>) -> Router {
     let spread_pending_state = Arc::clone(&state);
     let spread_history_state = Arc::clone(&state);
     let regular_fill_state = Arc::clone(&state);
+    let regular_fill_history_state = Arc::clone(&state);
     let spread_trade_state = state;
 
     Router::new()
@@ -2847,6 +3353,16 @@ fn create_exec_report_test_router(state: Arc<ReportRouteState>) -> Router {
             }),
         )
         .route(
+            "/api/v5/trade/fills-history",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let state = Arc::clone(&regular_fill_history_state);
+                async move {
+                    state.regular_fill_history_queries.lock().await.push(params);
+                    Json(json!({"code": "0", "msg": "", "data": []})).into_response()
+                }
+            }),
+        )
+        .route(
             "/api/v5/sprd/trades",
             get(move |Query(params): Query<HashMap<String, String>>| {
                 let state = Arc::clone(&spread_trade_state);
@@ -2855,6 +3371,14 @@ fn create_exec_report_test_router(state: Arc<ReportRouteState>) -> Router {
                     Json(load_test_data("http_get_spread_trades.json")).into_response()
                 }
             }),
+        )
+        .route(
+            "/api/v5/account/positions",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
         )
 }
 
@@ -2870,7 +3394,7 @@ fn create_test_execution_client(
 
 fn create_test_execution_client_configured(
     base_url: &str,
-    configure: impl FnOnce(&mut OKXExecClientConfig),
+    configure: impl FnOnce(&mut OKXExecutionClientConfig),
 ) -> (
     OKXExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -2893,8 +3417,7 @@ fn create_test_execution_client_configured(
         cache.clone(),
     );
 
-    let mut config = OKXExecClientConfig {
-        trader_id,
+    let mut config = OKXExecutionClientConfig {
         account_id,
         base_url_http: Some(base_url.to_string()),
         base_url_ws_private: Some("ws://127.0.0.1:19999/ws/v5/private".to_string()),
@@ -4023,4 +4546,1459 @@ async fn test_submit_order_list_denies_spread_instrument() {
             "reason was: {reason}"
         );
     }
+}
+
+fn generate_order_status_report_cmd(
+    instrument_id: Option<InstrumentId>,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: Option<VenueOrderId>,
+) -> GenerateOrderStatusReport {
+    GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        None,
+        None,
+    )
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_requires_instrument_id() {
+    let (client, _rx, _cache, _state) = create_query_order_test_client().await;
+    let error = client
+        .generate_order_status_report(&generate_order_status_report_cmd(
+            None,
+            Some(ClientOrderId::from("OQUERYREGULAR1")),
+            None,
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("requires instrument_id"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_uses_targeted_lookup() {
+    let (client, _rx, _cache, state) = create_query_order_test_client().await;
+    let client_order_id = ClientOrderId::from("OQUERYREGULAR1");
+    let report = client
+        .generate_order_status_report(&generate_order_status_report_cmd(
+            Some(InstrumentId::from("ETH-USDT-SWAP.OKX")),
+            Some(client_order_id),
+            None,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let regular_queries = state.regular_queries.lock().await;
+    let sequence = state.sequence.lock().await;
+
+    assert_eq!(report.client_order_id, Some(client_order_id));
+    assert!(
+        regular_queries
+            .iter()
+            .any(|query| query.get("clOrdId").map(String::as_str) == Some("OQUERYREGULAR1"))
+    );
+    assert!(sequence.iter().any(|entry| entry.starts_with("regular:")));
+    assert!(
+        !sequence
+            .iter()
+            .any(|entry| entry.contains("orders-history"))
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_venue_only_queries_algo_after_regular_miss() {
+    let (client, _rx, _cache, state) = create_query_order_test_client().await;
+    let venue_order_id = VenueOrderId::from("algo-venue-id");
+    let report = client
+        .generate_order_status_report(&generate_order_status_report_cmd(
+            Some(InstrumentId::from("ETH-USDT-SWAP.OKX")),
+            None,
+            Some(venue_order_id),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let regular_queries = state.regular_queries.lock().await;
+    let algo_queries = state.algo_queries.lock().await;
+    let sequence = state.sequence.lock().await;
+
+    assert_eq!(report.venue_order_id, venue_order_id);
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("OQUERYALGO1"))
+    );
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(
+        regular_queries[0].get("ordId").map(String::as_str),
+        Some("algo-venue-id")
+    );
+    assert!(!regular_queries[0].contains_key("clOrdId"));
+    assert_eq!(
+        algo_queries[0].get("algoId").map(String::as_str),
+        Some("algo-venue-id")
+    );
+    assert!(!algo_queries[0].contains_key("algoClOrdId"));
+    assert_eq!(
+        sequence.as_slice(),
+        ["regular:algo-venue-id", "algo:algo-venue-id"]
+    );
+}
+
+#[rstest]
+#[case(Some(60), 60)]
+#[case(None, OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS)]
+#[case(Some(5 * 24 * 60), 5 * 24 * 60)]
+#[case(
+    Some(8 * 24 * 60),
+    OKX_RECONCILIATION_LOOKBACK_MAX_MINS
+)]
+#[tokio::test]
+async fn test_generate_mass_status_sets_report_window(
+    #[case] lookback_mins: Option<u64>,
+    #[case] expected_mins: u64,
+) {
+    let state = Arc::new(ReportRouteState::default());
+    let addr = start_exec_report_test_server(Arc::clone(&state)).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_start = UnixNanos::from(
+        mass_status
+            .ts_init
+            .as_u64()
+            .saturating_sub(expected_mins * 60 * 1_000_000_000),
+    );
+    let recent_fill_queries = state.regular_fill_queries.lock().await.clone();
+    let extended_fill_queries = state.regular_fill_history_queries.lock().await.clone();
+    let expected_begin = (expected_start.as_u64() / 1_000_000).to_string();
+
+    assert_eq!(mass_status.lookback_start(), Some(expected_start));
+    assert!(mass_status.reports_complete());
+    let fill_query = if expected_mins <= OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS {
+        assert_eq!(recent_fill_queries.len(), 1);
+        assert!(extended_fill_queries.is_empty());
+        &recent_fill_queries[0]
+    } else {
+        assert!(recent_fill_queries.is_empty());
+        assert_eq!(extended_fill_queries.len(), 1);
+        &extended_fill_queries[0]
+    };
+    assert_eq!(
+        fill_query.get("begin").map(String::as_str),
+        Some(expected_begin.as_str())
+    );
+    assert!(!fill_query.contains_key("end"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_does_not_invent_net_flat_for_cached_hedge_position() {
+    let state = Arc::new(ReportRouteState::default());
+    let addr = start_exec_report_test_server(Arc::clone(&state)).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    let instrument = query_order_instrument();
+    client.on_instrument(instrument.clone());
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .build();
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-HEDGE-001")),
+        Some(PositionId::from("P-HEDGE-001")),
+        Some(Price::from("2000")),
+        Some(Quantity::from("1")),
+        Some(LiquiditySide::Taker),
+        Some(Money::from("0.01 USDT")),
+        None,
+        Some(AccountId::from("OKX-001")),
+    );
+    let position = Position::new(&instrument, fill.into());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+
+    assert!(mass_status.reports_complete());
+    assert!(mass_status.position_reports().is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
+    let mut fill = load_test_data("http_transaction_detail.json");
+    fill["fillSz"] = json!("invalid");
+    fill["instId"] = json!("ETH-USDT-SWAP");
+    fill["instType"] = json!("SWAP");
+    fill["ts"] = json!(jiff::Timestamp::now().as_millisecond().to_string());
+    let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
+    let router = Router::new()
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-history", empty.clone())
+        .route("/api/v5/trade/orders-algo-pending", empty.clone())
+        .route("/api/v5/trade/orders-algo-history", empty.clone())
+        .route(
+            "/api/v5/trade/fills",
+            get(move || {
+                let fill = fill.clone();
+                async move { Json(json!({"code": "0", "msg": "", "data": [fill]})) }
+            }),
+        )
+        .route("/api/v5/account/positions", empty.clone())
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+    client.on_instrument(query_order_instrument());
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+
+    assert!(error.to_string().contains("failed to parse fill quantity"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_recovers_historical_triggered_child_status() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some("filled"),
+        "1",
+        "OMASSTRIGGERED1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected recovered triggered child report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(mass_status.reports_complete());
+    assert!(mass_status.lookback_start().is_some());
+    assert_eq!(reports.len(), 1);
+    let position_reports = mass_status.position_reports();
+    let position_report = position_reports
+        .get(&InstrumentId::from("ETH-USDT-SWAP.OKX"))
+        .and_then(|reports| reports.first())
+        .expect("expected explicit flat position report");
+    assert_eq!(detail_queries.len(), 1);
+    assert_eq!(
+        detail_queries[0].get("ordId").map(String::as_str),
+        Some("mass-triggered-child-venue-id")
+    );
+    assert_eq!(
+        detail_queries[0].get("instId").map(String::as_str),
+        Some("ETH-USDT-SWAP")
+    );
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("OMASSTRIGGERED1"))
+    );
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(report.quantity, Quantity::from("1"));
+    assert_eq!(report.filled_qty, Quantity::from("1"));
+    assert_eq!(position_reports.len(), 1);
+    assert_eq!(position_report.position_side, PositionSideSpecified::Flat);
+    assert_eq!(position_report.quantity, Quantity::from("0"));
+}
+
+#[rstest]
+#[case("live", "0", OrderStatus::Triggered, Quantity::from("0"))]
+#[case(
+    "partially_filled",
+    "0.5",
+    OrderStatus::PartiallyFilled,
+    Quantity::from("0.5")
+)]
+#[case("canceled", "0", OrderStatus::Canceled, Quantity::from("0"))]
+#[case("post_only_rejected", "0", OrderStatus::Rejected, Quantity::from("0"))]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_triggered_child_status(
+    #[case] child_state: &'static str,
+    #[case] filled_qty: &'static str,
+    #[case] expected_status: OrderStatus,
+    #[case] expected_filled_qty: Quantity,
+) {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some(child_state),
+        filled_qty,
+        "OMASSTRIGGERED1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected recovered triggered child report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(mass_status.reports_complete());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(detail_queries.len(), 1);
+    assert_eq!(report.order_status, expected_status);
+    assert_eq!(report.filled_qty, expected_filled_qty);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_uses_live_child_quantity_for_close_fraction_parent() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some("live"),
+        "0",
+        "OMASSCLOSEFRACTION1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected recovered close-fraction child report");
+
+    assert_eq!(detail_queries.lock().await.len(), 1);
+    assert_eq!(report.order_status, OrderStatus::Triggered);
+    assert_eq!(report.quantity, Quantity::from("1"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_external_triggered_child_identity() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some("filled"),
+        "1",
+        "",
+        "OCHILDGENERATED1",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected recovered external child report");
+
+    assert!(mass_status.reports_complete());
+    assert_eq!(report.client_order_id, None);
+    assert_eq!(report.order_status, OrderStatus::Filled);
+}
+
+#[rstest]
+#[case::missing_child(
+    "effective",
+    None,
+    "ETH-USDT-SWAP",
+    None,
+    1,
+    &["mass-triggered-child-venue-id"],
+    1
+)]
+#[case::multiple_children(
+    "effective",
+    Some("filled"),
+    "ETH-USDT-SWAP",
+    None,
+    1,
+    &["mass-triggered-child-venue-id", "other-child-venue-id"],
+    0
+)]
+#[case::mismatched_instrument(
+    "effective",
+    Some("filled"),
+    "BTC-USDT-SWAP",
+    None,
+    1,
+    &["mass-triggered-child-venue-id"],
+    1
+)]
+#[case::mismatched_venue_order_id(
+    "effective",
+    Some("filled"),
+    "ETH-USDT-SWAP",
+    Some("other-child-venue-id"),
+    1,
+    &["mass-triggered-child-venue-id"],
+    1
+)]
+#[case::inconsistent_child_order_id(
+    "effective",
+    Some("filled"),
+    "ETH-USDT-SWAP",
+    None,
+    1,
+    &["other-child-venue-id"],
+    0
+)]
+#[case::child_algo_order(
+    "effective",
+    Some("filled"),
+    "ETH-USDT-SWAP",
+    None,
+    1,
+    &["sub-algo-id"],
+    0
+)]
+#[case::excess_order_details(
+    "effective",
+    Some("filled"),
+    "ETH-USDT-SWAP",
+    None,
+    2,
+    &["mass-triggered-child-venue-id"],
+    1
+)]
+#[tokio::test]
+async fn test_generate_mass_status_omits_unresolved_triggered_child(
+    #[case] parent_state: &'static str,
+    #[case] child_state: Option<&'static str>,
+    #[case] response_instrument_id: &'static str,
+    #[case] response_venue_order_id: Option<&'static str>,
+    #[case] detail_record_count: usize,
+    #[case] child_order_ids: &'static [&'static str],
+    #[case] expected_detail_queries: usize,
+) {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        parent_state,
+        child_state,
+        "0",
+        "OMASSTRIGGERED1",
+        "",
+        response_instrument_id,
+        response_venue_order_id,
+        detail_record_count,
+        false,
+        child_order_ids,
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(!mass_status.reports_complete());
+    assert!(mass_status.order_reports().is_empty());
+    assert_eq!(detail_queries.len(), expected_detail_queries);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_rejected_algo_parent() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "order_failed",
+        Some("filled"),
+        "0",
+        "OMASSREJECTED1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected rejected algo report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(mass_status.reports_complete());
+    assert_eq!(reports.len(), 1);
+    assert!(detail_queries.is_empty());
+    assert_eq!(report.order_status, OrderStatus::Rejected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_regular_child_for_ambiguous_algo_parent() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some("live"),
+        "0",
+        "OMASSTRIGGERED1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        true,
+        &["mass-triggered-child-venue-id", "other-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected authoritative regular child report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(!mass_status.reports_complete());
+    assert_eq!(reports.len(), 1);
+    assert!(detail_queries.is_empty());
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_external_regular_child_when_detail_missing() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        None,
+        "0",
+        "OMASSTRIGGERED1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        true,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected regular child fallback report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(!mass_status.reports_complete());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(detail_queries.len(), 1);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_recovers_sole_listed_child_order_id() {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        Some("filled"),
+        "1",
+        "OMASSLISTONLY1",
+        "",
+        "ETH-USDT-SWAP",
+        None,
+        1,
+        false,
+        &["mass-triggered-child-venue-id"],
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
+        .expect("expected recovered listed child report");
+    let detail_queries = detail_queries.lock().await;
+
+    assert!(mass_status.reports_complete());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(detail_queries.len(), 1);
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(report.filled_qty, Quantity::from("1"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_bounds_triggered_child_recovery() {
+    let detail_query_count = Arc::new(AtomicUsize::new(0));
+    let addr = start_mass_status_recovery_cap_server(Arc::clone(&detail_query_count)).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+
+    assert!(!mass_status.reports_complete());
+    assert_eq!(reports.len(), 100);
+    assert_eq!(detail_query_count.load(Ordering::Relaxed), 100);
+    assert!(reports.values().all(|report| {
+        report.order_status == OrderStatus::Filled && report.filled_qty == Quantity::from("1")
+    }));
+    assert!(reports.contains_key(&VenueOrderId::from("mass-cap-child-99")));
+    assert!(!reports.contains_key(&VenueOrderId::from("mass-cap-child-100")));
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn start_mass_status_triggered_child_server(
+    detail_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    parent_state: &'static str,
+    child_state: Option<&'static str>,
+    filled_qty: &'static str,
+    parent_client_order_id: &'static str,
+    child_client_order_id: &'static str,
+    response_instrument_id: &'static str,
+    response_venue_order_id: Option<&'static str>,
+    detail_record_count: usize,
+    bulk_regular_child: bool,
+    child_order_ids: &'static [&'static str],
+) -> SocketAddr {
+    let algo_history = get(
+        move |Query(params): Query<HashMap<String, String>>| async move {
+            let returns_parent = params
+                .get("ordType")
+                .is_some_and(|value| value == "trigger")
+                && params
+                    .get("state")
+                    .is_some_and(|value| value == parent_state);
+
+            if !returns_parent {
+                return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+            }
+
+            let mut response = load_test_data("http_get_orders_algo_history.json");
+            let order = &mut response["data"][0];
+            order["actualPx"] = json!("850.00");
+            order["actualSide"] = json!("buy");
+            order["actualSz"] = json!(filled_qty);
+            order["algoClOrdId"] = json!(parent_client_order_id);
+            order["algoId"] = json!("mass-triggered-parent-venue-id");
+            order["clOrdId"] = json!("");
+            order["instId"] = json!("ETH-USDT-SWAP");
+            order["instType"] = json!("SWAP");
+            order["ordId"] = json!(if parent_client_order_id == "OMASSLISTONLY1" {
+                ""
+            } else {
+                "mass-triggered-child-venue-id"
+            });
+
+            if child_order_ids
+                .first()
+                .is_some_and(|order_id| order_id.starts_with("sub-algo-"))
+            {
+                order["ordIdList"] = json!([]);
+                order["subAlgoIdList"] = json!(child_order_ids);
+            } else {
+                order["ordIdList"] = json!(child_order_ids);
+            }
+            order["ordPx"] = json!("850.00");
+            order["posSide"] = json!("net");
+            order["side"] = json!("buy");
+            order["state"] = json!(parent_state);
+            if parent_client_order_id == "OMASSCLOSEFRACTION1" {
+                order["closeFraction"] = json!("1");
+                order["sz"] = json!("");
+            } else {
+                order["sz"] = json!("1");
+            }
+            order["tdMode"] = json!("cross");
+            order["triggerPx"] = json!("900.00");
+            let now_ms = jiff::Timestamp::now().as_millisecond().to_string();
+            order["cTime"] = json!(&now_ms);
+            order["triggerTime"] = json!(&now_ms);
+            order["uTime"] = json!(now_ms);
+            Json(response).into_response()
+        },
+    );
+    let order_detail = get(move |Query(params): Query<HashMap<String, String>>| {
+        let detail_queries = Arc::clone(&detail_queries);
+        async move {
+            detail_queries.lock().await.push(params.clone());
+            let Some(child_state) = child_state else {
+                return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+            };
+            let mut response = regular_order_detail_response(&params);
+            let order = &mut response["data"][0];
+            order["accFillSz"] = json!(filled_qty);
+            order["algoClOrdId"] = json!("");
+            order["avgPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
+            order["clOrdId"] = json!(child_client_order_id);
+            order["fillPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
+            order["fillSz"] = json!(filled_qty);
+            order["instId"] = json!(response_instrument_id);
+            let state = if child_state == "post_only_rejected" {
+                order["cancelSource"] = json!(OKX_POST_ONLY_CANCEL_SOURCE);
+                order["cancelSourceReason"] = json!(OKX_POST_ONLY_CANCEL_REASON);
+                order["ordType"] = json!("post_only");
+                "canceled"
+            } else {
+                child_state
+            };
+
+            if let Some(response_venue_order_id) = response_venue_order_id {
+                order["ordId"] = json!(response_venue_order_id);
+            }
+            order["state"] = json!(state);
+            let now_ms = jiff::Timestamp::now().as_millisecond().to_string();
+            order["cTime"] = json!(&now_ms);
+            order["uTime"] = json!(now_ms);
+            if detail_record_count > 1 {
+                let duplicate = order.clone();
+                response["data"]
+                    .as_array_mut()
+                    .unwrap()
+                    .resize(detail_record_count, duplicate);
+            }
+            Json(response).into_response()
+        }
+    });
+    let regular_history = get(move || async move {
+        if !bulk_regular_child {
+            return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+        }
+
+        let mut response = load_test_data("http_get_orders_history.json");
+        let order = &mut response["data"][0];
+        order["accFillSz"] = json!("0");
+        order["algoClOrdId"] = json!(parent_client_order_id);
+        order["avgPx"] = json!("");
+        order["clOrdId"] = json!("");
+        order["fillPx"] = json!("");
+        order["fillSz"] = json!("");
+        order["instId"] = json!("ETH-USDT-SWAP");
+        order["ordId"] = json!("mass-triggered-child-venue-id");
+        order["ordType"] = json!("limit");
+        order["posSide"] = json!("net");
+        order["px"] = json!("850.00");
+        order["side"] = json!("buy");
+        order["state"] = json!("live");
+        order["sz"] = json!("1");
+        order["tdMode"] = json!("cross");
+        let now_ms = jiff::Timestamp::now().as_millisecond().to_string();
+        order["cTime"] = json!(&now_ms);
+        order["uTime"] = json!(now_ms);
+        Json(response).into_response()
+    });
+    let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
+    let router = Router::new()
+        .route("/api/v5/trade/order", order_detail)
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-history", regular_history)
+        .route("/api/v5/trade/orders-algo-pending", empty.clone())
+        .route("/api/v5/trade/orders-algo-history", algo_history)
+        .route("/api/v5/trade/fills", empty.clone())
+        .route("/api/v5/trade/fills-history", empty.clone())
+        .route("/api/v5/account/positions", empty)
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+async fn start_mass_status_recovery_cap_server(detail_query_count: Arc<AtomicUsize>) -> SocketAddr {
+    let algo_history = get(
+        move |Query(params): Query<HashMap<String, String>>| async move {
+            let returns_parents = params
+                .get("ordType")
+                .is_some_and(|value| value == "trigger")
+                && params
+                    .get("state")
+                    .is_some_and(|value| value == "effective")
+                && !params.contains_key("after");
+
+            if !returns_parents {
+                return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+            }
+
+            let template = load_test_data("http_get_orders_algo_history.json")["data"][0].clone();
+            let now_ms = jiff::Timestamp::now().as_millisecond().to_string();
+            let data: Vec<_> = (0..101)
+                .map(|index| {
+                    let mut order = template.clone();
+                    let child_order_id = format!("mass-cap-child-{index}");
+                    order["actualPx"] = json!("850.00");
+                    order["actualSide"] = json!("buy");
+                    order["actualSz"] = json!("1");
+                    order["algoClOrdId"] = json!(format!("OMASSCAP{index}"));
+                    order["algoId"] = json!(format!("mass-cap-parent-{index}"));
+                    order["clOrdId"] = json!("");
+                    order["instId"] = json!("ETH-USDT-SWAP");
+                    order["instType"] = json!("SWAP");
+                    order["ordId"] = json!(&child_order_id);
+                    order["ordIdList"] = json!([child_order_id]);
+                    order["ordPx"] = json!("850.00");
+                    order["posSide"] = json!("net");
+                    order["side"] = json!("buy");
+                    order["sz"] = json!("1");
+                    order["tdMode"] = json!("cross");
+                    order["triggerPx"] = json!("900.00");
+                    order["cTime"] = json!(&now_ms);
+                    order["triggerTime"] = json!(&now_ms);
+                    order["uTime"] = json!(&now_ms);
+                    order
+                })
+                .collect();
+
+            Json(json!({"code": "0", "msg": "", "data": data})).into_response()
+        },
+    );
+    let order_detail = get(move |Query(params): Query<HashMap<String, String>>| {
+        let detail_query_count = Arc::clone(&detail_query_count);
+        async move {
+            detail_query_count.fetch_add(1, Ordering::Relaxed);
+            Json(regular_order_detail_response(&params)).into_response()
+        }
+    });
+    let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
+    let router = Router::new()
+        .route("/api/v5/trade/order", order_detail)
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-history", empty.clone())
+        .route("/api/v5/trade/orders-algo-pending", empty.clone())
+        .route("/api/v5/trade/orders-algo-history", algo_history)
+        .route("/api/v5/trade/fills", empty.clone())
+        .route("/api/v5/trade/fills-history", empty.clone())
+        .route("/api/v5/account/positions", empty)
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+async fn start_live_order_report_server(inst_type: &'static str) -> SocketAddr {
+    let router = Router::new()
+        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(move || async move {
+                let mut response = load_test_data("http_get_orders_pending.json");
+                response["data"][0]["instType"] = json!(inst_type);
+                Json(response).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_in_scope_open_order_cache_miss_fails_report_request() {
+    let addr = start_live_order_report_server("SWAP").await;
+    let base_url = format!("http://{addr}");
+    let (client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let error = client
+        .generate_order_status_reports(&cmd)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing from cache"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_margin_only_open_spot_cache_miss_fails_report_request() {
+    let addr = start_live_order_report_server("SPOT").await;
+    let base_url = format!("http://{addr}");
+    let (client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Margin];
+        config.margin_mode = Some(OKXMarginMode::Cross);
+        config.use_spot_margin = true;
+    });
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let error = client
+        .generate_order_status_reports(&cmd)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing from cache"));
+}
+
+async fn start_stale_pending_order_report_server() -> SocketAddr {
+    let router = Router::new()
+        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(|| async move {
+                let mut response = load_test_data("http_get_orders_pending.json");
+                response["data"][0]["uTime"] = json!("1600000000000");
+                Json(response).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-history",
+            get(|| async move {
+                // Closed history outside the report window must stay excluded.
+                let mut response = load_test_data("http_get_orders_pending.json");
+                response["data"][0]["uTime"] = json!("1600000000000");
+                response["data"][0]["cTime"] = json!("1600000000000");
+                response["data"][0]["state"] = json!("canceled");
+                response["data"][0]["ordId"] = json!("9999999999999999999");
+                response["data"][0]["clOrdId"] = json!("Ostaleclosedhistory0");
+                Json(response).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|| async {
+                Json(load_test_data("http_get_orders_algo_pending.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-history",
+            get(|| async {
+                Json(load_test_data("http_get_orders_algo_history.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn test_failed_connect_tears_down_websockets_before_retry() {
+    let (addr, ws_state) = start_exec_session_failure_server().await;
+    let ws_base = format!("ws://{addr}");
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.base_url_ws_private = Some(format!("{ws_base}/ws/v5/private"));
+            config.base_url_ws_business = Some(format!("{ws_base}/ws/v5/business"));
+        });
+
+    for attempt in 1..=2 {
+        let error = client.connect().await.unwrap_err();
+        assert!(
+            error.to_string().contains("account state"),
+            "expected account state failure after transports started: {error}"
+        );
+
+        let expected_connections = attempt * 2;
+        wait_until_async(
+            || {
+                let ws_state = Arc::clone(&ws_state);
+                async move { ws_state.closed.load(Ordering::Relaxed) >= expected_connections }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            ws_state.opened.load(Ordering::Relaxed),
+            expected_connections,
+            "each connect attempt must open fresh private and business websockets"
+        );
+        assert_eq!(
+            ws_state.closed.load(Ordering::Relaxed),
+            expected_connections,
+            "failed connect must close both started websockets before retry"
+        );
+    }
+}
+
+#[rstest]
+#[case::older_than_start(Some(1_700_000_000_000_000_000), None)]
+#[case::newer_than_end(None, Some(1_500_000_000_000_000_000))]
+#[tokio::test]
+async fn test_open_order_outside_report_window_is_reported(
+    #[case] start_ns: Option<u64>,
+    #[case] end_ns: Option<u64>,
+) {
+    let addr = start_stale_pending_order_report_server().await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(btc_usdt_swap_instrument());
+
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        start_ns.map(UnixNanos::from),
+        end_ns.map(UnixNanos::from),
+        None,
+        None,
+    );
+
+    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.venue_order_id == VenueOrderId::from("1234567890123456789")),
+        "a live order outside the report window must still be reported"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.venue_order_id == VenueOrderId::from("123456789")),
+        "a live algo order outside the report window must still be reported"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|r| r.venue_order_id == VenueOrderId::from("9999999999999999999")),
+        "a closed order outside the report window must stay excluded"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|r| r.venue_order_id == VenueOrderId::from("987654321")),
+        "a triggered algo parent outside the report window must stay excluded"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_out_of_scope_open_order_cache_miss_is_dropped() {
+    let addr = start_live_order_report_server("SWAP").await;
+    let base_url = format!("http://{addr}");
+    let (client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Spot];
+    });
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_http_failure_is_error() {
+    let router = Router::new()
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/order",
+            get(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"code": "1", "msg": "internal", "data": []})),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/order-algo",
+            get(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"code": "1", "msg": "internal", "data": []})),
+                )
+                    .into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+    client.on_instrument(query_order_instrument());
+
+    let error = client
+        .generate_order_status_report(&generate_order_status_report_cmd(
+            Some(InstrumentId::from("ETH-USDT-SWAP.OKX")),
+            Some(ClientOrderId::from("OQUERYREGULAR1")),
+            None,
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(
+        !error.to_string().is_empty(),
+        "failed lookup must not become Ok(None)"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_marks_historical_cache_miss_incomplete() {
+    let router = Router::new()
+        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-history",
+            get(|| async {
+                let mut response = load_test_data("http_get_orders_history.json");
+                response["data"][0]["uTime"] =
+                    json!(jiff::Timestamp::now().as_millisecond().to_string());
+                Json(response).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/fills",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/fills-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/account/positions",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(mass_status.lookback_start().is_some());
+    assert!(!mass_status.reports_complete());
+    assert!(mass_status.order_reports().is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_reports_fails_on_open_algo_cache_miss() {
+    let router = Router::new()
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|| async {
+                Json(load_test_data("http_get_orders_algo_pending.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-history",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let error = client
+        .generate_order_status_reports(&cmd)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing from cache"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_fails_on_spread_missing_fee() {
+    let mut fill = load_test_data("http_get_spread_trades.json");
+    fill["data"][0]["fee"] = json!("");
+    fill["data"][0]["sprdId"] = json!("BCH-USDT_BCH-USDT-SWAP");
+    let router = Router::new()
+        .route(
+            "/api/v5/trade/fills",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        )
+        .route(
+            "/api/v5/sprd/trades",
+            get(move || {
+                let fill = fill.clone();
+                async move { Json(fill).into_response() }
+            }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.load_spreads = true;
+        });
+    client.on_instrument(make_spread_instrument());
+    let cmd = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let error = client.generate_fill_reports(cmd).await.unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("missing fee"),
+        "was {error:#}"
+    );
+}
+
+#[rstest]
+fn test_dispatch_fill_claims_trade_id() {
+    let (emitter, mut rx) = test_emitter();
+    let state = WsDispatchState::default();
+    let fill = make_fill_report("O-ROUTE-1");
+    let trade_id = fill.trade_id;
+
+    assert!(!state.contains_trade(&trade_id));
+    dispatch_execution_reports(vec![ExecutionReport::Fill(fill)], &emitter, &state);
+    let events = drain_events(&mut rx);
+
+    assert_eq!(events.len(), 1);
+    assert!(state.contains_trade(&trade_id));
 }

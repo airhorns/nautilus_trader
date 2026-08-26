@@ -42,7 +42,7 @@
 //! transport fails, the controller reconnects with configurable backoff, jitter, timeout,
 //! and attempt limits. The writer buffers application messages in FIFO order. A
 //! [`SocketReconnectReplay`] can place protocol setup messages before that buffer on the replacement
-//! connection, and a post‑reconnection callback runs after the writer, buffer, and reader are ready.
+//! connection, and a post-reconnection callback runs after the writer, buffer, and reader are ready.
 //!
 //! # Transport policy
 //!
@@ -55,5 +55,5 @@ pub mod config;
 pub mod types;
 
 pub use client::{SocketClient, SocketReconnectHandle, SocketReconnectReplay};
-pub use config::SocketConfig;
+pub use config::{SocketConfig, SocketHeartbeat};
 pub use types::{TcpMessageHandler, TcpReader, TcpWriter, WriterCommand};

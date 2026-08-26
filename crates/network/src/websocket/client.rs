@@ -43,7 +43,7 @@
 //! connection. Registered authentication state can hold or discard that replay before it reaches
 //! the replacement sink.
 //!
-//! Ownership‑bound sends wait for the writer result, require the expected connection epoch, and
+//! Ownership-bound sends wait for the writer result, require the expected connection epoch, and
 //! never enter the reconnect buffer. The writer advances the epoch only when it installs a
 //! replacement sink, so inbound attribution and bound sends share one transport ownership boundary.
 
@@ -60,7 +60,6 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use http::HeaderName;
-use nautilus_core::CleanDrop;
 use nautilus_cryptography::providers::install_cryptographic_provider;
 #[cfg(any(feature = "turmoil", feature = "transport-sockudo"))]
 use rustls::ClientConfig;
@@ -85,7 +84,7 @@ use tokio_tungstenite::tungstenite::{
 use ustr::Ustr;
 
 #[cfg(not(feature = "turmoil"))]
-use super::proxy::{ProxiedStream, ProxyKind, WsTarget, tunnel_via_proxy};
+use super::proxy::{ProxyKind, WsTarget, tunnel_via_proxy};
 use super::{
     auth::{AuthState, AuthTracker},
     config::{TransportBackend, WebSocketConfig},
@@ -108,7 +107,9 @@ use crate::transport::sockudo::{
 };
 use crate::{
     RECONNECTED, SocketState, SocketStateSink,
-    backoff::{ExponentialBackoff, RECONNECT_STABILITY_THRESHOLD, wait_reconnect_delay},
+    backoff::{
+        ExponentialBackoff, RECONNECT_STABILITY_THRESHOLD, ReconnectThrottle, wait_reconnect_delay,
+    },
     dst,
     error::{SendError, is_connection_drop_io_error},
     logging::{log_task_aborted, log_task_started, log_task_stopped},
@@ -125,70 +126,6 @@ const CONTROLLER_FALLBACK_INTERVAL_MS: u64 = 100;
 
 /// The RFC 6455 control-frame payload limit.
 const MAX_CONTROL_FRAME_PAYLOAD_BYTES: usize = 125;
-
-/// Shared headers used by future automatic WebSocket reconnects.
-///
-/// Updating these headers does not affect the active connection or trigger a reconnect.
-#[derive(Clone)]
-pub struct ReconnectHeaders {
-    inner: Arc<RwLock<Vec<(String, String)>>>,
-}
-
-impl ReconnectHeaders {
-    fn new(headers: Vec<(String, String)>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(headers)),
-        }
-    }
-
-    /// Replaces a header used by future automatic reconnect attempts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the header name or value is invalid, or if the shared state is poisoned.
-    pub fn update(&self, name: &str, value: &str) -> Result<(), TransportError> {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid WebSocket reconnect header name: {e}"),
-            ))
-        })?;
-        HeaderValue::from_str(value).map_err(|e| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid WebSocket reconnect header value: {e}"),
-            ))
-        })?;
-
-        let name = name.as_str();
-        let mut headers = self.inner.write().map_err(|_| {
-            TransportError::Io(std::io::Error::other(
-                "WebSocket reconnect headers lock poisoned",
-            ))
-        })?;
-        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-        headers.push((name.to_string(), value.to_string()));
-        Ok(())
-    }
-
-    fn snapshot(&self) -> Result<Vec<(String, String)>, TransportError> {
-        self.inner
-            .read()
-            .map(|headers| headers.clone())
-            .map_err(|_| {
-                TransportError::Io(std::io::Error::other(
-                    "WebSocket reconnect headers lock poisoned",
-                ))
-            })
-    }
-}
-
-impl Debug for ReconnectHeaders {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(ReconnectHeaders))
-            .finish_non_exhaustive()
-    }
-}
 
 /// Owns the transport tasks and reconnect state used by [`WebSocketClient`].
 ///
@@ -229,51 +166,22 @@ pub struct WebSocketClientInner {
     state_notify: Arc<tokio::sync::Notify>,
     controller_notify: Arc<tokio::sync::Notify>,
     reconnect_published: Arc<AtomicBool>,
-    reconnect_timeout: Duration,
+    connect_timeout: Duration,
     heartbeat_timeout: Option<Duration>,
     backoff: ExponentialBackoff,
+    reconnect_throttle: ReconnectThrottle,
     reconnect_max_attempts: Option<u32>,
     reconnection_attempt_count: u32,
     auth_tracker: Arc<OnceLock<AuthTracker>>,
     reconnect_buffer_waits_for_auth: Arc<AtomicBool>,
     state_sink: Option<SocketStateSink>,
+    connection_rate_limit: Option<ConnectionRateLimit>,
 }
 
-#[derive(Clone)]
-enum IncomingHandler {
-    Message(MessageHandler),
-    Epoch(EpochMessageHandler),
-}
-
-impl IncomingHandler {
-    fn handle(&self, connection_epoch: u64, message: Message) {
-        match self {
-            Self::Message(handler) => handler(message),
-            Self::Epoch(handler) => handler(connection_epoch, message),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum IncomingPingHandler {
-    Ping(PingHandler),
-    Epoch(EpochPingHandler),
-}
-
-impl IncomingPingHandler {
-    fn handle(&self, connection_epoch: u64, data: Vec<u8>) {
-        match self {
-            Self::Ping(handler) => handler(data),
-            Self::Epoch(handler) => handler(connection_epoch, data),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReconnectBufferAction {
-    Drain,
-    Wait,
-    Discard,
+#[derive(Clone, Debug)]
+struct ConnectionRateLimit {
+    limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    keys: Arc<[Ustr]>,
 }
 
 impl WebSocketClientInner {
@@ -304,7 +212,7 @@ impl WebSocketClientInner {
     ) -> Result<Self, TransportError> {
         install_cryptographic_provider();
 
-        if config.heartbeat == Some(0) {
+        if config.heartbeat_interval_secs == Some(0) {
             return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Heartbeat interval cannot be zero",
@@ -352,11 +260,11 @@ impl WebSocketClientInner {
             state_sink.clone(),
         );
 
-        let heartbeat_task = if let Some(heartbeat_interval) = config.heartbeat {
+        let heartbeat_task = if let Some(heartbeat_interval) = config.heartbeat_interval_secs {
             Some(Self::spawn_heartbeat_task(
                 connection_mode.clone(),
                 heartbeat_interval,
-                config.heartbeat_msg.clone(),
+                config.heartbeat_payload.clone(),
                 writer_tx.clone(),
             ))
         } else {
@@ -364,7 +272,7 @@ impl WebSocketClientInner {
         };
 
         let reconnect_max_attempts = None; // Stream mode does not reconnect
-        let reconnect_timeout = Duration::from_secs(10);
+        let connect_timeout = Duration::from_secs(10);
 
         let reconnect_headers = ReconnectHeaders::new(std::mem::take(&mut config.headers));
 
@@ -379,18 +287,20 @@ impl WebSocketClientInner {
             state_notify,
             controller_notify,
             reconnect_published,
-            reconnect_timeout,
+            connect_timeout,
             heartbeat_timeout: None,
             heartbeat_task,
             read_task,
             read_fence,
             write_task,
             backoff,
+            reconnect_throttle: ReconnectThrottle::default(),
             reconnect_max_attempts,
             reconnection_attempt_count: 0,
             auth_tracker,
             reconnect_buffer_waits_for_auth,
             state_sink,
+            connection_rate_limit: None,
         })
     }
 
@@ -421,46 +331,36 @@ impl WebSocketClientInner {
         handler: Option<IncomingHandler>,
         ping_handler: Option<IncomingPingHandler>,
         state_sink: Option<SocketStateSink>,
-        heartbeat_timeout: Option<Duration>,
+        connection_rate_limit: Option<ConnectionRateLimit>,
     ) -> Result<Self, TransportError> {
         install_cryptographic_provider();
 
-        if config.heartbeat == Some(0) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Heartbeat interval cannot be zero",
-            )));
-        }
-
-        if config.idle_timeout_ms == Some(0) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Idle timeout cannot be zero",
-            )));
-        }
-
-        if heartbeat_timeout == Some(Duration::ZERO) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Heartbeat timeout cannot be zero",
-            )));
-        }
-
         let is_stream_mode = handler.is_none();
+
+        // Adapters build this config by struct literal, bypassing the builder, so this is the only
+        // place the field invariants are enforced for them. Stream mode documents the reconnect and
+        // liveness fields as ignored and permits zero for them, so it checks only what it honours.
+        if is_stream_mode {
+            if config.heartbeat_interval_secs == Some(0) {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Heartbeat interval cannot be zero",
+                )));
+            }
+        } else {
+            config.validate().map_err(|e| {
+                TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            })?;
+        }
+
+        let heartbeat_timeout = config.resolved_heartbeat_timeout().map(Duration::from_secs);
         let reconnect_max_attempts = config.reconnect_max_attempts;
 
-        if !is_stream_mode && config.reconnect_timeout_ms == Some(0) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Reconnect timeout cannot be zero",
-            )));
-        }
-
         // Stream mode documents reconnect_* fields as ignored (callers may pass Some(0))
-        let reconnect_timeout = if is_stream_mode {
+        let connect_timeout = if is_stream_mode {
             Duration::from_secs(10)
         } else {
-            Duration::from_millis(config.reconnect_timeout_ms.unwrap_or(10_000))
+            Duration::from_millis(config.connect_timeout_ms.unwrap_or(10_000))
         };
         let backoff = ExponentialBackoff::new(
             Duration::from_millis(config.reconnect_delay_initial_ms.unwrap_or(2_000)),
@@ -475,9 +375,16 @@ impl WebSocketClientInner {
 
         let reconnect_headers = ReconnectHeaders::new(config.headers.clone());
 
-        // Bound the dial: a server that accepts TCP but never upgrades must not hang the caller
+        if let Some(rate_limit) = &connection_rate_limit {
+            rate_limit
+                .limiter
+                .await_keys_ready(Some(&rate_limit.keys))
+                .await;
+        }
+
+        // Bound the connection attempt: a server that accepts TCP but never upgrades must not hang the caller
         let (writer, reader) = dst::time::timeout(
-            reconnect_timeout,
+            connect_timeout,
             Box::pin(Self::connect_with_server(
                 &config.url,
                 config.headers.clone(),
@@ -491,7 +398,7 @@ impl WebSocketClientInner {
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "connection timed out after {}s",
-                    reconnect_timeout.as_secs_f64()
+                    connect_timeout.as_secs_f64()
                 ),
             ))
         })??;
@@ -540,11 +447,11 @@ impl WebSocketClientInner {
         );
 
         // Optionally spawn a heartbeat task to periodically ping server
-        let heartbeat_task = config.heartbeat.map(|heartbeat_secs| {
+        let heartbeat_task = config.heartbeat_interval_secs.map(|heartbeat_secs| {
             Self::spawn_heartbeat_task(
                 connection_mode.clone(),
                 heartbeat_secs,
-                config.heartbeat_msg.clone(),
+                config.heartbeat_payload.clone(),
                 writer_tx.clone(),
             )
         });
@@ -567,14 +474,16 @@ impl WebSocketClientInner {
             state_notify,
             controller_notify,
             reconnect_published,
-            reconnect_timeout,
+            connect_timeout,
             heartbeat_timeout,
             backoff,
+            reconnect_throttle: ReconnectThrottle::default(),
             reconnect_max_attempts,
             reconnection_attempt_count: 0,
             auth_tracker,
             reconnect_buffer_waits_for_auth,
             state_sink,
+            connection_rate_limit,
         })
     }
 
@@ -586,12 +495,9 @@ impl WebSocketClientInner {
     /// Cargo feature (enabled by default) and uses a custom HTTP/1.1 handshake
     /// path for upgrade headers.
     ///
-    /// When `proxy_url` is `Some`, the Tungstenite backend establishes an HTTP
-    /// `CONNECT` tunnel through the proxy before performing the WebSocket
-    /// handshake. The Sockudo backend does not yet support proxying; when it
-    /// is selected together with a proxy URL, this method logs a warning and
-    /// transparently falls back to Tungstenite so configurations that use the
-    /// default backend keep working.
+    /// When `proxy_url` is `Some`, both backends establish an HTTP `CONNECT`
+    /// tunnel through the proxy before performing the WebSocket handshake, and
+    /// each keeps its own handshake path over the resulting stream.
     ///
     /// # Errors
     ///
@@ -607,16 +513,6 @@ impl WebSocketClientInner {
         backend: TransportBackend,
         proxy_url: Option<&str>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
-        // Sockudo does not yet support proxy tunnels. When a proxy URL is supplied,
-        // route through Tungstenite so configurations that rely on the runtime
-        // default keep working.
-        if matches!(backend, TransportBackend::Sockudo)
-            && let Some(proxy) = proxy_url
-        {
-            log::warn!("Sockudo backend does not support proxy_url; falling back to Tungstenite");
-            return Box::pin(Self::connect_tungstenite_via_proxy(url, headers, proxy)).await;
-        }
-
         match backend {
             TransportBackend::Tungstenite => match proxy_url {
                 Some(proxy) => {
@@ -627,7 +523,12 @@ impl WebSocketClientInner {
             TransportBackend::Sockudo => {
                 #[cfg(feature = "transport-sockudo")]
                 {
-                    Self::connect_sockudo(url, headers).await
+                    match proxy_url {
+                        Some(proxy) => {
+                            Box::pin(Self::connect_sockudo_via_proxy(url, headers, proxy)).await
+                        }
+                        None => Self::connect_sockudo(url, headers).await,
+                    }
                 }
                 #[cfg(not(feature = "transport-sockudo"))]
                 {
@@ -651,9 +552,12 @@ impl WebSocketClientInner {
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         let request = tungstenite_request(url, headers)?;
 
-        let (stream, _resp) = connect_async_with_config(request, None, true)
+        // Nagle stays enabled here so `apply_socket_options` owns every socket option in one place
+        let (stream, _resp) = connect_async_with_config(request, None, false)
             .await
             .map_err(TransportError::from)?;
+        crate::net::apply_socket_options(stream.get_ref().get_ref());
+
         let transport: BoxedWsTransport = Box::pin(TungsteniteTransport::new(stream));
         Ok(transport.split())
     }
@@ -688,20 +592,10 @@ impl WebSocketClientInner {
         let target = WsTarget::parse(url)?;
         let stream = tunnel_via_proxy(&target, &proxy).await?;
 
-        // Each ProxiedStream variant carries a distinct concrete stream type,
-        // so we monomorphize the handshake through `proxied_ws_handshake`
-        // rather than duplicating the body four times. The futures are boxed
-        // because `client_async` produces a large state machine.
-        let transport: BoxedWsTransport = match stream {
-            ProxiedStream::Plain(tcp) => Box::pin(proxied_ws_handshake(request, tcp)).await?,
-            ProxiedStream::PlainOverTlsProxy(s) => {
-                Box::pin(proxied_ws_handshake(request, *s)).await?
-            }
-            ProxiedStream::Tls(s) => Box::pin(proxied_ws_handshake(request, *s)).await?,
-            ProxiedStream::TlsOverTlsProxy(s) => {
-                Box::pin(proxied_ws_handshake(request, *s)).await?
-            }
-        };
+        // `ProxiedStream` implements the IO traits over all four variants, so one
+        // instantiation covers every tunnel shape. The future is boxed because
+        // `client_async` produces a large state machine.
+        let transport: BoxedWsTransport = Box::pin(proxied_ws_handshake(request, stream)).await?;
 
         Ok(transport.split())
     }
@@ -752,9 +646,7 @@ impl WebSocketClientInner {
         // Use the connector to get a turmoil-compatible stream
         let connector = crate::net::RealTcpConnector;
         let tcp_stream = connector.connect(&addr).await?;
-        if let Err(e) = tcp_stream.set_nodelay(true) {
-            log::warn!("Failed to enable TCP_NODELAY for socket client: {e:?}");
-        }
+        crate::net::apply_socket_options(&tcp_stream);
 
         // Wrap stream appropriately based on scheme
         let maybe_tls_stream = if scheme == "wss" {
@@ -815,9 +707,7 @@ impl WebSocketClientInner {
             .await
             .map_err(TransportError::Io)?;
 
-        if let Err(e) = tcp_stream.set_nodelay(true) {
-            log::warn!("Failed to enable TCP_NODELAY for sockudo client: {e:?}");
-        }
+        crate::net::apply_socket_options(&tcp_stream);
 
         #[cfg(not(feature = "turmoil"))]
         if target.is_tls {
@@ -837,6 +727,61 @@ impl WebSocketClientInner {
         }
 
         Self::finish_sockudo_handshake(tcp_stream, &target, &headers).await
+    }
+
+    /// Connects via an HTTP `CONNECT` proxy and performs the sockudo WebSocket
+    /// handshake over the resulting tunnel.
+    ///
+    /// Recognised but unsupported proxy schemes (currently SOCKS) log a warning
+    /// and fall back to a direct connection, matching the Tungstenite path.
+    #[inline]
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    async fn connect_sockudo_via_proxy(
+        url: &str,
+        headers: Vec<(String, String)>,
+        proxy_url: &str,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        let proxy = match ProxyKind::parse(proxy_url)? {
+            ProxyKind::Http(target) => target,
+            ProxyKind::Unsupported { scheme } => {
+                log::warn!(
+                    "WebSocket proxy_url scheme '{scheme}' is not yet supported; \
+                     connecting without a WebSocket proxy"
+                );
+                return Self::connect_sockudo(url, headers).await;
+            }
+        };
+
+        let target = SockudoTarget::parse(url)?;
+        validate_extra_headers(&headers).map_err(TransportError::from)?;
+
+        // `tunnel_via_proxy` establishes upstream TLS inside the tunnel when the
+        // target is `wss://`, so the handshake below runs over the finished stream
+        // regardless of which of the four tunnel shapes it returned.
+        let ws_target = WsTarget::parse(url)?;
+        let stream = tunnel_via_proxy(&ws_target, &proxy).await?;
+
+        Self::finish_sockudo_handshake(stream, &target, &headers).await
+    }
+
+    /// Turmoil simulator variant: HTTP `CONNECT` tunneling is not modelled under
+    /// the simulator so any proxy URL is rejected up front.
+    #[inline]
+    #[cfg(all(feature = "transport-sockudo", feature = "turmoil"))]
+    #[allow(unknown_lints, reason = "Clippy lint is unavailable on Rust 1.97")]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "signature mirrors the production variant; both are awaited in the dispatcher"
+    )]
+    async fn connect_sockudo_via_proxy(
+        _url: &str,
+        _headers: Vec<(String, String)>,
+        _proxy_url: &str,
+    ) -> Result<(MessageWriter, MessageReader), TransportError> {
+        Err(TransportError::Other(
+            "proxy_url is not supported under the turmoil simulator".to_string(),
+        ))
     }
 
     #[cfg(feature = "transport-sockudo")]
@@ -1007,7 +952,7 @@ impl SockudoTarget {
         // url::Url stores IPv6 hosts in their bracketed form (e.g. `[::1]`).
         // Brackets are correct for the HTTP `Host:` header but invalid for
         // DNS/TCP and TLS SNI, so we keep two representations: a bracketed
-        // `host_header` for the upgrade, and a bare `host` for socket dialing.
+        // `host_header` for the upgrade, and a bare `host` for the socket connection.
         let is_bracketed = raw_host.starts_with('[') && raw_host.ends_with(']');
         let host = if is_bracketed {
             raw_host[1..raw_host.len() - 1].to_string()
@@ -1118,9 +1063,21 @@ impl WebSocketClientInner {
             return Ok(ReconnectOutcome::Aborted);
         }
 
+        if let Some(rate_limit) = &self.connection_rate_limit {
+            rate_limit
+                .limiter
+                .await_keys_ready(Some(&rate_limit.keys))
+                .await;
+        }
+
+        if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
+            log::debug!("Reconnect aborted during connection rate-limit wait");
+            return Ok(ReconnectOutcome::Aborted);
+        }
+
         // Bound only connection establishment; the swap below must run to completion
         let (new_writer, reader) = dst::time::timeout(
-            self.reconnect_timeout,
+            self.connect_timeout,
             Box::pin(Self::connect_with_server(
                 &self.config.url,
                 self.reconnect_headers.snapshot()?,
@@ -1134,7 +1091,7 @@ impl WebSocketClientInner {
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "reconnection timed out after {}s",
-                    self.reconnect_timeout.as_secs_f64()
+                    self.connect_timeout.as_secs_f64()
                 ),
             ))
         })??;
@@ -1409,6 +1366,26 @@ impl WebSocketClientInner {
         })
     }
 
+    /// Queues a message for replay on the replacement connection.
+    ///
+    /// A keepalive belongs to the connection it was issued on: a Pong answers that
+    /// connection's Ping, a heartbeat probes it, and a Close terminates it. None
+    /// carries its meaning on a replacement connection, so those messages are dropped
+    /// instead. Text keepalives reach the writer as [`WriterCommand::Heartbeat`] and
+    /// never enter this buffer.
+    fn buffer_for_replay(buffer: &mut VecDeque<Message>, msg: Message) {
+        if msg.is_control() {
+            return;
+        }
+
+        log::debug!(
+            "Buffering message for replay (buffer size: {})",
+            buffer.len() + 1
+        );
+
+        buffer.push_back(msg);
+    }
+
     /// Attempts to send all buffered messages after reconnection.
     ///
     /// Returns `true` if a send error occurred (caller should trigger reconnection).
@@ -1659,19 +1636,16 @@ impl WebSocketClientInner {
                                 }
                             }
                             WriterCommand::Send(msg) if mode.is_reconnect() => {
-                                // Buffer messages during reconnection instead of dropping them
-                                log::debug!(
-                                    "Buffering message during reconnection (buffer size: {})",
-                                    reconnect_buffer.len() + 1
-                                );
-                                reconnect_buffer.push_back(msg);
+                                Self::buffer_for_replay(&mut reconnect_buffer, msg);
                             }
+                            WriterCommand::Heartbeat(_)
+                            | WriterCommand::SendPongOnConnection { .. }
+                                if mode.is_reconnect() => {}
                             WriterCommand::SendOnConnection { response_tx, .. }
                                 if mode.is_reconnect() =>
                             {
                                 _ = response_tx.send(Err(SendError::ConnectionChanged));
                             }
-                            WriterCommand::SendPongOnConnection { .. } if mode.is_reconnect() => {}
                             WriterCommand::SendPongOnConnection {
                                 data,
                                 connection_epoch: expected_epoch,
@@ -1773,31 +1747,11 @@ impl WebSocketClientInner {
                                 }
                             }
                             WriterCommand::Send(msg) => {
-                                let send_result = dst::time::timeout(
-                                    Duration::from_secs(WRITE_TIMEOUT_SECS),
-                                    active_writer.send(msg.clone()),
-                                )
-                                .await;
-                                let send_failed = match send_result {
-                                    Ok(Ok(())) => false,
-                                    Ok(Err(e)) => {
-                                        if is_connection_drop_transport_error(&e) {
-                                            log::warn!("Failed to send message: {e}");
-                                        } else {
-                                            log::error!("Failed to send message: {e}");
-                                        }
-                                        true
-                                    }
-                                    Err(_) => {
-                                        log::warn!(
-                                            "Timed out sending message after {WRITE_TIMEOUT_SECS}s"
-                                        );
-                                        true
-                                    }
-                                };
+                                let send_failed =
+                                    Self::write_outbound(&mut active_writer, msg.clone()).await;
 
                                 if send_failed {
-                                    reconnect_buffer.push_back(msg);
+                                    Self::buffer_for_replay(&mut reconnect_buffer, msg);
 
                                     // CAS: a disconnect landing mid-send must not be overwritten
                                     if request_websocket_reconnect(
@@ -1811,6 +1765,23 @@ impl WebSocketClientInner {
                                     {
                                         log::warn!("Writer triggering reconnect");
                                     }
+                                }
+                            }
+                            WriterCommand::Heartbeat(msg) => {
+                                let send_failed =
+                                    Self::write_outbound(&mut active_writer, msg).await;
+
+                                if send_failed
+                                    && request_websocket_reconnect(
+                                        &connection_state,
+                                        &reconnect_published,
+                                        state_sink.as_ref(),
+                                        &auth_tracker,
+                                        &controller_notify,
+                                        || {},
+                                    ) == ReconnectRequestOutcome::Accepted
+                                {
+                                    log::warn!("Writer triggering reconnect");
                                 }
                             }
                         }
@@ -1838,6 +1809,27 @@ impl WebSocketClientInner {
         })
     }
 
+    async fn write_outbound(writer: &mut MessageWriter, msg: Message) -> bool {
+        let send_result =
+            dst::time::timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), writer.send(msg)).await;
+
+        match send_result {
+            Ok(Ok(())) => false,
+            Ok(Err(e)) => {
+                if is_connection_drop_transport_error(&e) {
+                    log::warn!("Failed to send message: {e}");
+                } else {
+                    log::error!("Failed to send message: {e}");
+                }
+                true
+            }
+            Err(_) => {
+                log::warn!("Timed out sending message after {WRITE_TIMEOUT_SECS}s");
+                true
+            }
+        }
+    }
+
     fn spawn_heartbeat_task(
         connection_state: Arc<AtomicU8>,
         heartbeat_secs: u64,
@@ -1855,8 +1847,10 @@ impl WebSocketClientInner {
                 match ConnectionMode::from_u8(connection_state.load(Ordering::SeqCst)) {
                     ConnectionMode::Active => {
                         let msg = match &message {
-                            Some(text) => WriterCommand::Send(Message::Text(text.clone().into())),
-                            None => WriterCommand::Send(Message::Ping(vec![].into())),
+                            Some(text) => {
+                                WriterCommand::Heartbeat(Message::Text(text.clone().into()))
+                            }
+                            None => WriterCommand::Heartbeat(Message::Ping(vec![].into())),
                         };
 
                         match writer_tx.send(msg) {
@@ -1914,14 +1908,6 @@ fn idle_timeout_exceeded(
 
 impl Drop for WebSocketClientInner {
     fn drop(&mut self) {
-        // Delegate to explicit cleanup handler
-        self.clean_drop();
-    }
-}
-
-/// Cleanup on drop: aborts background tasks and clears handlers to break reference cycles.
-impl CleanDrop for WebSocketClientInner {
-    fn clean_drop(&mut self) {
         if let Some(read_fence) = self.read_fence.take() {
             read_fence.invalidate();
         }
@@ -1944,10 +1930,6 @@ impl CleanDrop for WebSocketClientInner {
             handle.abort();
             log_task_aborted("heartbeat");
         }
-
-        // Clear handlers to break potential reference cycles
-        self.handler = None;
-        self.ping_handler = None;
     }
 }
 
@@ -1963,10 +1945,47 @@ impl Debug for WebSocketClientInner {
                 "connection_mode",
                 &ConnectionMode::from_atomic(&self.connection_mode),
             )
-            .field("reconnect_timeout", &self.reconnect_timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .field("is_stream_mode", &self.handler.is_none())
             .finish()
     }
+}
+
+#[derive(Clone)]
+enum IncomingHandler {
+    Message(MessageHandler),
+    Epoch(EpochMessageHandler),
+}
+
+impl IncomingHandler {
+    fn handle(&self, connection_epoch: u64, message: Message) {
+        match self {
+            Self::Message(handler) => handler(message),
+            Self::Epoch(handler) => handler(connection_epoch, message),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum IncomingPingHandler {
+    Ping(PingHandler),
+    Epoch(EpochPingHandler),
+}
+
+impl IncomingPingHandler {
+    fn handle(&self, connection_epoch: u64, data: Vec<u8>) {
+        match self {
+            Self::Ping(handler) => handler(data),
+            Self::Epoch(handler) => handler(connection_epoch, data),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconnectBufferAction {
+    Drain,
+    Wait,
+    Discard,
 }
 
 /// A WebSocket client with rate limiting, heartbeats, and automatic reconnection in handler mode.
@@ -1980,7 +1999,7 @@ pub struct WebSocketClient {
     pub(crate) connection_mode: Arc<AtomicU8>,
     pub(crate) connection_epoch: Arc<AtomicU64>,
     pub(crate) state_notify: Arc<tokio::sync::Notify>,
-    pub(crate) reconnect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     pub(crate) rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
     pub(crate) writer_tx: tokio::sync::mpsc::UnboundedSender<WriterCommand>,
     auth_tracker: Arc<OnceLock<AuthTracker>>,
@@ -1991,6 +2010,70 @@ pub struct WebSocketClient {
     controller_notify: Arc<tokio::sync::Notify>,
     reconnect_published: Arc<AtomicBool>,
     reconnect_supported: bool,
+}
+
+/// Shared headers used by future automatic WebSocket reconnects.
+///
+/// Updating these headers does not affect the active connection or trigger a reconnect.
+#[derive(Clone)]
+pub struct ReconnectHeaders {
+    inner: Arc<RwLock<Vec<(String, String)>>>,
+}
+
+impl ReconnectHeaders {
+    fn new(headers: Vec<(String, String)>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(headers)),
+        }
+    }
+
+    /// Replaces a header used by future automatic reconnect attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header name or value is invalid, or if the shared state is poisoned.
+    pub fn update(&self, name: &str, value: &str) -> Result<(), TransportError> {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid WebSocket reconnect header name: {e}"),
+            ))
+        })?;
+        HeaderValue::from_str(value).map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid WebSocket reconnect header value: {e}"),
+            ))
+        })?;
+
+        let name = name.as_str();
+        let mut headers = self.inner.write().map_err(|_| {
+            TransportError::Io(std::io::Error::other(
+                "WebSocket reconnect headers lock poisoned",
+            ))
+        })?;
+        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        headers.push((name.to_string(), value.to_string()));
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<Vec<(String, String)>, TransportError> {
+        self.inner
+            .read()
+            .map(|headers| headers.clone())
+            .map_err(|_| {
+                TransportError::Io(std::io::Error::other(
+                    "WebSocket reconnect headers lock poisoned",
+                ))
+            })
+    }
+}
+
+impl Debug for ReconnectHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ReconnectHeaders))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Cloneable controller handle for requesting one transport reconnect.
@@ -2320,7 +2403,7 @@ impl WebSocketClient {
         install_cryptographic_provider();
 
         // Create a single connection and split it, respecting configured headers.
-        // The dial bound is a fixed default: stream mode documents reconnect_* fields as ignored
+        // The connection attempt bound is a fixed default: stream mode documents reconnect_* fields as ignored
         let connect_timeout = Duration::from_secs(10);
         let (writer, reader) = dst::time::timeout(
             connect_timeout,
@@ -2351,7 +2434,7 @@ impl WebSocketClient {
         let state_notify = inner.state_notify.clone();
         let controller_notify = Arc::clone(&inner.controller_notify);
         let reconnect_published = Arc::clone(&inner.reconnect_published);
-        let reconnect_timeout = inner.reconnect_timeout;
+        let connect_timeout = inner.connect_timeout;
         let auth_tracker = Arc::clone(&inner.auth_tracker);
         let reconnect_buffer_waits_for_auth = Arc::clone(&inner.reconnect_buffer_waits_for_auth);
         let reconnect_headers = inner.reconnect_headers.clone();
@@ -2382,7 +2465,7 @@ impl WebSocketClient {
                 connection_mode,
                 connection_epoch,
                 state_notify,
-                reconnect_timeout,
+                connect_timeout,
                 rate_limiter,
                 writer_tx,
                 auth_tracker,
@@ -2421,43 +2504,13 @@ impl WebSocketClient {
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
     ) -> Result<Self, TransportError> {
-        Self::connect_with_state_sink_and_heartbeat_timeout(
+        Self::connect_with_state_sink(
             config,
             message_handler,
             ping_handler,
             keyed_quotas,
             default_quota,
             None,
-            None,
-        )
-        .await
-    }
-
-    /// Creates a handler-mode client with an inbound-frame timeout.
-    ///
-    /// The timeout starts when each connection is established and resets on every inbound frame,
-    /// including Ping and Pong. When the timeout expires, the client reconnects normally.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established, `message_handler` is `None`, or
-    /// `heartbeat_timeout` is zero.
-    pub async fn connect_with_heartbeat_timeout(
-        config: WebSocketConfig,
-        heartbeat_timeout: Duration,
-        message_handler: Option<MessageHandler>,
-        ping_handler: Option<PingHandler>,
-        keyed_quotas: Vec<(String, Quota)>,
-        default_quota: Option<Quota>,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_state_sink_and_heartbeat_timeout(
-            config,
-            message_handler,
-            ping_handler,
-            keyed_quotas,
-            default_quota,
-            None,
-            Some(heartbeat_timeout),
         )
         .await
     }
@@ -2474,27 +2527,6 @@ impl WebSocketClient {
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
         state_sink: Option<SocketStateSink>,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_state_sink_and_heartbeat_timeout(
-            config,
-            message_handler,
-            ping_handler,
-            keyed_quotas,
-            default_quota,
-            state_sink,
-            None,
-        )
-        .await
-    }
-
-    async fn connect_with_state_sink_and_heartbeat_timeout(
-        config: WebSocketConfig,
-        message_handler: Option<MessageHandler>,
-        ping_handler: Option<PingHandler>,
-        keyed_quotas: Vec<(String, Quota)>,
-        default_quota: Option<Quota>,
-        state_sink: Option<SocketStateSink>,
-        heartbeat_timeout: Option<Duration>,
     ) -> Result<Self, TransportError> {
         let keyed_quotas = keyed_quotas
             .into_iter()
@@ -2513,7 +2545,6 @@ impl WebSocketClient {
             ping_handler.map(IncomingPingHandler::Ping),
             rate_limiter,
             state_sink,
-            heartbeat_timeout,
         )
         .await
     }
@@ -2552,7 +2583,6 @@ impl WebSocketClient {
             ping_handler.map(IncomingPingHandler::Ping),
             rate_limiter,
             None,
-            None,
         )
         .await
     }
@@ -2588,7 +2618,7 @@ impl WebSocketClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection cannot be established.
+    /// Returns an error if the connection cannot be established or the config fails validation.
     pub async fn connect_with_rate_limiter_and_epoch_handler_and_state_sink(
         config: WebSocketConfig,
         epoch_handler: EpochMessageHandler,
@@ -2602,7 +2632,6 @@ impl WebSocketClient {
             ping_handler.map(IncomingPingHandler::Ping),
             rate_limiter,
             state_sink,
-            None,
         )
         .await
     }
@@ -2624,7 +2653,42 @@ impl WebSocketClient {
             epoch_ping_handler.map(IncomingPingHandler::Epoch),
             rate_limiter,
             None,
-            None,
+        )
+        .await
+    }
+
+    /// Creates a handler-mode client with separate shared message and connection limiters.
+    ///
+    /// The connection limiter gates the initial connection and every automatic reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established or `message_handler` is `None`.
+    pub async fn connect_with_rate_limiters_and_state_sink(
+        config: WebSocketConfig,
+        message_handler: Option<MessageHandler>,
+        ping_handler: Option<PingHandler>,
+        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+        connection_rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+        connection_rate_keys: Arc<[Ustr]>,
+        state_sink: Option<SocketStateSink>,
+    ) -> Result<Self, TransportError> {
+        let message_handler = message_handler.ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Handler mode requires message_handler to be set. Use connect_stream() for stream mode without a handler.",
+            ))
+        })?;
+        Self::connect_with_handler_scoped(
+            config,
+            IncomingHandler::Message(message_handler),
+            ping_handler.map(IncomingPingHandler::Ping),
+            rate_limiter,
+            state_sink,
+            Some(ConnectionRateLimit {
+                limiter: connection_rate_limiter,
+                keys: connection_rate_keys,
+            }),
         )
         .await
     }
@@ -2635,7 +2699,25 @@ impl WebSocketClient {
         ping_handler: Option<IncomingPingHandler>,
         rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
         state_sink: Option<SocketStateSink>,
-        heartbeat_timeout: Option<Duration>,
+    ) -> Result<Self, TransportError> {
+        Self::connect_with_handler_scoped(
+            config,
+            handler,
+            ping_handler,
+            rate_limiter,
+            state_sink,
+            None,
+        )
+        .await
+    }
+
+    async fn connect_with_handler_scoped(
+        config: WebSocketConfig,
+        handler: IncomingHandler,
+        ping_handler: Option<IncomingPingHandler>,
+        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+        state_sink: Option<SocketStateSink>,
+        connection_rate_limit: Option<ConnectionRateLimit>,
     ) -> Result<Self, TransportError> {
         log::debug!("Connecting");
         let inner = WebSocketClientInner::connect_url_with_handler(
@@ -2643,7 +2725,7 @@ impl WebSocketClient {
             Some(handler),
             ping_handler,
             state_sink,
-            heartbeat_timeout,
+            connection_rate_limit,
         )
         .await?;
         let connection_mode = inner.connection_mode.clone();
@@ -2652,7 +2734,7 @@ impl WebSocketClient {
         let controller_notify = Arc::clone(&inner.controller_notify);
         let reconnect_published = Arc::clone(&inner.reconnect_published);
         let writer_tx = inner.writer_tx.clone();
-        let reconnect_timeout = inner.reconnect_timeout;
+        let connect_timeout = inner.connect_timeout;
         let auth_tracker = Arc::clone(&inner.auth_tracker);
         let reconnect_buffer_waits_for_auth = Arc::clone(&inner.reconnect_buffer_waits_for_auth);
         let reconnect_headers = inner.reconnect_headers.clone();
@@ -2675,7 +2757,7 @@ impl WebSocketClient {
             connection_mode,
             connection_epoch,
             state_notify,
-            reconnect_timeout,
+            connect_timeout,
             rate_limiter,
             writer_tx,
             auth_tracker,
@@ -2871,7 +2953,7 @@ impl WebSocketClient {
 
         let fallback_interval = Duration::from_millis(FALLBACK_INTERVAL_MS);
 
-        dst::time::timeout(self.reconnect_timeout, async {
+        dst::time::timeout(self.connect_timeout, async {
             loop {
                 // Enable before the state check: an unpolled Notified is unregistered and misses notifies
                 let mut notified = pin!(self.state_notify.notified());
@@ -3276,11 +3358,16 @@ impl WebSocketClient {
                         break;
                     }
 
-                    if reconnect_uptime.is_some() && !previous_reconnect_stable {
-                        let duration = inner.backoff.next_duration();
-                        if !duration.is_zero() {
-                            log::warn!("Backing off for {}s...", duration.as_secs_f64());
-                        }
+                    let backoff_delay = if reconnect_uptime.is_some() && !previous_reconnect_stable
+                    {
+                        inner.backoff.next_duration()
+                    } else {
+                        Duration::ZERO
+                    };
+
+                    let duration = inner.reconnect_throttle.gated_delay(backoff_delay);
+                    if !duration.is_zero() {
+                        log::warn!("Backing off for {}s...", duration.as_secs_f64());
 
                         if !wait_reconnect_delay(
                             duration,
@@ -3295,6 +3382,7 @@ impl WebSocketClient {
                     }
 
                     inner.reconnection_attempt_count += 1;
+                    inner.reconnect_throttle.record_attempt();
                     log::debug!(
                         "Reconnection attempt {} of {}",
                         inner.reconnection_attempt_count,
@@ -3604,14 +3692,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![("test".into(), "test".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_backoff_factor: None,
             reconnect_delay_max_ms: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -3625,14 +3714,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(1),
             reconnect_backoff_factor: Some(1.0),
             reconnect_delay_max_ms: Some(1),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4042,14 +4132,15 @@ mod tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:9997".into(), // <-- No server
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_backoff_factor: None,
             reconnect_delay_max_ms: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4102,14 +4193,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{}", server.port),
             headers: vec![("test".into(), "test".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(1),
             reconnect_backoff_factor: Some(1.0),
             reconnect_delay_max_ms: Some(1),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(3),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4162,14 +4254,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{}", server.port),
             headers: vec![("test".into(), "test".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(1),
             reconnect_backoff_factor: Some(1.0),
             reconnect_delay_max_ms: Some(1),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(3),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4204,14 +4297,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{}", server.port),
             headers: vec![("test".into(), "test".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_backoff_factor: None,
             reconnect_delay_max_ms: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4254,14 +4348,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(100),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(100),
             reconnect_delay_initial_ms: Some(1),
             reconnect_backoff_factor: Some(1.0),
             reconnect_delay_max_ms: Some(1),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(2),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4338,14 +4433,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![("Authorization".into(), "Bearer initial".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(50),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4386,14 +4482,15 @@ mod tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{}", server.port),
             headers: vec![("test".into(), "test".into())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_backoff_factor: None,
             reconnect_delay_max_ms: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4563,14 +4660,15 @@ mod rust_tests {
         WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -4578,8 +4676,59 @@ mod rust_tests {
     }
 
     #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn connection_rate_limit_gates_initial_connect_and_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _first = accept_async(stream).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let _second = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let key = Ustr::from("connection-attempt");
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(key, Quota::with_period(Duration::from_secs(1)).unwrap())],
+        ));
+        limiter.await_keys_ready(Some(&[key])).await;
+        let rate_limit = ConnectionRateLimit {
+            limiter,
+            keys: Arc::from([key]),
+        };
+        let (handler, _rx) = channel_message_handler();
+        let mut config = reconnect_test_config(port);
+        config.connect_timeout_ms = Some(10_000);
+        let initial = WebSocketClientInner::connect_url_with_handler(
+            config,
+            Some(IncomingHandler::Message(handler)),
+            None,
+            None,
+            Some(rate_limit),
+        );
+        tokio::pin!(initial);
+        assert!(futures_util::poll!(&mut initial).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let mut inner = initial.await.unwrap();
+
+        inner
+            .connection_mode
+            .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
+        let reconnect = inner.reconnect_with_outcome();
+        tokio::pin!(reconnect);
+        assert!(futures_util::poll!(&mut reconnect).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reconnect.await.unwrap(), ReconnectOutcome::Reconnected);
+
+        server.abort();
+    }
+
+    #[rstest]
     #[tokio::test]
-    async fn test_reconnect_outcome_is_aborted_before_dial() {
+    async fn test_reconnect_outcome_is_aborted_before_connect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -4675,6 +4824,73 @@ mod rust_tests {
             .expect("epoch handler channel closed");
         assert_eq!(epoch, 1);
         assert_eq!(message, WsMessage::Text("replacement".into()));
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_inner_drop_invalidates_read_fence_and_aborts_tasks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _websocket = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut config = reconnect_test_config(port);
+        config.heartbeat_interval_secs = Some(60);
+        let (handler, _handler_rx) = channel_message_handler();
+        let inner = WebSocketClientInner::connect_url(config, Some(handler), None)
+            .await
+            .unwrap();
+        let read_fence = inner
+            .read_fence
+            .clone()
+            .expect("read fence should exist in handler mode");
+        let read_abort = inner
+            .read_task
+            .as_ref()
+            .expect("read task should be spawned in handler mode")
+            .abort_handle();
+        let write_abort = inner.write_task.abort_handle();
+        let heartbeat_abort = inner
+            .heartbeat_task
+            .as_ref()
+            .expect("heartbeat task should be spawned for a configured heartbeat")
+            .abort_handle();
+
+        assert!(read_fence.is_valid(), "read fence should start valid");
+        assert!(
+            !read_abort.is_finished(),
+            "read task should be running before drop"
+        );
+        assert!(
+            !write_abort.is_finished(),
+            "write task should be running before drop"
+        );
+        assert!(
+            !heartbeat_abort.is_finished(),
+            "heartbeat task should be running before drop"
+        );
+
+        drop(inner);
+        wait_until_async(
+            || async {
+                read_abort.is_finished()
+                    && write_abort.is_finished()
+                    && heartbeat_abort.is_finished()
+            },
+            TEST_TIMEOUT,
+        )
+        .await;
+
+        assert!(!read_fence.is_valid(), "read fence was not invalidated");
+        assert!(read_abort.is_finished(), "read task was not aborted");
+        assert!(write_abort.is_finished(), "write task was not aborted");
+        assert!(
+            heartbeat_abort.is_finished(),
+            "heartbeat task was not aborted"
+        );
         server.abort();
     }
 
@@ -5117,14 +5333,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5164,14 +5381,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5216,14 +5434,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5265,14 +5484,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5340,14 +5560,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(200),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(10),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5402,14 +5623,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5462,8 +5684,8 @@ mod rust_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_send_timeout_uses_configured_reconnect_timeout() {
-        // Test that send operations respect the configured reconnect_timeout.
+    async fn test_send_timeout_uses_configured_connect_timeout() {
+        // Test that send operations respect the configured connect_timeout.
         // When a client is stuck in RECONNECT longer than the timeout, sends should fail with Timeout.
         use nautilus_common::testing::wait_until_async;
 
@@ -5487,14 +5709,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000), // 2s timeout
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000), // 2s timeout
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5573,14 +5796,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000), // 5s timeout - enough for reconnect
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000), // 5s timeout - enough for reconnect
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(200),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5660,14 +5884,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5752,14 +5977,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000), // 2s timeout - shorter than disconnect timeout
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000), // 2s timeout - shorter than disconnect timeout
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(200),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5819,14 +6045,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5897,14 +6124,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:9999".to_string(),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(500),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5934,14 +6162,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:1".to_string(),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(0),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(0),
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(500),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -5955,9 +6184,7 @@ mod rust_tests {
             TransportError::Io(error) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
                 assert!(
-                    error
-                        .to_string()
-                        .contains("Reconnect timeout cannot be zero"),
+                    error.to_string().contains("connect_timeout_ms"),
                     "error should mention zero reconnect timeout, was: {error}"
                 );
             }
@@ -5967,7 +6194,7 @@ mod rust_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_connect_url_rejects_invalid_reconnect_backoff_before_dial() {
+    async fn test_connect_url_rejects_invalid_reconnect_backoff_before_connect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5982,14 +6209,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(100.1),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6011,7 +6239,7 @@ mod rust_tests {
         }
         assert!(
             !accepted.load(Ordering::SeqCst),
-            "invalid reconnect backoff must be rejected before dialing"
+            "invalid reconnect backoff must be rejected before connecting"
         );
         server.abort();
     }
@@ -6037,14 +6265,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(500),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6086,14 +6315,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6146,14 +6376,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(1_000),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6206,14 +6437,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6275,14 +6507,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: Some(1),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: Some(1),
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(1_500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6335,14 +6568,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(10_000), // 10s backoff to ensure we're sleeping
             reconnect_delay_max_ms: Some(10_000),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6406,14 +6640,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(100),
             reconnect_delay_max_ms: Some(500),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -6501,14 +6736,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(1_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7014,6 +7250,310 @@ mod rust_tests {
     }
 
     #[rstest]
+    #[case(Message::Ping(vec![1, 2, 3].into()))]
+    #[case(Message::Pong(vec![4, 5, 6].into()))]
+    #[case(Message::Close(None))]
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_control_frame_is_not_replayed(#[case] control: Message) {
+        // A control frame belongs to the connection it was issued on, so a failed write must
+        // drop it instead of replaying it onto the replacement connection.
+        let state = Arc::new(BlockingFailState::default());
+        let transport: BoxedWsTransport = Box::pin(BlockingFailTransport {
+            state: Arc::clone(&state),
+        });
+        let (writer, _reader) = transport.split();
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let state_notify = Arc::new(tokio::sync::Notify::new());
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let write_task = WebSocketClientInner::spawn_write_task(
+            Arc::clone(&connection_state),
+            Arc::clone(&state_notify),
+            Arc::new(AtomicBool::new(true)),
+            writer,
+            writer_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(OnceLock::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        writer_tx.send(WriterCommand::Send(control)).unwrap();
+        state.send_entered_notify.notified().await;
+
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let recording_state = Arc::new(RecordingState {
+            messages: Arc::clone(&recorded),
+            recorded_notify: tokio::sync::Notify::new(),
+        });
+        let transport: BoxedWsTransport = Box::pin(RecordingTransport {
+            state: recording_state,
+        });
+        let (new_writer, _reader) = transport.split();
+        let (update_tx, update_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send(WriterCommand::Update(new_writer, update_tx))
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(WRITE_TIMEOUT_SECS)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), update_rx)
+                .await
+                .expect("writer update should not remain queued behind a stalled send")
+                .unwrap(),
+            1,
+            "the replacement sink should install as connection epoch 1"
+        );
+        assert_eq!(
+            ConnectionMode::from_atomic(&connection_state),
+            ConnectionMode::Reconnect,
+            "a failed control-frame write should still trigger a reconnect"
+        );
+
+        connection_state.store(ConnectionMode::Active.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+
+        // Each pass returns the writer to the loop top, where a buffered frame would drain
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+        }
+
+        let replayed = recorded.lock().unwrap().clone();
+        assert!(
+            replayed.is_empty(),
+            "a failed control frame must not reach the replacement connection, was {replayed:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+        drop(writer_tx);
+        write_task.await.unwrap();
+    }
+
+    #[rstest]
+    #[case(Message::Ping(vec![1, 2, 3].into()))]
+    #[case(Message::Pong(vec![4, 5, 6].into()))]
+    #[case(Message::Close(None))]
+    #[tokio::test(start_paused = true)]
+    async fn test_control_frame_enqueued_during_reconnect_is_not_replayed(
+        #[case] control: Message,
+    ) {
+        // `send_pong` and the heartbeat task check for an active connection before enqueueing,
+        // so a mode flip can land their frame on the writer's reconnect-mode branch instead.
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let recording_state = Arc::new(RecordingState {
+            messages: Arc::clone(&recorded),
+            recorded_notify: tokio::sync::Notify::new(),
+        });
+        let transport: BoxedWsTransport = Box::pin(RecordingTransport {
+            state: recording_state,
+        });
+        let (writer, _reader) = transport.split();
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Reconnect.as_u8()));
+        let state_notify = Arc::new(tokio::sync::Notify::new());
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let write_task = WebSocketClientInner::spawn_write_task(
+            Arc::clone(&connection_state),
+            Arc::clone(&state_notify),
+            Arc::new(AtomicBool::new(true)),
+            writer,
+            writer_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(OnceLock::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        writer_tx.send(WriterCommand::Send(control)).unwrap();
+        tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+
+        connection_state.store(ConnectionMode::Active.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+
+        // Each pass returns the writer to the loop top, where a buffered frame would drain
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+        }
+
+        let replayed = recorded.lock().unwrap().clone();
+        assert!(
+            replayed.is_empty(),
+            "a control frame enqueued during reconnect must not reach the replacement connection, was {replayed:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+        drop(writer_tx);
+        write_task.await.unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_text_heartbeat_is_not_replayed() {
+        let state = Arc::new(BlockingFailState::default());
+        let transport: BoxedWsTransport = Box::pin(BlockingFailTransport {
+            state: Arc::clone(&state),
+        });
+        let (writer, _reader) = transport.split();
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let state_notify = Arc::new(tokio::sync::Notify::new());
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let write_task = WebSocketClientInner::spawn_write_task(
+            Arc::clone(&connection_state),
+            Arc::clone(&state_notify),
+            Arc::new(AtomicBool::new(true)),
+            writer,
+            writer_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(OnceLock::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        writer_tx
+            .send(WriterCommand::Heartbeat(Message::text(
+                "{\"op\":\"heartbeat\"}",
+            )))
+            .unwrap();
+        state.send_entered_notify.notified().await;
+
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let recording_state = Arc::new(RecordingState {
+            messages: Arc::clone(&recorded),
+            recorded_notify: tokio::sync::Notify::new(),
+        });
+        let transport: BoxedWsTransport = Box::pin(RecordingTransport {
+            state: recording_state,
+        });
+        let (new_writer, _reader) = transport.split();
+        let (update_tx, update_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send(WriterCommand::Update(new_writer, update_tx))
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(WRITE_TIMEOUT_SECS)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), update_rx)
+                .await
+                .expect("writer update should not remain queued behind a stalled send")
+                .unwrap(),
+            1,
+            "the replacement sink should install as connection epoch 1"
+        );
+        assert_eq!(
+            ConnectionMode::from_atomic(&connection_state),
+            ConnectionMode::Reconnect,
+            "a failed heartbeat write should still trigger a reconnect"
+        );
+
+        connection_state.store(ConnectionMode::Active.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+        }
+
+        let replayed = recorded.lock().unwrap().clone();
+        assert!(
+            replayed.is_empty(),
+            "a failed text heartbeat must not reach the replacement connection, was {replayed:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+        drop(writer_tx);
+        write_task.await.unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_text_heartbeat_enqueued_during_reconnect_is_not_replayed() {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let recording_state = Arc::new(RecordingState {
+            messages: Arc::clone(&recorded),
+            recorded_notify: tokio::sync::Notify::new(),
+        });
+        let transport: BoxedWsTransport = Box::pin(RecordingTransport {
+            state: recording_state,
+        });
+        let (writer, _reader) = transport.split();
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Reconnect.as_u8()));
+        let state_notify = Arc::new(tokio::sync::Notify::new());
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let write_task = WebSocketClientInner::spawn_write_task(
+            Arc::clone(&connection_state),
+            Arc::clone(&state_notify),
+            Arc::new(AtomicBool::new(true)),
+            writer,
+            writer_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(OnceLock::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        writer_tx
+            .send(WriterCommand::Heartbeat(Message::text(
+                "{\"op\":\"heartbeat\"}",
+            )))
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+
+        connection_state.store(ConnectionMode::Active.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+        }
+
+        let replayed = recorded.lock().unwrap().clone();
+        assert!(
+            replayed.is_empty(),
+            "a text heartbeat enqueued during reconnect must not reach the replacement connection, was {replayed:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+        drop(writer_tx);
+        write_task.await.unwrap();
+    }
+
+    #[rstest]
+    #[case::text(
+        Some("{\"op\":\"heartbeat\"}"),
+        Message::text("{\"op\":\"heartbeat\"}")
+    )]
+    #[case::ping(None, Message::Ping(vec![].into()))]
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_task_enqueues_writer_heartbeat_command(
+        #[case] payload: Option<&str>,
+        #[case] expected: Message,
+    ) {
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = WebSocketClientInner::spawn_heartbeat_task(
+            Arc::clone(&connection_state),
+            1,
+            payload.map(ToString::to_string),
+            writer_tx,
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cmd = writer_rx
+            .recv()
+            .await
+            .expect("heartbeat task should enqueue");
+
+        match cmd {
+            WriterCommand::Heartbeat(msg) => assert_eq!(msg, expected),
+            other => panic!("expected Heartbeat, was {other:?}"),
+        }
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.unwrap();
+    }
+
+    #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_stalled_ownership_bound_send_times_out_without_replay() {
         let state = Arc::new(BlockingFailState::default());
@@ -7229,14 +7769,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:1".to_string(),
             headers: vec![],
-            heartbeat: Some(0),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: Some(0),
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7272,14 +7813,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(500),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(500),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7312,23 +7854,37 @@ mod rust_tests {
         // connection establishment.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
 
         let server = task::spawn(async move {
-            // First connection: accept and immediately drop
+            // Keep the first socket until connect() returns; an immediate drop
+            // can fail the initial handshake
             if let Ok((stream, _)) = listener.accept().await
                 && let Ok(ws) = accept_async(stream).await
             {
+                let _ = release_first_rx.await;
                 drop(ws);
             }
 
-            // Second connection: announce and keep alive
-            if let Ok((stream, _)) = listener.accept().await
-                && let Ok(mut ws) = accept_async(stream).await
-            {
-                let _ = ws
-                    .send(WsMessage::Text("reconnected-msg".to_string().into()))
-                    .await;
-                sleep(Duration::from_secs(5)).await;
+            // A timed-out reconnect can consume an accept without completing the
+            // handshake, so keep accepting and announce on every replacement
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                if let Ok(mut ws) = accept_async(stream).await {
+                    loop {
+                        if ws
+                            .send(WsMessage::Text("reconnected-msg".to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
             }
         });
 
@@ -7337,14 +7893,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(150), // Shorter than the ~200ms swap ceremony
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(150), // Shorter than the ~200ms swap ceremony
             reconnect_delay_initial_ms: Some(25),
             reconnect_delay_max_ms: Some(50),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7353,21 +7910,26 @@ mod rust_tests {
         let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
             .await
             .unwrap();
+        wait_until_async(|| async { client.is_active() }, Duration::from_secs(2)).await;
+        release_first_tx
+            .send(())
+            .expect("server should still be holding the first connection");
 
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(WsMessage::Text(text)) = rx.try_recv()
-                    && text.as_str() == "reconnected-msg"
-                {
-                    return true;
+                match rx.recv().await {
+                    Some(WsMessage::Text(text)) if text.as_str() == "reconnected-msg" => {
+                        return true;
+                    }
+                    Some(_) => {}
+                    None => return false,
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
 
         assert!(
-            received.is_ok(),
+            matches!(received, Ok(true)),
             "Reconnect should complete despite a timeout shorter than the swap ceremony"
         );
 
@@ -7402,14 +7964,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7908,14 +8471,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:9999".to_string(),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: Some(0),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
@@ -7926,8 +8490,8 @@ mod rust_tests {
         assert!(result.is_err(), "Zero idle timeout should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Idle timeout cannot be zero"),
-            "Error should mention zero idle timeout, was: {err_msg}"
+            err_msg.contains("idle_timeout_ms"),
+            "Error should name the offending field, was: {err_msg}"
         );
     }
 
@@ -7939,34 +8503,27 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:9999".to_string(),
             headers: vec![],
-            heartbeat: Some(30),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: Some(30),
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: Some(0),
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
         };
 
-        let result = WebSocketClient::connect_with_heartbeat_timeout(
-            config,
-            Duration::ZERO,
-            Some(handler),
-            None,
-            vec![],
-            None,
-        )
-        .await;
+        let result = WebSocketClient::connect(config, Some(handler), None, vec![], None).await;
 
         assert!(result.is_err(), "Zero heartbeat timeout should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Heartbeat timeout cannot be zero"),
-            "Error should mention zero heartbeat timeout, was: {err_msg}"
+            err_msg.contains("heartbeat_timeout_secs"),
+            "Error should name the offending field, was: {err_msg}"
         );
     }
 
@@ -7979,14 +8536,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: "ws://127.0.0.1:1".to_string(),
             headers: vec![("Host".to_string(), "example.com".to_string())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: None,
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: None,
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
@@ -8037,14 +8595,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}/ws"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
@@ -8115,14 +8674,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![("X-Test".to_string(), "value".to_string())],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
@@ -8190,14 +8750,15 @@ mod rust_tests {
         let config = WebSocketConfig {
             url: format!("ws://127.0.0.1:{port}"),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(2_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(100),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
@@ -9026,14 +9587,15 @@ mod turmoil_tests {
         WebSocketConfig {
             url: "ws://server:8080".to_string(),
             headers: vec![],
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(50),
             reconnect_delay_max_ms: Some(200),
             reconnect_backoff_factor: Some(1.0),
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,

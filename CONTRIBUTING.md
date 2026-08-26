@@ -1,7 +1,7 @@
 # Contributing to NautilusTrader
 
-Thank you for helping improve NautilusTrader. High‑quality contributions from the trading
-community are welcome. This guide explains how to prepare a complete, review‑ready pull request.
+Thank you for helping improve NautilusTrader. High-quality contributions from the trading
+community are welcome. This guide explains how to prepare a complete, review-ready pull request.
 For questions, ask in
 [GitHub Discussions](https://github.com/nautechsystems/nautilus_trader/discussions) or on
 [Discord](https://discord.gg/NautilusTrader).
@@ -16,7 +16,7 @@ For questions, ask in
 all pull requests are held to a very high standard for correctness, reliability, testing, clarity,
 and maintainability.**
 
-Maintainers appreciate the time and care a high‑quality pull request requires, with or without AI.
+Maintainers appreciate the time and care a high-quality pull request requires, with or without AI.
 They review complete, locally validated pull requests thoroughly. Merge decisions still depend on
 evidence that the change meets this standard. When a contribution's expected review and maintenance
 cost is disproportionate to its value to the project, maintainers may decline it. Contributors must
@@ -33,7 +33,7 @@ communication, and attribution.
 
 Before starting a substantial change, such as a new feature, integration, or design change,
 **open a GitHub issue or comment on a relevant existing issue, then wait for a maintainer to agree
-on the problem and approach**. **Small, self‑contained fixes, such as typos, obvious documentation
+on the problem and approach**. **Small, self-contained fixes, such as typos, obvious documentation
 corrections, or narrowly scoped bug fixes with focused tests, do not need prior agreement.** Pull
 requests for substantial changes without prior discussion and agreement may be closed without
 review. Early agreement is the quickest way to avoid work that can't be merged.
@@ -103,10 +103,10 @@ below).
 
 ## Before you open a PR
 
-### Prepare a review‑ready change
+### Prepare a review-ready change
 
 Open a pull request only when the change is complete, locally validated, and ready for maintainer
-review, unless a maintainer asks for an early draft. Do not use draft or work‑in‑progress pull
+review, unless a maintainer asks for an early draft. Do not use draft or work-in-progress pull
 requests as a development workspace. Develop and iterate on your branch before opening the pull
 request.
 
@@ -126,6 +126,9 @@ Complete these requirements before opening or updating a pull request:
 - Do not use [Conventional Commits](https://www.conventionalcommits.org/) syntax for commit messages
   or PR titles. Follow [Commit messages](docs/developer_guide/coding_standards.md#commit-messages)
   instead. PR titles matter because a squash merge turns the PR title into the commit subject.
+- Do not put an issue or pull request number in a commit subject or PR title, including a trailing
+  `(#9999)`. The squash merge appends that number for you, so a hand-written one duplicates it.
+  Reference issues from the commit body instead, such as `Resolves #4534`.
 
 For higher assurance, you can also run `make pre-flight`, which performs the project's broad local
 validation suite. It does not replace `make pre-commit`.

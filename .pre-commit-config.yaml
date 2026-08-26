@@ -35,7 +35,7 @@ repos:
         args: ["-i", "2", "-ci", "-sr", "-ln", "bash", "-w"]
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.11.0.1
+    rev: v0.11.0.1-1
     hooks:
       - id: shellcheck
 
@@ -102,8 +102,8 @@ repos:
       - id: zizmor
         name: zizmor (security)
         description: Scans GitHub Actions workflows for security misconfigurations
-        args: ["--no-online-audits", "--min-severity", "medium", "--config", ".zizmor.yml", ".github/"]
-        files: ^(\.github/.*\.ya?ml|\.pre-commit-config\.yaml|\.zizmor\.yml)$
+        args: ["--no-online-audits", "--strict-collection", "--min-severity", "informational", ".github/"]
+        files: ^(\.github/.*\.ya?ml|\.pre-commit-config\.yaml)$
         pass_filenames: false
 
   ##############################################################################
@@ -130,7 +130,7 @@ repos:
 
       - id: check-unicode-typography
         name: check Unicode typography
-        description: Reject typographic dashes, curly quotes, and emoji-style check/cross marks
+        description: Reject non-breaking hyphens, typographic dashes, curly quotes, and emoji-style check/cross marks
         entry: bash .pre-commit-hooks/check_unicode_typography.sh
         language: system
         types: [text]
@@ -240,6 +240,14 @@ repos:
         name: check pyo3 conventions
         description: Enforces PyO3 naming conventions
         entry: bash .pre-commit-hooks/check_pyo3_conventions.sh
+        language: system
+        files: "\\.rs$"
+        pass_filenames: false
+
+      - id: check-ustr-conventions
+        name: check ustr conventions
+        description: Enforces Ustr interning conventions (no redundant re-interning)
+        entry: bash .pre-commit-hooks/check_ustr_conventions.sh
         language: system
         files: "\\.rs$"
         pass_filenames: false
@@ -382,6 +390,22 @@ repos:
         files: "(Cargo\\.toml|\\.rs)$|^\\.pre-commit-hooks/cargo_machete\\.sh$"
         pass_filenames: false
 
+      - id: cargo-cooldown
+        name: cargo cooldown
+        description: Blocks crate versions published inside the cooldown window
+        entry: >-
+          bash scripts/check-cargo-cooldown.sh
+          --lock Cargo.lock
+          --lock crates/adapters/lighter/fuzz/pornin/Cargo.lock
+        language: system
+        files: >-
+          (?x)^(
+            Cargo\.(lock|toml)|
+            crates/adapters/lighter/fuzz/pornin/Cargo\.lock|
+            scripts/check-cargo-cooldown\.sh
+          )$
+        pass_filenames: false
+
   ##############################################################################
   #  Python formatting and linting
   ##############################################################################
@@ -399,7 +423,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.2
+    rev: v0.16.3
     hooks:
       - id: ruff
         name: ruff
@@ -427,7 +451,7 @@ repos:
           - "--in-place"
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.12.3 # Must match [uv] in tools.toml
+    rev: 0.12.5 # Must match [uv] in tools.toml
     hooks:
       - id: uv-lock
         args: ["--project", "python"]
