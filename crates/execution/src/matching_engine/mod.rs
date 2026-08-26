@@ -153,6 +153,10 @@ impl Debug for OrderMatchingEngine {
     }
 }
 
+fn scale_queue_position_size(size_raw: QuantityRaw, multiplier: u32) -> QuantityRaw {
+    size_raw.saturating_mul(QuantityRaw::from(multiplier))
+}
+
 impl OrderMatchingEngine {
     /// Creates a new [`OrderMatchingEngine`] instance.
     #[expect(clippy::too_many_arguments)]
@@ -168,6 +172,10 @@ impl OrderMatchingEngine {
         cache: Rc<RefCell<Cache>>,
         config: OrderMatchingEngineConfig,
     ) -> Self {
+        assert!(
+            config.queue_position_multiplier >= 1,
+            "queue_position_multiplier must be at least one"
+        );
         let book = OrderBook::new(instrument.id(), book_type);
         let mut core = OrderMatchingCore::new(instrument.id(), instrument.price_increment());
         core.set_fill_limit_inside_spread(Self::fill_limit_inside_spread_or_false(&fill_model));
@@ -483,8 +491,13 @@ impl OrderMatchingEngine {
             }
         }
 
-        self.queue_ahead_total
-            .insert(client_order_id, (price.raw, qty_ahead.raw));
+        self.queue_ahead_total.insert(
+            client_order_id,
+            (
+                price.raw,
+                scale_queue_position_size(qty_ahead.raw, self.config.queue_position_multiplier),
+            ),
+        );
 
         // L3 books identify orders, so track which specific orders are ahead
         if self.book_type == BookType::L3_MBO {
@@ -784,6 +797,7 @@ impl OrderMatchingEngine {
         size_raw: QuantityRaw,
         order_side: OrderSide,
     ) {
+        let size_raw = scale_queue_position_size(size_raw, self.config.queue_position_multiplier);
         let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
         let mut stale: Vec<ClientOrderId> = Vec::new();
 
@@ -908,9 +922,13 @@ impl OrderMatchingEngine {
             if crossed {
                 self.queue_ahead_total
                     .insert(client_order_id, (order_price_raw, 0));
-            } else if order_price_raw == new_price_raw && ahead_raw > new_size_raw {
-                self.queue_ahead_total
-                    .insert(client_order_id, (order_price_raw, new_size_raw));
+            } else if order_price_raw == new_price_raw {
+                let scaled_size_raw =
+                    scale_queue_position_size(new_size_raw, self.config.queue_position_multiplier);
+                if ahead_raw > scaled_size_raw {
+                    self.queue_ahead_total
+                        .insert(client_order_id, (order_price_raw, scaled_size_raw));
+                }
             }
         }
 
@@ -957,8 +975,16 @@ impl OrderMatchingEngine {
                     .insert(client_order_id, (order_price_raw, 0));
             } else if order_price_raw == new_price_raw {
                 self.queue_pending.shift_remove(&client_order_id);
-                self.queue_ahead_total
-                    .insert(client_order_id, (order_price_raw, new_size_raw));
+                self.queue_ahead_total.insert(
+                    client_order_id,
+                    (
+                        order_price_raw,
+                        scale_queue_position_size(
+                            new_size_raw,
+                            self.config.queue_position_multiplier,
+                        ),
+                    ),
+                );
             }
         }
 
@@ -1006,8 +1032,13 @@ impl OrderMatchingEngine {
 
             if let Some(size) = matched_size {
                 self.queue_pending.shift_remove(&client_order_id);
-                self.queue_ahead_total
-                    .insert(client_order_id, (order_price_raw, size));
+                self.queue_ahead_total.insert(
+                    client_order_id,
+                    (
+                        order_price_raw,
+                        scale_queue_position_size(size, self.config.queue_position_multiplier),
+                    ),
+                );
             }
         }
 
@@ -7156,6 +7187,98 @@ mod tests {
         assert_eq!(sizes.low.raw, 4);
         assert_eq!(sizes.close.raw, 5);
         assert_valid_bar_tick_sizes(volume, increment);
+    }
+
+    #[rstest]
+    fn test_queue_position_multiplier_does_not_change_executable_book_liquidity() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = OrderMatchingEngineConfig {
+            queue_position: true,
+            queue_position_multiplier: 2,
+            ..Default::default()
+        };
+        let mut engine = OrderMatchingEngine::new(
+            instrument.clone(),
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::default().into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            Rc::clone(&cache),
+            config,
+        );
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("1499.00"),
+            Price::from("1501.00"),
+            Quantity::from("10.000"),
+            Quantity::from("12.000"),
+            UnixNanos::from(1_u64),
+            UnixNanos::from(1_u64),
+        );
+        engine.process_quote_tick(&quote);
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-QUEUE-MULTIPLIER-BID"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1499.00"))
+            .quantity(Quantity::from("1.000"))
+            .post_only(true)
+            .submit(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        engine.process_order(&mut order, AccountId::from("ACCOUNT-001"));
+
+        assert_eq!(engine.book.best_bid_size(), Some(Quantity::from("10.000")));
+        assert_eq!(engine.book.best_ask_size(), Some(Quantity::from("12.000")));
+        assert_eq!(
+            engine.queue_ahead_total.get(&order.client_order_id()),
+            Some(&(Price::from("1499.00").raw, Quantity::from("20.000").raw)),
+        );
+
+        let mut pending = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-QUEUE-MULTIPLIER-ASK"))
+            .side(OrderSide::Sell)
+            .price(Price::from("1502.00"))
+            .quantity(Quantity::from("1.000"))
+            .post_only(true)
+            .submit(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(pending.clone(), None, None, false)
+            .unwrap();
+        engine.process_order(&mut pending, AccountId::from("ACCOUNT-001"));
+        assert!(
+            engine
+                .queue_pending
+                .contains_key(&pending.client_order_id())
+        );
+
+        let reached = QuoteTick::new(
+            instrument.id(),
+            Price::from("1499.00"),
+            Price::from("1502.00"),
+            Quantity::from("10.000"),
+            Quantity::from("7.000"),
+            UnixNanos::from(2_u64),
+            UnixNanos::from(2_u64),
+        );
+        engine.process_quote_tick(&reached);
+        assert_eq!(engine.book.best_ask_size(), Some(Quantity::from("7.000")));
+        assert_eq!(
+            engine.queue_ahead_total.get(&pending.client_order_id()),
+            Some(&(Price::from("1502.00").raw, Quantity::from("14.000").raw)),
+        );
     }
 
     fn get_l3_queue_engine(instrument: InstrumentAny) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
