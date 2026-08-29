@@ -630,8 +630,16 @@ struct UserWsTag {
 pub enum PolymarketWsMessage {
     Market(MarketWsMessage),
     User(UserWsMessage),
+    /// Emitted for an application-level market-channel `PONG`.
+    TransportHeartbeat {
+        /// Epoch of the WebSocket connection which received the heartbeat.
+        connection_epoch: u64,
+    },
     /// Emitted when the underlying WebSocket reconnects.
-    Reconnected,
+    Reconnected {
+        /// Epoch assigned to the replacement WebSocket connection.
+        connection_epoch: u64,
+    },
 }
 
 /// Auth payload embedded in user-channel subscribe messages.

@@ -80,7 +80,9 @@ use self::{
 use crate::{
     common::consts::POLYMARKET_VENUE,
     config::PolymarketDataClientConfig,
-    data_types::POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+    data_types::{
+        POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME, POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+    },
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
@@ -503,9 +505,12 @@ impl DataClient for PolymarketDataClient {
     }
 
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
-        if cmd.data_type.type_name() == POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME {
+        if matches!(
+            cmd.data_type.type_name(),
+            POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME | POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME
+        ) {
             log::debug!(
-                "Tracking internal Polymarket transport reconnect subscription: {}",
+                "Tracking internal Polymarket transport subscription: {}",
                 cmd.data_type
             );
             return Ok(());
@@ -668,9 +673,12 @@ impl DataClient for PolymarketDataClient {
     }
 
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
-        if cmd.data_type.type_name() == POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME {
+        if matches!(
+            cmd.data_type.type_name(),
+            POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME | POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME
+        ) {
             log::debug!(
-                "Tracking internal Polymarket transport reconnect unsubscription: {}",
+                "Tracking internal Polymarket transport unsubscription: {}",
                 cmd.data_type
             );
             return Ok(());

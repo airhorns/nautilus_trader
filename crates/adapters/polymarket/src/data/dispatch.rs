@@ -57,7 +57,10 @@ use super::{
     instruments::{TokenMeta, apply_live_instrument},
 };
 use crate::{
-    data_types::{POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, PolymarketTransportReconnect},
+    data_types::{
+        POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME, POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+        PolymarketTransportHeartbeat, PolymarketTransportReconnect,
+    },
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, gamma::PolymarketGammaHttpClient,
@@ -182,7 +185,24 @@ pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageCon
         PolymarketWsMessage::User(_) => {
             log::debug!("Ignoring user message on data client");
         }
-        PolymarketWsMessage::Reconnected => {
+        PolymarketWsMessage::TransportHeartbeat { connection_epoch } => {
+            let observed_at = ctx.clock.get_time_ns();
+            let heartbeat = Arc::new(PolymarketTransportHeartbeat::new(
+                connection_epoch,
+                observed_at,
+                observed_at,
+            ));
+            let data_type = DataType::new(POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME, None, None);
+            if let Err(e) =
+                ctx.data_sender
+                    .send(DataEvent::Data(NautilusData::Custom(CustomData::new(
+                        heartbeat, data_type,
+                    ))))
+            {
+                log::error!("Failed to emit Polymarket transport heartbeat: {e}");
+            }
+        }
+        PolymarketWsMessage::Reconnected { connection_epoch } => {
             log::info!("Polymarket WS reconnected");
             if ctx.cancellation_token.is_cancelled() {
                 log::debug!("Skipping RTDS recovery because data client is cancelling");
@@ -195,7 +215,11 @@ pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageCon
             // reconnect from later snapshots is unsafe because ordinary token-local refreshes use
             // the same snapshot wire format.
             let observed_at = ctx.clock.get_time_ns();
-            let reconnect = Arc::new(PolymarketTransportReconnect::new(observed_at, observed_at));
+            let reconnect = Arc::new(PolymarketTransportReconnect::new(
+                connection_epoch,
+                observed_at,
+                observed_at,
+            ));
             let data_type = DataType::new(POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, None, None);
             if let Err(error) =
                 ctx.data_sender
@@ -2156,7 +2180,12 @@ mod tests {
         .await;
         state.received_payloads.lock().await.clear();
 
-        handle_ws_message(PolymarketWsMessage::Reconnected, &ctx);
+        handle_ws_message(
+            PolymarketWsMessage::Reconnected {
+                connection_epoch: 1,
+            },
+            &ctx,
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -2190,7 +2219,12 @@ mod tests {
             ))
             .expect("track RTDS subscribe");
 
-        handle_ws_message(PolymarketWsMessage::Reconnected, &ctx);
+        handle_ws_message(
+            PolymarketWsMessage::Reconnected {
+                connection_epoch: 1,
+            },
+            &ctx,
+        );
 
         wait_until_async(
             || {
@@ -2232,7 +2266,12 @@ mod tests {
             .expect("track RTDS subscribe");
 
         ctx.cancellation_token.cancel();
-        handle_ws_message(PolymarketWsMessage::Reconnected, &ctx);
+        handle_ws_message(
+            PolymarketWsMessage::Reconnected {
+                connection_epoch: 1,
+            },
+            &ctx,
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(state.received_payloads.lock().await.is_empty());
@@ -6527,6 +6566,34 @@ mod tests {
         assert!(!ctx.order_books.contains_key(&instrument_id));
     }
 
+    #[rstest]
+    fn transport_heartbeat_emits_typed_custom_data() {
+        let (ctx, mut data_rx) = make_ws_ctx();
+
+        handle_ws_message(
+            PolymarketWsMessage::TransportHeartbeat {
+                connection_epoch: 7,
+            },
+            &ctx,
+        );
+
+        let heartbeat = data_rx.try_recv().expect("transport heartbeat custom data");
+        let DataEvent::Data(NautilusData::Custom(heartbeat)) = heartbeat else {
+            panic!("expected typed transport heartbeat custom data");
+        };
+        assert_eq!(
+            heartbeat.data_type.type_name(),
+            POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME
+        );
+        let heartbeat = heartbeat
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketTransportHeartbeat>()
+            .expect("typed heartbeat payload");
+        assert_eq!(heartbeat.connection_epoch, 7);
+        assert_eq!(heartbeat.ts_event, heartbeat.ts_init);
+    }
+
     #[tokio::test]
     async fn reconnect_gates_newer_delta_until_replacement_snapshot() {
         let asset_id_str = "0xRECONNECT_TOKEN";
@@ -6554,7 +6621,12 @@ mod tests {
         assert!(ctx.order_books.contains_key(&instrument_id));
         while data_rx.try_recv().is_ok() {}
 
-        handle_ws_message(PolymarketWsMessage::Reconnected, &ctx);
+        handle_ws_message(
+            PolymarketWsMessage::Reconnected {
+                connection_epoch: 7,
+            },
+            &ctx,
+        );
         assert!(!ctx.order_books.contains_key(&instrument_id));
         assert!(
             ctx.pending_snapshot_after_tick_change
@@ -6570,13 +6642,12 @@ mod tests {
             reconnect.data_type.type_name(),
             POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME
         );
-        assert!(
-            reconnect
-                .data
-                .as_any()
-                .downcast_ref::<PolymarketTransportReconnect>()
-                .is_some()
-        );
+        let reconnect = reconnect
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketTransportReconnect>()
+            .expect("typed reconnect payload");
+        assert_eq!(reconnect.connection_epoch, 7);
 
         handle_market_message(make_price_change(market, asset_id_str, "0.50", "20"), &ctx);
         assert!(!ctx.order_books.contains_key(&instrument_id));

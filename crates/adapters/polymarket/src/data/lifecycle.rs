@@ -576,7 +576,9 @@ mod tests {
             instruments::{apply_live_instrument, cache_instrument_unchecked},
             runtime::retire_local_instrument_state,
         },
-        data_types::POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+        data_types::{
+            POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME, POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+        },
         http::{
             clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
             gamma::PolymarketGammaHttpClient,
@@ -999,9 +1001,13 @@ mod tests {
     }
 
     #[rstest]
-    fn subscribe_internal_transport_reconnect_does_not_create_wire_subscription() {
+    #[case(POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME)]
+    #[case(POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME)]
+    fn subscribe_internal_transport_data_does_not_create_wire_subscription(
+        #[case] type_name: &str,
+    ) {
         let mut client = make_client_for_reset_test();
-        let data_type = DataType::new(POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME, None, None);
+        let data_type = DataType::new(type_name, None, None);
 
         client
             .subscribe(SubscribeCustomData::new(
@@ -1013,7 +1019,7 @@ mod tests {
                 None,
                 None,
             ))
-            .expect("internal reconnect subscription should be accepted");
+            .expect("internal transport subscription should be accepted");
 
         assert_eq!(client.rtds_feed.tracked_subscription_count(), 0);
     }

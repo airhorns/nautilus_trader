@@ -402,7 +402,12 @@ impl FeedHandler {
                             if text == RECONNECTED {
                                 self.market_subscription_initialized = false;
                                 self.resubscribe_all(connection_epoch).await;
-                                return Some(PolymarketWsMessage::Reconnected);
+                                return Some(PolymarketWsMessage::Reconnected { connection_epoch });
+                            }
+                            if self.channel == WsChannel::Market && text == "PONG" {
+                                return Some(PolymarketWsMessage::TransportHeartbeat {
+                                    connection_epoch,
+                                });
                             }
                             let msgs = self.parse_messages(&text);
                             if msgs.is_empty() {
@@ -663,7 +668,18 @@ mod tests {
 
         assert!(matches!(
             handler.next().await,
-            Some(PolymarketWsMessage::Reconnected),
+            Some(PolymarketWsMessage::Reconnected {
+                connection_epoch: 0
+            }),
+        ));
+        raw_tx
+            .send((0, Message::Text("PONG".into())))
+            .expect("queue heartbeat acknowledgement");
+        assert!(matches!(
+            handler.next().await,
+            Some(PolymarketWsMessage::TransportHeartbeat {
+                connection_epoch: 0
+            }),
         ));
         handler
             .client

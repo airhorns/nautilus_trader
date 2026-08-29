@@ -352,10 +352,10 @@ impl PolymarketWebSocketClient {
 
             loop {
                 match handler.next().await {
-                    Some(PolymarketWsMessage::Reconnected) => {
+                    Some(message @ PolymarketWsMessage::Reconnected { .. }) => {
                         log::info!("Polymarket WebSocket reconnected");
 
-                        if handler.send(PolymarketWsMessage::Reconnected).is_err() {
+                        if handler.send(message).is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Output channel closed, stopping handler");
                             } else {
@@ -795,7 +795,7 @@ mod tests {
 
         assert!(matches!(
             message,
-            Some(super::super::messages::PolymarketWsMessage::Reconnected)
+            Some(super::super::messages::PolymarketWsMessage::Reconnected { .. })
         ));
 
         client
@@ -830,7 +830,7 @@ mod tests {
                 if let Some(message) = client.next_message().await
                     && matches!(
                         message,
-                        super::super::messages::PolymarketWsMessage::Reconnected
+                        super::super::messages::PolymarketWsMessage::Reconnected { .. }
                     )
                 {
                     break message;
@@ -841,7 +841,7 @@ mod tests {
         .expect("wait for reconnect sentinel");
         assert!(matches!(
             message,
-            super::super::messages::PolymarketWsMessage::Reconnected
+            super::super::messages::PolymarketWsMessage::Reconnected { .. }
         ));
         wait_for_server_event(&mut server_events, 2, "connected").await;
         wait_for_server_event(&mut server_events, 2, "token-reconnect-test").await;
