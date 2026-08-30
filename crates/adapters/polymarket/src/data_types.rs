@@ -22,6 +22,42 @@ use nautilus_core::UnixNanos;
 use nautilus_model::types::Price;
 use nautilus_persistence_macros::custom_data;
 
+/// Canonical Nautilus custom-data name for a main Polymarket market-data transport reconnect.
+pub const POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME: &str = "PolymarketTransportReconnect";
+
+/// Canonical Nautilus custom-data name for a main Polymarket market-data transport heartbeat.
+pub const POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME: &str = "PolymarketTransportHeartbeat";
+
+/// Positive inbound liveness from the main Polymarket market-data transport.
+///
+/// The adapter emits this event only for an application-level `PONG` received from Polymarket.
+/// The connection epoch allows consumers to reject a delayed heartbeat from an obsolete socket.
+#[custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.polymarket")]
+pub struct PolymarketTransportHeartbeat {
+    /// Monotonically increasing epoch assigned by the WebSocket transport.
+    pub connection_epoch: u64,
+    /// UNIX timestamp (nanoseconds) when the heartbeat was observed.
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was initialized.
+    pub ts_init: UnixNanos,
+}
+
+/// Main Polymarket market-data transport reconnect boundary.
+///
+/// The adapter emits this event before any replacement snapshot or incremental update from the
+/// new transport can enter the Nautilus data engine. Consumers can therefore invalidate every
+/// application-level book atomically and fail closed until authoritative replacement snapshots
+/// arrive. Token-local snapshots caused by fills or tick-size changes do not emit this event.
+#[custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.polymarket")]
+pub struct PolymarketTransportReconnect {
+    /// Monotonically increasing epoch assigned by the replacement WebSocket transport.
+    pub connection_epoch: u64,
+    /// UNIX timestamp (nanoseconds) when the reconnect boundary was observed.
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was initialized.
+    pub ts_init: UnixNanos,
+}
+
 /// Polymarket RTDS crypto price sample from the `crypto_prices` topic.
 ///
 /// The adapter normalizes both live `update` frames and `subscribe` backfill
@@ -76,6 +112,10 @@ pub struct PolymarketRtdsEquityPrice {
 ///
 /// Safe to call multiple times (idempotent via internal `Once` guards).
 pub fn register_polymarket_custom_data() {
+    let _ =
+        nautilus_model::data::ensure_custom_data_json_registered::<PolymarketTransportHeartbeat>();
+    let _ =
+        nautilus_model::data::ensure_custom_data_json_registered::<PolymarketTransportReconnect>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsCryptoPrice>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsEquityPrice>();
 }
@@ -84,11 +124,22 @@ pub fn register_polymarket_custom_data() {
 mod tests {
     use rstest::rstest;
 
-    use super::register_polymarket_custom_data;
+    use super::{
+        POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME, POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+        register_polymarket_custom_data,
+    };
 
     #[rstest]
     fn test_register_polymarket_custom_data_is_idempotent() {
         register_polymarket_custom_data();
         register_polymarket_custom_data();
+        assert_eq!(
+            POLYMARKET_TRANSPORT_HEARTBEAT_TYPE_NAME,
+            "PolymarketTransportHeartbeat"
+        );
+        assert_eq!(
+            POLYMARKET_TRANSPORT_RECONNECT_TYPE_NAME,
+            "PolymarketTransportReconnect"
+        );
     }
 }

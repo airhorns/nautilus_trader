@@ -194,7 +194,7 @@ impl CanonicalBacktestResult {
             normalized == document,
             "canonical backtest result violates the version 1 encoding rules"
         );
-        let canonical = serde_json::to_vec(&document)?;
+        let canonical = serde_json::to_vec(&normalized)?;
         anyhow::ensure!(
             canonical == bytes,
             "canonical backtest result bytes do not use the canonical encoding"
@@ -638,6 +638,12 @@ fn canonical_account(account: &AccountAny) -> anyhow::Result<Value> {
                 locked_balances(&betting.balances_locked),
             );
         }
+        AccountAny::Wallet(wallet) => {
+            payload.insert(
+                "balances_locked_transient".to_string(),
+                locked_balances(&wallet.balances_locked),
+            );
+        }
     }
     canonicalize_value(&mut value)?;
     Ok(value)
@@ -767,12 +773,14 @@ fn canonical_value<T: Serialize>(source: &T) -> anyhow::Result<Value> {
 }
 
 fn canonicalize_value(value: &mut Value) -> anyhow::Result<()> {
+    value.sort_all_objects();
     sort_named_arrays(value, false);
     stringify_numbers(value)?;
     Ok(())
 }
 
 fn canonicalize_document(value: &mut Value) -> anyhow::Result<()> {
+    value.sort_all_objects();
     sort_named_arrays(value, false);
     normalize_identities(value);
     sort_named_arrays(value, true);
@@ -1066,10 +1074,12 @@ fn escape_pointer_token(token: &str) -> String {
 mod tests {
     use ahash::AHashMap;
     use nautilus_model::{
-        enums::{OrderType, TrailingOffsetType},
-        identifiers::InstrumentId,
+        accounts::WalletAccount,
+        enums::{AccountType, OrderType, TrailingOffsetType},
+        events::AccountState,
+        identifiers::{AccountId, InstrumentId},
         orders::OrderTestBuilder,
-        types::Quantity,
+        types::{AccountBalance, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -1135,6 +1145,40 @@ mod tests {
         );
         assert_eq!(value["stats_general"]["Long Ratio"], json!(1.0));
         assert_eq!(value["returns_series"]["3"], json!(0.25));
+    }
+
+    #[rstest]
+    fn test_canonical_account_wallet_includes_transient_locks() {
+        let eth = Currency::ETH();
+        let state = AccountState::new(
+            AccountId::from("WALLET-001"),
+            AccountType::Wallet,
+            vec![AccountBalance::new(
+                Money::new(10.0, eth),
+                Money::zero(eth),
+                Money::new(10.0, eth),
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let mut account = WalletAccount::new(state, true);
+        let instrument_id = InstrumentId::from("WETHUSDC.BLOCKCHAIN");
+        account
+            .update_balance_locked(instrument_id, Money::new(2.0, eth))
+            .unwrap();
+
+        let value = canonical_account(&AccountAny::Wallet(account)).unwrap();
+
+        let payload = value.get("Wallet").unwrap();
+        let locks = payload["balances_locked_transient"].as_array().unwrap();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0]["currency"], "ETH");
+        assert_eq!(locks[0]["instrument_id"], "WETHUSDC.BLOCKCHAIN");
+        assert_eq!(locks[0]["money"], "2.00000000 ETH");
     }
 
     #[rstest]

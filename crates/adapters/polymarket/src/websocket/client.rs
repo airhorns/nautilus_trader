@@ -21,6 +21,7 @@ use std::sync::{
 };
 
 use nautilus_common::live::get_runtime;
+use nautilus_live::SocketControl;
 use nautilus_network::{
     SocketStateSink,
     mode::ConnectionMode,
@@ -40,23 +41,23 @@ use crate::common::{
     urls::{clob_ws_market_url, clob_ws_user_url},
 };
 
-const POLYMARKET_HEARTBEAT_SECS: u64 = 30;
+// The venue counts only the `PING` text frame, not protocol ping frames, and
+// closes with `1008 no ping received` otherwise. The venue requires a ping at
+// least every ten seconds, while a one-second cadence also gives consumers a
+// useful liveness signal for quiet prediction markets:
+// https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
+const POLYMARKET_HEARTBEAT_SECS: u64 = 1;
+
+// Prediction markets go quiet for long stretches, so liveness is the venue
+// still sending frames, not data arriving. A data-silence timer cannot serve:
+// `PONG` is a text frame and refreshes it. Tear down after three cycles.
+const POLYMARKET_HEARTBEAT_TIMEOUT_SECS: u64 = POLYMARKET_HEARTBEAT_SECS * 3;
 
 /// Polymarket WebSocket channel: market data or authenticated user data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsChannel {
     Market,
     User,
-}
-
-// Market channel streams continuously; user channel can legitimately be quiet
-// when no orders or fills exist, so give it a longer window before treating
-// silence as a zombie connection.
-fn idle_timeout_ms_for(channel: WsChannel) -> u64 {
-    match channel {
-        WsChannel::Market => 60_000,
-        WsChannel::User => 300_000,
-    }
 }
 
 /// Lightweight handle for subscribing/unsubscribing to market data.
@@ -84,6 +85,20 @@ impl WsSubscriptionHandle {
             .await
             .send(HandlerCommand::UnsubscribeMarket(asset_ids))
             .map_err(|e| anyhow::anyhow!("Failed to send UnsubscribeMarket: {e}"))
+    }
+
+    /// Exercises the ordinary transport reconnect path without stopping the data client.
+    pub async fn reconnect_test(&self) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::ReconnectTest(response_tx))
+            .map_err(|e| anyhow::anyhow!("Failed to send ReconnectTest: {e}"))?;
+        response_rx
+            .await
+            .map_err(|e| anyhow::anyhow!("ReconnectTest response channel closed: {e}"))?
+            .map_err(anyhow::Error::msg)
     }
 
     // Constructs a handle around a raw command sender. Test-only: lets unit
@@ -121,7 +136,8 @@ pub struct PolymarketWebSocketClient {
     subscribe_new_markets: bool,
     transport_backend: TransportBackend,
     proxy_url: Option<ProxyUrl>,
-    state_sink: Option<SocketStateSink>,
+    socket_sink: Option<SocketStateSink>,
+    socket_control: Option<SocketControl>,
 }
 
 impl PolymarketWebSocketClient {
@@ -212,14 +228,22 @@ impl PolymarketWebSocketClient {
             subscribe_new_markets,
             transport_backend,
             proxy_url,
-            state_sink: None,
+            socket_sink: None,
+            socket_control: None,
         }
     }
 
     /// Configures socket state reporting for the underlying transport.
     #[must_use]
     pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
-        self.state_sink = Some(state_sink);
+        self.socket_sink = Some(state_sink);
+        self
+    }
+
+    /// Configures state reporting and reconnect control for the underlying transport.
+    #[must_use]
+    pub(crate) fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
         self
     }
 
@@ -239,6 +263,10 @@ impl PolymarketWebSocketClient {
             return Ok(());
         }
 
+        // A client may be connected again after a graceful stop/disconnect.
+        // The stop latch belongs to one handler generation only.
+        self.signal.store(false, Ordering::Relaxed);
+
         let (message_handler, raw_rx) = channel_epoch_message_handler();
         let cfg = self.websocket_config();
 
@@ -247,9 +275,17 @@ impl PolymarketWebSocketClient {
             message_handler,
             None,
             Arc::new(RateLimiter::new_with_quota(None, vec![])),
-            self.state_sink.clone(),
+            self.socket_control
+                .as_ref()
+                .map(SocketControl::sink)
+                .or_else(|| self.socket_sink.clone()),
         )
         .await?;
+
+        if let Some(control) = &self.socket_control {
+            let handle = client.reconnect_handle();
+            control.register(move || handle.request_reconnect());
+        }
         let connection_epoch = client.connection_epoch();
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
@@ -267,7 +303,7 @@ impl PolymarketWebSocketClient {
         // path, a fresh connect() never fires resubscribe_all() inside the handler.
         let initial_market_replay = match self.channel {
             WsChannel::Market => {
-                let topics = self.subscriptions.all_topics();
+                let topics = self.subscriptions.reset_after_reconnect();
                 if !topics.is_empty() || self.discovery_subscribed.load(Ordering::Relaxed) {
                     log::debug!(
                         "Replaying market subscription state onto new session: assets={}, discovery={}",
@@ -318,10 +354,10 @@ impl PolymarketWebSocketClient {
 
             loop {
                 match handler.next().await {
-                    Some(PolymarketWsMessage::Reconnected) => {
+                    Some(message @ PolymarketWsMessage::Reconnected { .. }) => {
                         log::info!("Polymarket WebSocket reconnected");
 
-                        if handler.send(PolymarketWsMessage::Reconnected).is_err() {
+                        if handler.send(message).is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Output channel closed, stopping handler");
                             } else {
@@ -360,15 +396,16 @@ impl PolymarketWebSocketClient {
         WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(POLYMARKET_HEARTBEAT_SECS),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(15_000),
+            heartbeat_interval_secs: Some(POLYMARKET_HEARTBEAT_SECS),
+            heartbeat_payload: Some("PING".to_string()),
+            connect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(200),
             reconnect_max_attempts: None,
-            idle_timeout_ms: Some(idle_timeout_ms_for(self.channel)),
+            heartbeat_timeout_secs: Some(POLYMARKET_HEARTBEAT_TIMEOUT_SECS),
+            idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.as_ref().map(|url| url.expose().to_string()),
         }
@@ -377,7 +414,7 @@ impl PolymarketWebSocketClient {
     /// Force-close fallback for the sync `stop()` path.
     /// Prefer `disconnect()` for graceful shutdown.
     pub(crate) fn abort(&mut self) {
-        self.signal.store(true, Ordering::Relaxed);
+        self.begin_shutdown();
         self.connection_mode
             .store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
 
@@ -385,12 +422,24 @@ impl PolymarketWebSocketClient {
             handle.abort();
         }
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+    }
+
+    /// Marks the current handler generation as intentionally stopping.
+    ///
+    /// This is separated from async disconnect so synchronous client shutdown
+    /// can classify an output receiver closing during teardown as expected.
+    pub(crate) fn begin_shutdown(&self) {
+        self.signal.store(true, Ordering::Relaxed);
     }
 
     /// Disconnects the WebSocket connection.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
         log::debug!("Disconnecting Polymarket WebSocket");
-        self.signal.store(true, Ordering::Relaxed);
+        self.begin_shutdown();
 
         if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
             log::debug!("Failed to send disconnect (handler may already be shut down): {e}");
@@ -415,6 +464,10 @@ impl PolymarketWebSocketClient {
         // Invalidate after the task has stopped so any in-flight auth_tracker.succeed()
         // calls from the handler cannot race with and survive the invalidation.
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         log::debug!("Polymarket WebSocket disconnected");
         Ok(())
     }
@@ -553,21 +606,105 @@ impl PolymarketWebSocketClient {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::{
         Router,
-        extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        extract::{
+            State,
+            ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        },
         response::Response,
         routing::get,
     };
     use nautilus_network::{
         RECONNECTED,
-        websocket::{TransportBackend, WebSocketConfig, proxy::ProxyUrl},
+        websocket::{TransportBackend, WebSocketClient, WebSocketConfig, proxy::ProxyUrl},
     };
     use rstest::rstest;
 
-    use super::{PolymarketWebSocketClient, WsChannel, idle_timeout_ms_for};
+    use super::PolymarketWebSocketClient;
+
+    #[derive(Clone)]
+    struct ReconnectServerState {
+        connections: Arc<AtomicUsize>,
+        events: tokio::sync::mpsc::UnboundedSender<(usize, String)>,
+    }
+
+    async fn handle_reconnect_upgrade(
+        ws: WebSocketUpgrade,
+        State(state): State<ReconnectServerState>,
+    ) -> Response {
+        ws.on_upgrade(move |socket| handle_reconnect_socket(socket, state))
+    }
+
+    async fn handle_reconnect_socket(mut socket: WebSocket, state: ReconnectServerState) {
+        let generation = state.connections.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = state.events.send((generation, "connected".to_string()));
+        while let Some(Ok(message)) = socket.recv().await {
+            match message {
+                AxumWsMessage::Text(text) => {
+                    let _ = state.events.send((generation, text.to_string()));
+                }
+                AxumWsMessage::Close(_) => {
+                    let _ = state.events.send((generation, "closed".to_string()));
+                    let _ = socket.send(AxumWsMessage::Close(None)).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn start_reconnect_test_server() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(usize, String)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reconnect websocket server");
+        let addr = listener.local_addr().expect("reconnect websocket address");
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = ReconnectServerState {
+            connections: Arc::new(AtomicUsize::new(0)),
+            events,
+        };
+        let router = Router::new()
+            .route("/ws", get(handle_reconnect_upgrade))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("reconnect websocket server failed");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        (addr, receiver)
+    }
+
+    async fn wait_for_server_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<(usize, String)>,
+        generation: usize,
+        expected: &str,
+    ) {
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                let (observed_generation, message) =
+                    events.recv().await.expect("reconnect server event channel");
+                if observed_generation == generation && message.contains(expected) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("wait for reconnect server event");
+    }
 
     async fn handle_upgrade(ws: WebSocketUpgrade) -> Response {
         ws.on_upgrade(handle_socket)
@@ -596,11 +733,45 @@ mod tests {
         addr
     }
 
-    #[rstest]
-    #[case::market(WsChannel::Market, 60_000)]
-    #[case::user(WsChannel::User, 300_000)]
-    fn test_idle_timeout_ms_for_channel(#[case] channel: WsChannel, #[case] expected: u64) {
-        assert_eq!(idle_timeout_ms_for(channel), expected);
+    type HeartbeatSender = Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>;
+
+    async fn handle_heartbeat_upgrade(
+        ws: WebSocketUpgrade,
+        State(sender): State<HeartbeatSender>,
+    ) -> Response {
+        ws.on_upgrade(move |socket| handle_heartbeat_socket(socket, sender))
+    }
+
+    async fn handle_heartbeat_socket(mut socket: WebSocket, sender: HeartbeatSender) {
+        while let Some(Ok(message)) = socket.recv().await {
+            if let AxumWsMessage::Text(text) = message {
+                if let Some(sender) = sender.lock().await.take() {
+                    let _ = sender.send(text.to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    async fn start_heartbeat_test_server() -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat websocket server");
+        let addr = listener.local_addr().expect("heartbeat websocket address");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let state = Arc::new(tokio::sync::Mutex::new(Some(sender)));
+        let router = Router::new()
+            .route("/ws", get(handle_heartbeat_upgrade))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("heartbeat websocket server failed");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        (addr, receiver)
     }
 
     #[rstest]
@@ -613,7 +784,11 @@ mod tests {
             TransportBackend::default(),
         );
 
+        client.begin_shutdown();
+        assert!(client.signal.load(std::sync::atomic::Ordering::Relaxed));
+
         client.connect().await.expect("connect websocket client");
+        assert!(!client.signal.load(std::sync::atomic::Ordering::Relaxed));
 
         let message =
             tokio::time::timeout(tokio::time::Duration::from_secs(2), client.next_message())
@@ -622,13 +797,86 @@ mod tests {
 
         assert!(matches!(
             message,
-            Some(super::super::messages::PolymarketWsMessage::Reconnected)
+            Some(super::super::messages::PolymarketWsMessage::Reconnected { .. })
         ));
 
         client
             .disconnect()
             .await
             .expect("disconnect websocket client");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reconnect_test_closes_reconnects_and_replays_subscription() {
+        let (addr, mut server_events) = start_reconnect_test_server().await;
+        let mut client = PolymarketWebSocketClient::new_market(
+            Some(format!("ws://{addr}/ws")),
+            false,
+            TransportBackend::Tungstenite,
+        );
+        client.connect().await.expect("connect websocket client");
+        let handle = client.clone_subscription_handle();
+        handle
+            .subscribe_market(vec!["token-reconnect-test".to_string()])
+            .await
+            .expect("subscribe before reconnect test");
+
+        wait_for_server_event(&mut server_events, 1, "connected").await;
+        wait_for_server_event(&mut server_events, 1, "token-reconnect-test").await;
+        handle.reconnect_test().await.expect("send reconnect test");
+        wait_for_server_event(&mut server_events, 1, "closed").await;
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(message) = client.next_message().await
+                    && matches!(
+                        message,
+                        super::super::messages::PolymarketWsMessage::Reconnected { .. }
+                    )
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("wait for reconnect sentinel");
+        assert!(matches!(
+            message,
+            super::super::messages::PolymarketWsMessage::Reconnected { .. }
+        ));
+        wait_for_server_event(&mut server_events, 2, "connected").await;
+        wait_for_server_event(&mut server_events, 2, "token-reconnect-test").await;
+
+        client
+            .disconnect()
+            .await
+            .expect("disconnect websocket client");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn configured_heartbeat_writes_application_ping_text() {
+        let (addr, heartbeat) = start_heartbeat_test_server().await;
+        let adapter = PolymarketWebSocketClient::new_market(
+            Some(format!("ws://{addr}/ws")),
+            false,
+            TransportBackend::Tungstenite,
+        );
+        let mut config = adapter.websocket_config();
+        // Preserve the production payload while shortening only the fixture cadence.
+        config.heartbeat_interval_secs = Some(1);
+        let client = WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, vec![], None)
+            .await
+            .expect("connect heartbeat websocket client");
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(2), heartbeat)
+            .await
+            .expect("wait for application heartbeat")
+            .expect("heartbeat server sender dropped");
+
+        assert_eq!(message, "PING");
+        client.disconnect().await;
     }
 
     #[rstest]
@@ -659,14 +907,18 @@ mod tests {
         let user_debug = format!("{user:?}");
         let assert_common = |config: &WebSocketConfig| {
             assert_eq!(config.headers, Vec::<(String, String)>::new());
-            assert_eq!(config.heartbeat, Some(super::POLYMARKET_HEARTBEAT_SECS));
-            assert_eq!(config.heartbeat_msg, None);
-            assert_eq!(config.reconnect_timeout_ms, Some(15_000));
+            assert_eq!(config.heartbeat_interval_secs, Some(1));
+            assert_eq!(config.heartbeat_payload.as_deref(), Some("PING"));
+            assert_eq!(config.connect_timeout_ms, Some(15_000));
             assert_eq!(config.reconnect_delay_initial_ms, Some(250));
             assert_eq!(config.reconnect_delay_max_ms, Some(5_000));
             assert_eq!(config.reconnect_backoff_factor, Some(2.0));
             assert_eq!(config.reconnect_jitter_ms, Some(200));
             assert_eq!(config.reconnect_max_attempts, None);
+            assert_eq!(config.heartbeat_timeout_secs, Some(3));
+            // No data-silence timer: `PONG` arrives as a text frame and would
+            // refresh it, so liveness rests on the heartbeat timeout instead.
+            assert_eq!(config.idle_timeout_ms, None);
             assert_eq!(config.backend, TransportBackend::Tungstenite);
         };
 
@@ -674,14 +926,6 @@ mod tests {
         assert_eq!(user.proxy_url.as_ref().unwrap().expose(), USER_PROXY);
         assert_eq!(market_config.url, "ws://market.example/ws");
         assert_eq!(user_config.url, "ws://user.example/ws");
-        assert_eq!(
-            market_config.idle_timeout_ms,
-            Some(idle_timeout_ms_for(WsChannel::Market))
-        );
-        assert_eq!(
-            user_config.idle_timeout_ms,
-            Some(idle_timeout_ms_for(WsChannel::User))
-        );
         assert_eq!(market_config.proxy_url.as_deref(), Some(MARKET_PROXY));
         assert_eq!(user_config.proxy_url.as_deref(), Some(USER_PROXY));
         assert_common(&market_config);

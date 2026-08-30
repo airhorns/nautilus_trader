@@ -14,15 +14,15 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::identifiers::{AccountId, InstrumentId, TraderId};
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use nautilus_network::websocket::TransportBackend;
 use pyo3::{PyResult, pymethods};
 
 use crate::{
     common::enums::SignatureType,
     config::{
-        PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
-        PolymarketUpDownEventSlugConfig,
+        PolymarketDataClientConfig, PolymarketExecutionClientConfig,
+        PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig,
     },
     providers::build_gamma_params_from_hashmap,
 };
@@ -130,7 +130,7 @@ impl PolymarketDataClientConfig {
     /// and are skipped during serialization; they default to empty/`None` and must be
     /// installed programmatically after deserialization.
     #[new]
-    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None, transport_backend=None, drop_quotes_missing_side=None, proxy_url=None, compute_effective_deltas=None))]
+    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None, transport_backend=None, reconnect_test_after_secs=None, drop_quotes_missing_side=None, proxy_url=None, compute_effective_deltas=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_config: Option<PolymarketInstrumentProviderConfig>,
@@ -155,6 +155,7 @@ impl PolymarketDataClientConfig {
         resolve_poll_max_wait_secs: Option<u64>,
         base_url_rtds: Option<String>,
         transport_backend: Option<TransportBackend>,
+        reconnect_test_after_secs: Option<u64>,
         drop_quotes_missing_side: Option<bool>,
         proxy_url: Option<String>,
         compute_effective_deltas: Option<bool>,
@@ -199,6 +200,7 @@ impl PolymarketDataClientConfig {
             resolve_poll_max_wait_secs: resolve_poll_max_wait_secs
                 .unwrap_or(default.resolve_poll_max_wait_secs),
             transport_backend: transport_backend.unwrap_or(default.transport_backend),
+            reconnect_test_after_secs,
             compute_effective_deltas: compute_effective_deltas
                 .unwrap_or(default.compute_effective_deltas),
         };
@@ -225,16 +227,15 @@ impl PolymarketDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PolymarketExecClientConfig {
+impl PolymarketExecutionClientConfig {
     /// Configuration for the Polymarket execution client.
     ///
     /// `Debug` is implemented manually to redact secrets, so it is not part of the
     /// derive list.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None))]
+    #[pyo3(signature = (account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None))]
     fn py_new(
-        trader_id: Option<String>,
         account_id: Option<String>,
         private_key: Option<String>,
         api_key: Option<String>,
@@ -252,10 +253,10 @@ impl PolymarketExecClientConfig {
         heartbeat_enabled: Option<bool>,
         transport_backend: Option<TransportBackend>,
         proxy_url: Option<String>,
+        instrument_config: Option<PolymarketInstrumentProviderConfig>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let config = Self {
-            trader_id: trader_id.map_or(default.trader_id, |s| TraderId::from(s.as_str())),
             account_id: account_id.map_or(default.account_id, |s| AccountId::from(s.as_str())),
             private_key,
             api_key,
@@ -274,6 +275,7 @@ impl PolymarketExecClientConfig {
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(default.retry_delay_max_ms),
             heartbeat_enabled: heartbeat_enabled.unwrap_or(default.heartbeat_enabled),
             transport_backend: transport_backend.unwrap_or(default.transport_backend),
+            instrument_config,
         };
         config
             .validated_proxy_url()
@@ -577,7 +579,7 @@ mod tests {
             let kwargs = PyDict::new(py);
             kwargs.set_item("proxy_url", &proxy_url).unwrap();
             kwargs.set_item("heartbeat_enabled", true).unwrap();
-            let cls = py.get_type::<PolymarketExecClientConfig>();
+            let cls = py.get_type::<PolymarketExecutionClientConfig>();
             let obj = cls
                 .call((), Some(&kwargs))
                 .expect("construct execution config");
@@ -593,7 +595,7 @@ mod tests {
                 .extract::<bool>()
                 .expect("bool getter");
             let config = obj
-                .extract::<PolymarketExecClientConfig>()
+                .extract::<PolymarketExecutionClientConfig>()
                 .expect("extract execution config");
 
             assert_eq!(config.proxy_url.as_deref(), Some(proxy_url.as_str()));
@@ -602,6 +604,37 @@ mod tests {
             assert!(heartbeat_enabled);
             assert!(!obj.hasattr("proxy_url").unwrap());
             assert!(!repr.contains(SECRET));
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_exec_config_wires_instrument_config_load_ids() {
+        Python::initialize();
+        Python::attach(|py| {
+            let scoped = InstrumentId::from("0xabc-123.POLYMARKET");
+            let provider_kwargs = PyDict::new(py);
+            provider_kwargs.set_item("load_ids", vec![scoped]).unwrap();
+            let provider = py
+                .get_type::<PolymarketInstrumentProviderConfig>()
+                .call((), Some(&provider_kwargs))
+                .expect("construct provider config");
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("instrument_config", &provider).unwrap();
+            let obj = py
+                .get_type::<PolymarketExecutionClientConfig>()
+                .call((), Some(&kwargs))
+                .expect("construct execution config");
+            let exposed = obj
+                .getattr("instrument_config")
+                .expect("instrument_config getter")
+                .extract::<PolymarketInstrumentProviderConfig>()
+                .expect("extract provider config");
+            let config = obj
+                .extract::<PolymarketExecutionClientConfig>()
+                .expect("extract execution config");
+
+            assert_eq!(exposed.load_ids.as_deref(), Some([scoped].as_slice()));
+            assert_eq!(config.reconciliation_load_ids(), Some([scoped].as_slice()));
         });
     }
 

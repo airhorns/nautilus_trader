@@ -13,7 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Ordered socket state notification for shared connection modes.
+//! Ordered availability-edge publication for socket transports.
+//!
+//! # Ordering
+//!
+//! A [`SocketStateSink`] reports transitions into and out of [`ConnectionMode::Active`] for one
+//! client, rather than every internal connection mode. Most paths perform the mode transition and
+//! callback under the same serialization lock, so concurrent loss and recovery attempts publish
+//! at most one ordered edge. WebSocket reconnect changes mode before publishing loss and uses the
+//! same lock for publication, while the controller prevents recovery until publication completes.
 
 use std::{
     fmt::Debug,
@@ -52,6 +60,26 @@ impl SocketStateSink {
         }
     }
 
+    /// Returns a sink that invokes `callback` before forwarding each state to this sink.
+    #[must_use]
+    pub fn with_callback<F>(self, callback: F) -> Self
+    where
+        F: Fn(SocketState) + Send + Sync + 'static,
+    {
+        let Self {
+            callback: forwarded,
+            transition_lock,
+        } = self;
+
+        Self {
+            callback: Arc::new(move |state| {
+                callback(state);
+                forwarded(state);
+            }),
+            transition_lock,
+        }
+    }
+
     pub(crate) fn transition(
         &self,
         value: &AtomicU8,
@@ -59,26 +87,41 @@ impl SocketStateSink {
         next: ConnectionMode,
         state: SocketState,
     ) -> bool {
+        self.transition_result(value, current, next, state).is_ok()
+    }
+
+    pub(crate) fn transition_result(
+        &self,
+        value: &AtomicU8,
+        current: ConnectionMode,
+        next: ConnectionMode,
+        state: SocketState,
+    ) -> Result<(), ConnectionMode> {
         let _guard = self
             .transition_lock
             .lock()
             .expect("socket state sink transition lock poisoned");
 
-        if value
-            .compare_exchange(
-                current.as_u8(),
-                next.as_u8(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return false;
+        if let Err(actual) = value.compare_exchange(
+            current.as_u8(),
+            next.as_u8(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            return Err(ConnectionMode::from_u8(actual));
         }
 
         self.notify(state);
 
-        true
+        Ok(())
+    }
+
+    pub(crate) fn publish_websocket(&self, state: SocketState) {
+        let _guard = self
+            .transition_lock
+            .lock()
+            .expect("socket state sink transition lock poisoned");
+        self.notify(state);
     }
 
     pub(crate) fn close_on_loss(&self, value: &AtomicU8) -> bool {
@@ -182,6 +225,28 @@ mod tests {
     }
 
     #[rstest]
+    fn state_sink_with_callback_runs_before_forwarded_sink() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let forwarded_calls = Arc::clone(&calls);
+        let sink = SocketStateSink::new(move |_| {
+            forwarded_calls.lock().unwrap().push("forwarded");
+        });
+        let transition_lock = Arc::clone(&sink.transition_lock);
+        let callback_calls = Arc::clone(&calls);
+        let sink = sink.with_callback(move |_| {
+            callback_calls.lock().unwrap().push("callback");
+        });
+        let mode = AtomicU8::new(ConnectionMode::Reconnect.as_u8());
+
+        assert_eq!(
+            ConnectionMode::complete_reconnect_with_sink(&mode, Some(&sink)),
+            ReconnectOutcome::Reconnected
+        );
+        assert!(Arc::ptr_eq(&sink.transition_lock, &transition_lock));
+        assert_eq!(*calls.lock().unwrap(), vec!["callback", "forwarded"]);
+    }
+
+    #[rstest]
     fn state_sink_reports_one_concurrent_loss() {
         let states = Arc::new(Mutex::new(Vec::new()));
         let states_callback = Arc::clone(&states);
@@ -241,7 +306,7 @@ mod tests {
             let mode = Arc::clone(&mode);
             move || {
                 barrier.wait();
-                ConnectionMode::close_on_loss(&mode, Some(&sink))
+                ConnectionMode::close_websocket_on_loss(&mode, Some(&sink))
             }
         });
 
@@ -313,7 +378,7 @@ mod tests {
         });
         let mode = AtomicU8::new(ConnectionMode::Reconnect.as_u8());
 
-        assert!(ConnectionMode::close_on_loss(&mode, Some(&sink)));
+        assert!(ConnectionMode::close_websocket_on_loss(&mode, Some(&sink)));
 
         assert_eq!(ConnectionMode::from_atomic(&mode), ConnectionMode::Closed);
         assert_eq!(*states.lock().unwrap(), Vec::new());

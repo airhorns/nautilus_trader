@@ -28,7 +28,7 @@ use jiff::Timestamp;
 use nautilus_core::{
     from_pydict,
     nanos::UnixNanos,
-    python::{to_pyruntime_err, to_pyvalue_err},
+    python::{to_pyruntime_err, to_pyvalue_err, upgrade_py_weakref},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{
@@ -56,7 +56,7 @@ use nautilus_model::{
 use pyo3::{
     IntoPyObjectExt,
     prelude::*,
-    types::{PyBytes, PyDict, PyList},
+    types::{PyBytes, PyDict, PyList, PyWeakrefReference},
 };
 use ustr::Ustr;
 
@@ -81,6 +81,7 @@ use crate::{
         clock::PyClock,
         indicators::{registered_python_indicators, wrap_python_indicator},
         logging::PyLogger,
+        wrappers::retain_python_wrapper,
     },
     signal::Signal,
     timer::{TimeEvent, TimeEventCallback},
@@ -199,7 +200,7 @@ impl ImportableActorConfig {
 /// and the global registries without copying.
 pub struct PyDataActorInner {
     core: DataActorCore,
-    py_self: Option<Py<PyAny>>,
+    py_self: Option<Py<PyWeakrefReference>>,
     config: Option<Py<PyAny>>,
     clock: PyClock,
     logger: PyLogger,
@@ -209,7 +210,10 @@ impl Debug for PyDataActorInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(PyDataActorInner))
             .field("core", &self.core)
-            .field("py_self", &self.py_self.as_ref().map(|_| "<Py<PyAny>>"))
+            .field(
+                "py_self",
+                &self.py_self.as_ref().map(|_| "<Py<PyWeakrefReference>>"),
+            )
             .field("config", &self.config.as_ref().map(|_| "<Py<PyAny>>"))
             .field("clock", &self.clock)
             .field("logger", &self.logger)
@@ -283,7 +287,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_order(&mut self, order: OrderAny) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| -> PyResult<()> {
                 let py_order = order_any_to_pyobject(py, order)?;
                 py_self.call_method1(py, "on_order", (py_order,))?;
@@ -298,7 +302,7 @@ impl PyDataActorInner {
         order_list: OrderList,
         orders: Vec<OrderAny>,
     ) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| -> PyResult<()> {
                 if py_self.bind(py).hasattr("on_order_list")? {
                     let py_order_list = order_list.into_py_any(py)?;
@@ -322,56 +326,56 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_start(&self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_start"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_stop(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_stop"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_resume(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_resume"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_reset(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_reset"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_dispose(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_dispose"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_degrade(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_degrade"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_fault(&mut self) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method0(py, "on_fault"))?;
         }
         Ok(())
     }
 
     fn dispatch_on_save(&self) -> PyResult<IndexMap<String, Vec<u8>>> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_state = py_self.call_method0(py, "on_save")?;
                 let py_state: &Bound<'_, PyDict> = py_state.cast_bound::<PyDict>(py)?;
@@ -383,7 +387,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_load(&mut self, state: &IndexMap<String, Vec<u8>>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| -> PyResult<()> {
                 let py_state = state_to_pydict(py, state)?;
                 py_self.call_method1(py, "on_load", (py_state,))?;
@@ -394,7 +398,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_time_event(&mut self, event: TimeEvent) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_time_event", (event.into_py_any(py)?,))
             })?;
@@ -403,14 +407,14 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_data(&mut self, data: Py<PyAny>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_data", (data,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_signal(&mut self, signal: &Signal) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_signal", (signal.clone().into_py_any(py)?,))
             })?;
@@ -419,7 +423,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_queue_state(&mut self, event: &QueueStateChanged) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_queue_state", (event.clone().into_py_any(py)?,))
             })?;
@@ -428,7 +432,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_socket_state(&mut self, event: &SocketStateChanged) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_socket_state", (event.clone().into_py_any(py)?,))
             })?;
@@ -437,35 +441,35 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_instrument(&mut self, instrument: Py<PyAny>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_instrument", (instrument,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_quote(&mut self, quote: QuoteTick) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_quote", (quote.into_py_any(py)?,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_trade(&mut self, trade: TradeTick) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_trade", (trade.into_py_any(py)?,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_bar(&mut self, bar: Bar) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_bar", (bar.into_py_any(py)?,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_book_deltas(&mut self, deltas: OrderBookDeltas) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_book_deltas", (deltas.into_py_any(py)?,))
             })?;
@@ -474,7 +478,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_book_depth(&mut self, depth: &OrderBookDepth10) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_book_depth", ((*depth).into_py_any(py)?,))
             })?;
@@ -483,7 +487,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_book(&mut self, book: &OrderBook) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_book", (book.clone().into_py_any(py)?,))
             })?;
@@ -492,7 +496,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_mark_price(&mut self, mark_price: MarkPriceUpdate) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_mark_price", (mark_price.into_py_any(py)?,))
             })?;
@@ -501,7 +505,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_index_price(&mut self, index_price: IndexPriceUpdate) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_index_price", (index_price.into_py_any(py)?,))
             })?;
@@ -510,7 +514,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_funding_rate(&mut self, funding_rate: FundingRateUpdate) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_funding_rate", (funding_rate.into_py_any(py)?,))
             })?;
@@ -519,7 +523,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_instrument_status(&mut self, data: InstrumentStatus) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_instrument_status", (data.into_py_any(py)?,))
             })?;
@@ -528,7 +532,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_instrument_close(&mut self, update: InstrumentClose) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_instrument_close", (update.into_py_any(py)?,))
             })?;
@@ -537,7 +541,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_option_greeks(&mut self, greeks: OptionGreeks) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_option_greeks", (greeks.into_py_any(py)?,))
             })?;
@@ -546,7 +550,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_option_chain(&mut self, slice: OptionChainSlice) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_option_chain", (slice.into_py_any(py)?,))
             })?;
@@ -555,14 +559,14 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_historical_data(&mut self, data: Py<PyAny>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_historical_data", (data,)))?;
         }
         Ok(())
     }
 
     fn dispatch_on_historical_book_deltas(&mut self, deltas: Vec<OrderBookDelta>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_deltas = deltas
                     .into_iter()
@@ -575,7 +579,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_historical_book_depth(&mut self, depths: Vec<OrderBookDepth10>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_depths = depths
                     .into_iter()
@@ -588,7 +592,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_historical_quotes(&mut self, quotes: Vec<QuoteTick>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_quotes = quotes
                     .into_iter()
@@ -601,7 +605,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_historical_trades(&mut self, trades: Vec<TradeTick>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_trades = trades
                     .into_iter()
@@ -617,7 +621,7 @@ impl PyDataActorInner {
         &mut self,
         funding_rates: Vec<FundingRateUpdate>,
     ) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_rates = funding_rates
                     .into_iter()
@@ -630,7 +634,7 @@ impl PyDataActorInner {
     }
 
     fn dispatch_on_historical_bars(&mut self, bars: Vec<Bar>) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_bars = bars
                     .into_iter()
@@ -646,7 +650,7 @@ impl PyDataActorInner {
         &mut self,
         mark_prices: Vec<MarkPriceUpdate>,
     ) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_prices = mark_prices
                     .into_iter()
@@ -662,7 +666,7 @@ impl PyDataActorInner {
         &mut self,
         index_prices: Vec<IndexPriceUpdate>,
     ) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_prices = index_prices
                     .into_iter()
@@ -676,7 +680,7 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_block(&mut self, block: Block) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_block", (block.into_py_any(py)?,)))?;
         }
         Ok(())
@@ -684,7 +688,7 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_pool(&mut self, pool: Pool) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| py_self.call_method1(py, "on_pool", (pool.into_py_any(py)?,)))?;
         }
         Ok(())
@@ -692,7 +696,7 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_pool_swap(&mut self, swap: PoolSwap) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_pool_swap", (swap.into_py_any(py)?,))
             })?;
@@ -702,7 +706,7 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_pool_liquidity_update(&mut self, update: PoolLiquidityUpdate) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_pool_liquidity_update", (update.into_py_any(py)?,))
             })?;
@@ -712,7 +716,7 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_pool_fee_collect(&mut self, collect: PoolFeeCollect) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_pool_fee_collect", (collect.into_py_any(py)?,))
             })?;
@@ -722,12 +726,18 @@ impl PyDataActorInner {
 
     #[cfg(feature = "defi")]
     fn dispatch_on_pool_flash(&mut self, flash: PoolFlash) -> PyResult<()> {
-        if let Some(ref py_self) = self.py_self {
+        if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_pool_flash", (flash.into_py_any(py)?,))
             })?;
         }
         Ok(())
+    }
+
+    // The trader owns the wrapper for as long as the actor stays registered, so a collected
+    // wrapper propagates as an error rather than a skipped callback.
+    fn python_instance(&self) -> PyResult<Option<Py<PyAny>>> {
+        upgrade_py_weakref(self.py_self.as_ref(), &self.core.actor_id)
     }
 }
 
@@ -767,7 +777,8 @@ fn pydict_to_state(state: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, Vec<u
     module = "nautilus_trader.common",
     name = "DataActor",
     unsendable,
-    subclass
+    subclass,
+    weakref
 )]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 pub struct PyDataActor {
@@ -864,15 +875,22 @@ impl PyDataActor {
     /// to the original Python instance that contains this `PyDataActor`. This is essential
     /// for Python inheritance to work correctly, allowing Python subclasses to override
     /// `DataActor` methods and have them called by the Rust system.
-    pub fn set_python_instance(&mut self, py_obj: Py<PyAny>) {
-        self.inner_mut().py_self = Some(py_obj);
+    ///
+    /// Only a weak reference is stored, so the caller keeps ownership of `py_obj`. The trader
+    /// owns registered wrappers; an unregistered actor stays collectable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `py_obj` cannot be weakly referenced.
+    pub fn set_python_instance(&mut self, py_obj: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner_mut().py_self = Some(PyWeakrefReference::new(py_obj)?.unbind());
+        Ok(())
     }
 
     /// Stores the original Python config object passed at construction.
     ///
-    /// Retained so the constructed instance exposes `.config` (matching v1) and so
-    /// instance-based registration can source the actor ID and logging flags from the
-    /// same single config object.
+    /// Retained so the constructed instance exposes `.config` and instance-based registration can
+    /// source the actor ID and logging flags from the same single config object.
     pub fn set_config(&mut self, config: Option<Py<PyAny>>) {
         self.inner_mut().config = config;
     }
@@ -887,6 +905,7 @@ impl PyDataActor {
         let inner = self.inner_mut();
         inner.core.config.actor_id = Some(actor_id);
         inner.core.actor_id = actor_id;
+        inner.logger = PyLogger::new(actor_id.as_str());
     }
 
     /// Updates the `log_events` setting in the core config.
@@ -942,27 +961,46 @@ impl PyDataActor {
         inner.initialize()
     }
 
-    /// Registers this actor in the global component and actor registries.
+    /// Registers this actor in the global component, actor, and wrapper registries.
     ///
     /// Clones the internal `Rc` and inserts into both registries. This ensures
-    /// Python and the registries share the exact same actor instance.
-    pub fn register_in_global_registries(&self) {
+    /// Python and the registries share the exact same actor instance. The Python wrapper is
+    /// retained as part of the same act, so a registered actor always has an owner for the
+    /// wrapper its inner only weakly references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no Python wrapper is attached, or if the attached wrapper has already
+    /// been collected. Nothing is registered in that case.
+    pub fn register_in_global_registries(&self) -> PyResult<()> {
         let inner = self.inner();
-        let component_id = inner.component_id().inner();
+        let component_id = inner.component_id();
         let actor_id = Actor::id(inner);
+
+        let Some(wrapper) = inner.python_instance()? else {
+            return Err(to_pyruntime_err(format!(
+                "Cannot register actor {actor_id} without a Python wrapper, call `set_python_instance` first"
+            )));
+        };
 
         let inner_ref: Rc<UnsafeCell<PyDataActorInner>> = self.inner.clone();
 
         let component_trait_ref: Rc<UnsafeCell<dyn Component>> = inner_ref.clone();
-        with_component_registry(|registry| registry.insert(component_id, component_trait_ref));
+        with_component_registry(|registry| {
+            registry.insert(component_id.inner(), component_trait_ref);
+        });
 
         let actor_trait_ref: Rc<UnsafeCell<dyn Actor>> = inner_ref;
         with_actor_registry(|registry| registry.insert(actor_id, actor_trait_ref));
+
+        retain_python_wrapper(component_id, wrapper);
+
+        Ok(())
     }
 }
 
 pub fn register_python_exec_algorithm_endpoint(exec_algorithm_id: ExecAlgorithmId) {
-    let actor_id = Ustr::from(exec_algorithm_id.inner().as_str());
+    let actor_id = exec_algorithm_id.inner();
     let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
     let handler = ShareableMessageHandler::from_typed(move |command: &TradingCommand| {
         if let Some(mut algo) = try_get_actor_unchecked::<PyDataActorInner>(&actor_id) {
@@ -1243,14 +1281,24 @@ impl PyDataActor {
     }
 
     #[pyo3(signature = (config=None))]
-    fn __init__(slf: &Bound<'_, Self>, config: Option<Py<PyAny>>) {
-        let py_self: Py<PyAny> = slf.clone().unbind().into_any();
-        let mut borrowed = slf.borrow_mut();
-        borrowed.set_python_instance(py_self);
-        // `__new__` retained the config; only a forwarded config overrides it
-        if config.is_some() {
-            borrowed.set_config(config);
+    fn __init__(slf: &Bound<'_, Self>, config: Option<Py<PyAny>>) -> PyResult<()> {
+        {
+            let mut borrowed = slf.borrow_mut();
+            borrowed.set_python_instance(slf.as_any())?;
+            // `__new__` retained the config; only a forwarded config overrides it
+            if config.is_some() {
+                borrowed.set_config(config);
+            }
         }
+
+        if !has_configured_actor_id(slf) {
+            let py_type = slf.get_type();
+            let type_name = py_type.name()?;
+            let actor_id = ActorId::new_checked(type_name.to_str()?).map_err(to_pyvalue_err)?;
+            slf.borrow_mut().set_actor_id(actor_id);
+        }
+
+        Ok(())
     }
 
     #[getter]
@@ -1402,8 +1450,10 @@ impl PyDataActor {
     }
 
     #[pyo3(name = "publish_data")]
-    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) {
+    fn py_publish_data(&self, data_type: &DataType, data: &CustomData) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner().publish_data(data_type, data);
+        Ok(())
     }
 
     #[pyo3(name = "publish_signal")]
@@ -1419,7 +1469,7 @@ impl PyDataActor {
         value: Py<PyAny>,
         ts_event: u64,
     ) -> PyResult<()> {
-        // Accept any int / float / str / bool - match v1 behaviour by coercing with `str(value)`.
+        self.ensure_registered_for_data()?;
         let value_str: String = value.bind(py).str()?.extract()?;
         self.inner()
             .publish_signal(name, value_str, UnixNanos::from(ts_event));
@@ -1428,6 +1478,7 @@ impl PyDataActor {
 
     #[pyo3(name = "add_synthetic")]
     fn py_add_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner()
             .add_synthetic(synthetic)
             .map_err(to_pyvalue_err)
@@ -1435,6 +1486,7 @@ impl PyDataActor {
 
     #[pyo3(name = "update_synthetic")]
     fn py_update_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
+        self.ensure_registered_for_data()?;
         self.inner()
             .update_synthetic(synthetic)
             .map_err(to_pyvalue_err)
@@ -1608,6 +1660,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_data(self.inner_mut(), data_type, client_id, params);
         Ok(())
@@ -1615,20 +1668,26 @@ impl PyDataActor {
 
     #[pyo3(name = "subscribe_signal")]
     #[pyo3(signature = (name="", priority=None))]
-    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) {
+    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::subscribe_signal(self.inner_mut(), name, priority);
+        Ok(())
     }
 
     #[pyo3(name = "subscribe_queue_state")]
     #[pyo3(signature = (priority=None))]
-    fn py_subscribe_queue_state(&mut self, priority: Option<u32>) {
+    fn py_subscribe_queue_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::subscribe_queue_state(self.inner_mut(), priority);
+        Ok(())
     }
 
     #[pyo3(name = "subscribe_socket_state")]
     #[pyo3(signature = (priority=None))]
-    fn py_subscribe_socket_state(&mut self, priority: Option<u32>) {
+    fn py_subscribe_socket_state(&mut self, priority: Option<u32>) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::subscribe_socket_state(self.inner_mut(), priority);
+        Ok(())
     }
 
     #[pyo3(name = "subscribe_instruments")]
@@ -1640,6 +1699,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instruments(self.inner_mut(), venue, client_id, params);
         Ok(())
@@ -1654,6 +1714,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1672,6 +1733,7 @@ impl PyDataActor {
         managed: bool,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         let depth = depth.and_then(NonZeroUsize::new);
         DataActor::subscribe_book_deltas(
@@ -1697,6 +1759,7 @@ impl PyDataActor {
         managed: bool,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_book_depth10(
             self.inner_mut(),
@@ -1722,11 +1785,12 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let params = dict_to_params(py, params)?;
-        let depth = depth.and_then(NonZeroUsize::new);
         let interval_ms = NonZeroUsize::new(interval_ms)
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
+        self.ensure_registered()?;
+        let params = dict_to_params(py, params)?;
+        let depth = depth.and_then(NonZeroUsize::new);
         DataActor::subscribe_book_at_interval(
             self.inner_mut(),
             instrument_id,
@@ -1748,6 +1812,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_quotes(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1762,6 +1827,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_trades(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1776,6 +1842,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_bars(self.inner_mut(), bar_type, client_id, params);
         Ok(())
@@ -1790,6 +1857,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_mark_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1804,6 +1872,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_index_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1818,6 +1887,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_funding_rates(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1832,6 +1902,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_option_greeks(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1846,6 +1917,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument_status(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1860,6 +1932,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_instrument_close(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1876,6 +1949,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_option_chain(
             self.inner_mut(),
@@ -1897,6 +1971,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_data(self.inner_mut(), data_type, client_id, params);
         Ok(())
@@ -1904,18 +1979,24 @@ impl PyDataActor {
 
     #[pyo3(name = "unsubscribe_signal")]
     #[pyo3(signature = (name=""))]
-    fn py_unsubscribe_signal(&mut self, name: &str) {
+    fn py_unsubscribe_signal(&mut self, name: &str) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_signal(self.inner_mut(), name);
+        Ok(())
     }
 
     #[pyo3(name = "unsubscribe_queue_state")]
-    fn py_unsubscribe_queue_state(&mut self) {
+    fn py_unsubscribe_queue_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_queue_state(self.inner_mut());
+        Ok(())
     }
 
     #[pyo3(name = "unsubscribe_socket_state")]
-    fn py_unsubscribe_socket_state(&mut self) {
+    fn py_unsubscribe_socket_state(&mut self) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_socket_state(self.inner_mut());
+        Ok(())
     }
 
     #[pyo3(name = "unsubscribe_instruments")]
@@ -1927,6 +2008,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instruments(self.inner_mut(), venue, client_id, params);
         Ok(())
@@ -1941,6 +2023,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1955,6 +2038,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_deltas(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1969,6 +2053,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_depth10(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -1984,10 +2069,11 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let params = dict_to_params(py, params)?;
         let interval_ms = NonZeroUsize::new(interval_ms)
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
+        self.ensure_registered()?;
+        let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_at_interval(
             self.inner_mut(),
             instrument_id,
@@ -2007,6 +2093,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_quotes(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2021,6 +2108,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_trades(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2035,6 +2123,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_bars(self.inner_mut(), bar_type, client_id, params);
         Ok(())
@@ -2049,6 +2138,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_mark_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2063,6 +2153,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_index_prices(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2077,6 +2168,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_funding_rates(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2091,6 +2183,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_option_greeks(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2105,6 +2198,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument_status(
             self.inner_mut(),
@@ -2124,6 +2218,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_instrument_close(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2135,8 +2230,10 @@ impl PyDataActor {
         &mut self,
         series_id: OptionSeriesId,
         client_id: Option<ClientId>,
-    ) {
+    ) -> PyResult<()> {
+        self.ensure_registered()?;
         DataActor::unsubscribe_option_chain(self.inner_mut(), series_id, client_id);
+        Ok(())
     }
 
     #[pyo3(name = "request_data")]
@@ -2152,6 +2249,7 @@ impl PyDataActor {
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_data(
@@ -2178,6 +2276,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let request_id = DataActor::request_instrument(
             self.inner_mut(),
@@ -2202,6 +2301,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let request_id =
             DataActor::request_instruments(self.inner_mut(), venue, start, end, client_id, params)
@@ -2219,6 +2319,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let depth = depth.and_then(NonZeroUsize::new);
 
@@ -2246,6 +2347,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_book_deltas(
@@ -2275,6 +2377,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let depth = depth.and_then(NonZeroUsize::new);
@@ -2305,6 +2408,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_quotes(
@@ -2333,6 +2437,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_trades(
@@ -2361,6 +2466,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_funding_rates(
@@ -2389,6 +2495,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
+        self.ensure_registered_for_data()?;
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_bars(
@@ -2402,6 +2509,12 @@ impl PyDataActor {
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
+    }
+
+    /// Requests reconnect of one socket endpoint owned by `client_id`.
+    #[pyo3(name = "reconnect_socket")]
+    fn py_reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> PyResult<()> {
+        DataActor::reconnect_socket(self.inner(), client_id, endpoint).map_err(to_pyruntime_err)
     }
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -2492,6 +2605,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_blocks(self.inner_mut(), chain, client_id, params);
         Ok(())
@@ -2506,6 +2620,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2520,6 +2635,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_swaps(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2534,6 +2650,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_liquidity_updates(
             self.inner_mut(),
@@ -2553,6 +2670,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_fee_collects(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2567,6 +2685,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::subscribe_pool_flash_events(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2581,6 +2700,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_blocks(self.inner_mut(), chain, client_id, params);
         Ok(())
@@ -2595,6 +2715,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2609,6 +2730,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_swaps(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
@@ -2623,6 +2745,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_liquidity_updates(
             self.inner_mut(),
@@ -2642,6 +2765,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_fee_collects(
             self.inner_mut(),
@@ -2661,6 +2785,7 @@ impl PyDataActor {
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_pool_flash_events(
             self.inner_mut(),
@@ -2670,6 +2795,75 @@ impl PyDataActor {
         );
         Ok(())
     }
+}
+
+impl PyDataActor {
+    fn ensure_registered_for_data(&self) -> PyResult<()> {
+        if self.inner().core.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "DataActor must be registered before publishing, managing synthetics, or requesting data",
+            ))
+        }
+    }
+
+    fn ensure_registered(&self) -> PyResult<()> {
+        if self.inner().core.is_registered() {
+            Ok(())
+        } else {
+            Err(to_pyruntime_err(
+                "DataActor must be registered before managing subscriptions",
+            ))
+        }
+    }
+}
+
+/// Applies the runtime Python class of `actor_obj` as the actor ID when neither the config nor
+/// `DataActor.__init__` supplied one.
+///
+/// Registration paths call this so an actor whose subclass does not forward to
+/// `super().__init__()` still registers under its own class rather than the shared default.
+///
+/// # Errors
+///
+/// Returns an error if the class name is not a valid actor ID.
+pub fn apply_class_derived_actor_id(
+    actor: &mut PyRefMut<'_, PyDataActor>,
+    actor_obj: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    if actor.inner().core.config.actor_id.is_some() {
+        return Ok(());
+    }
+
+    let py_type = actor_obj.get_type();
+    let type_name = py_type.name()?;
+    let actor_id = ActorId::new_checked(type_name.to_str()?).map_err(to_pyvalue_err)?;
+    actor.set_actor_id(actor_id);
+
+    Ok(())
+}
+
+/// Returns whether the config retained by the actor supplies an actor ID.
+///
+/// The config is read through Python rather than the extracted [`DataActorConfig`] so that a
+/// custom subclass config which cannot be extracted still counts as configuring an ID. The actor
+/// borrow is released before the attribute lookup, which can run user code.
+fn has_configured_actor_id(slf: &Bound<'_, PyDataActor>) -> bool {
+    let py = slf.py();
+    let config = slf
+        .borrow()
+        .inner()
+        .config
+        .as_ref()
+        .map(|config| config.clone_ref(py));
+
+    config.is_some_and(|config| {
+        config
+            .bind(py)
+            .getattr("actor_id")
+            .is_ok_and(|actor_id| !actor_id.is_none())
+    })
 }
 
 #[cfg(test)]
@@ -2698,7 +2892,7 @@ mod tests {
         enums::{
             AggressorSide, BookType, GreeksConvention, InstrumentCloseType, MarketStatusAction,
         },
-        identifiers::{ClientId, OptionSeriesId, TradeId, TraderId, Venue},
+        identifiers::{ActorId, ClientId, ComponentId, OptionSeriesId, TradeId, TraderId, Venue},
         instruments::{CurrencyPair, InstrumentAny, stubs::audusd_sim},
         orderbook::OrderBook,
         types::{Price, Quantity},
@@ -2706,25 +2900,28 @@ mod tests {
     use pyo3::{
         Bound, Py, PyAny, PyResult, Python,
         ffi::c_str,
-        types::{PyAnyMethods, PyBytes, PyDict, PyList},
+        types::{PyAnyMethods, PyBytes, PyDict, PyList, PyWeakrefMethods, PyWeakrefReference},
     };
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
     use super::PyDataActor;
     use crate::{
-        actor::DataActor,
+        actor::{DataActor, data_actor::DataActorConfig, registry::actor_exists},
         cache::Cache,
         clock::TestClock,
-        component::Component,
+        component::{Component, get_component},
         enums::ComponentState,
+        live::runner::replace_system_command_sender,
         messages::{
+            SystemCommand,
             data::{BarsResponse, CustomDataResponse, QuotesResponse, TradesResponse},
             system::{
                 QueueCondition, QueueState, QueueStateChanged, SocketState, SocketStateChanged,
             },
         },
         msgbus::{self, MessageBus, MessagingSwitchboard, get_message_bus},
+        python::wrappers::get_python_wrapper,
         runner::{SyncDataCommandSender, SystemChannel, set_data_cmd_sender},
         signal::Signal,
         timer::TimeEvent,
@@ -2957,7 +3154,7 @@ mod tests {
         });
         msgbus::subscribe_any(topic.into(), handler, None);
 
-        actor.py_publish_data(&data.data_type, &data);
+        actor.py_publish_data(&data.data_type, &data).unwrap();
 
         let received = received.borrow();
         assert_eq!(received.len(), 1);
@@ -3076,10 +3273,10 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("example", None);
-        actor.py_unsubscribe_signal("example");
-        actor.py_subscribe_signal("", None);
-        actor.py_unsubscribe_signal("");
+        actor.py_subscribe_signal("example", None).unwrap();
+        actor.py_unsubscribe_signal("example").unwrap();
+        actor.py_subscribe_signal("", None).unwrap();
+        actor.py_unsubscribe_signal("").unwrap();
     }
 
     #[rstest]
@@ -3093,13 +3290,68 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("trigger", Some(50));
+        actor.py_subscribe_signal("trigger", Some(50)).unwrap();
 
         // The PyO3 binding must forward the priority to the bus unchanged.
         let topic = get_signal_topic("trigger");
         let subs = get_message_bus().borrow_mut().matching_subscriptions(topic);
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].priority, 50);
+    }
+
+    #[rstest]
+    fn test_register_in_global_registries_retains_python_wrapper(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let py_actor = create_tracking_python_actor(py).unwrap();
+
+            let mut rust_actor = PyDataActor::new(Some(DataActorConfig {
+                actor_id: Some(ActorId::from("RETAINED-ACTOR")),
+                ..Default::default()
+            }));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
+            rust_actor.register(trader_id, clock, cache).unwrap();
+
+            rust_actor.register_in_global_registries().unwrap();
+
+            let retained = get_python_wrapper(ComponentId::from("RETAINED-ACTOR"))
+                .expect("registering must retain the actor's Python wrapper");
+
+            assert!(retained.bind(py).is(py_actor.bind(py)));
+            assert!(get_component(&Ustr::from("RETAINED-ACTOR")).is_some());
+            assert!(actor_exists(&Ustr::from("RETAINED-ACTOR")));
+        });
+    }
+
+    #[rstest]
+    fn test_register_in_global_registries_rejects_missing_python_wrapper(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|_py| {
+            let mut rust_actor = PyDataActor::new(Some(DataActorConfig {
+                actor_id: Some(ActorId::from("UNWRAPPED-ACTOR")),
+                ..Default::default()
+            }));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+
+            let error = rust_actor
+                .register_in_global_registries()
+                .expect_err("registering without a Python wrapper must fail");
+
+            assert!(error.to_string().contains("without a Python wrapper"));
+            assert!(get_component(&Ustr::from("UNWRAPPED-ACTOR")).is_none());
+            assert!(!actor_exists(&Ustr::from("UNWRAPPED-ACTOR")));
+            assert!(get_python_wrapper(ComponentId::from("UNWRAPPED-ACTOR")).is_none());
+        });
     }
 
     #[rstest]
@@ -3118,9 +3370,9 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
             let data = stub_custom_data(1, 42, None, None);
@@ -3128,8 +3380,8 @@ mod tests {
                 .py_subscribe_data(py, data.data_type.clone(), None, None)
                 .unwrap();
 
-            rust_actor.py_publish_data(&data.data_type, &data);
-            rust_actor.py_publish_data(&data.data_type, &data);
+            rust_actor.py_publish_data(&data.data_type, &data).unwrap();
+            rust_actor.py_publish_data(&data.data_type, &data).unwrap();
 
             assert!(python_method_was_called(&py_actor, py, "on_data"));
             assert_eq!(python_method_call_count(&py_actor, py, "on_data"), 2);
@@ -3152,12 +3404,12 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None);
+            rust_actor.py_subscribe_signal("example", None).unwrap();
             let val1: Py<PyAny> = "1.5".into_py_any_unwrap(py);
             let val2: Py<PyAny> = 2.0_f64.into_py_any_unwrap(py);
             rust_actor
@@ -3188,19 +3440,19 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None);
+            rust_actor.py_subscribe_signal("example", None).unwrap();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             rust_actor
                 .py_publish_signal(py, "example", val1, 0)
                 .unwrap();
 
-            rust_actor.py_unsubscribe_signal("example");
+            rust_actor.py_unsubscribe_signal("example").unwrap();
             rust_actor
                 .py_publish_signal(py, "example", val2, 0)
                 .unwrap();
@@ -3223,11 +3475,11 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
-            rust_actor.py_subscribe_queue_state(Some(50));
+            rust_actor.py_subscribe_queue_state(Some(50)).unwrap();
 
             let topic = MessagingSwitchboard::queue_state_changed_topic();
             let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
@@ -3244,7 +3496,7 @@ mod tests {
                 .unwrap();
             assert_eq!(received, triggered);
 
-            rust_actor.py_unsubscribe_queue_state();
+            rust_actor.py_unsubscribe_queue_state().unwrap();
             let cleared = sample_queue_state_changed(QueueState::Cleared);
             msgbus::publish_any(topic, &cleared);
 
@@ -3266,11 +3518,11 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
-            rust_actor.py_subscribe_socket_state(Some(50));
+            rust_actor.py_subscribe_socket_state(Some(50)).unwrap();
 
             let topic = MessagingSwitchboard::socket_state_changed_topic();
             let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
@@ -3287,7 +3539,7 @@ mod tests {
                 .unwrap();
             assert_eq!(received, connected);
 
-            rust_actor.py_unsubscribe_socket_state();
+            rust_actor.py_unsubscribe_socket_state().unwrap();
             let disconnected = sample_socket_state_changed(SocketState::Disconnected);
             msgbus::publish_any(topic, &disconnected);
 
@@ -3314,12 +3566,12 @@ mod tests {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("", None);
+            rust_actor.py_subscribe_signal("", None).unwrap();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             let val3: Py<PyAny> = "3".into_py_any_unwrap(py);
@@ -3376,9 +3628,9 @@ class CapturingActor:
             let py_actor: Py<PyAny> = cls.call0().unwrap().unbind();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
-            rust_actor.register_in_global_registries();
+            rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
             // Subscribe as custom-data for the signal's advertised DataType
@@ -3540,6 +3792,46 @@ class CapturingActor:
         assert_eq!(state, ComponentState::Ready);
     }
 
+    #[rstest]
+    fn test_python_reconnect_socket_enqueues_typed_command(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+        replace_system_command_sender(system_tx);
+        let actor = create_registered_actor(clock, cache, trader_id);
+
+        actor
+            .py_reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+            .expect("valid reconnect command");
+        let command = system_rx
+            .try_recv()
+            .expect("reconnect command should be queued");
+        let SystemCommand::ReconnectSocket(command) = command;
+
+        assert_eq!(command.trader_id, trader_id);
+        assert_eq!(command.client_id, ClientId::from("POLYMARKET"));
+        assert_eq!(command.endpoint.as_str(), "polymarket-market-streams");
+        assert_eq!(command.ts_init, UnixNanos::default());
+    }
+
+    #[rstest]
+    fn test_python_reconnect_socket_returns_errors_without_panicking() {
+        let actor = create_unregistered_actor();
+
+        assert!(
+            actor
+                .py_reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+                .is_err()
+        );
+        assert!(
+            actor
+                .py_reconnect_socket(ClientId::from("POLYMARKET"), "wss://secret.example")
+                .is_err()
+        );
+    }
+
     fn sample_instrument() -> CurrencyPair {
         audusd_sim()
     }
@@ -3612,7 +3904,7 @@ class CapturingActor:
             instrument.id,
             Price::from("1.00000"),
             Quantity::from(100_000),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new("123456"),
             UnixNanos::default(),
             UnixNanos::default(),
@@ -4146,7 +4438,7 @@ class IndicatorEventActor:
         let py_actor = create_tracking_python_actor(py).unwrap();
 
         let mut rust_actor = PyDataActor::new(None);
-        rust_actor.set_python_instance(py_actor.clone_ref(py));
+        rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
         rust_actor.register(trader_id, clock, cache).unwrap();
 
         let result = invoke(&mut rust_actor);
@@ -4235,7 +4527,7 @@ class IndicatorEventActor:
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
 
             let saved = rust_actor.py_save(py).unwrap();
@@ -4327,7 +4619,7 @@ class IndicatorEventActor:
             let indicator = create_event_tracking_python_indicator(py, &events).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
             Component::start(rust_actor.inner_mut()).unwrap();
 
@@ -4393,7 +4685,7 @@ class IndicatorEventActor:
             let indicator = create_event_tracking_python_indicator(py, &events).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
 
             let quote = sample_quote();
@@ -4584,7 +4876,7 @@ class IndicatorEventActor:
             let indicator = create_raising_python_indicator(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
             Component::start(rust_actor.inner_mut()).unwrap();
 
@@ -4910,7 +5202,7 @@ class IndicatorEventActor:
             let py_actor = create_tracking_python_actor(py).unwrap();
 
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
 
             let quote = QuoteTick::new(
@@ -4943,7 +5235,7 @@ class IndicatorEventActor:
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
             let mut rust_actor = PyDataActor::new(None);
-            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.set_python_instance(py_actor.bind(py)).unwrap();
             rust_actor.register(trader_id, clock, cache).unwrap();
 
             let data = vec![
@@ -5074,5 +5366,28 @@ class IndicatorEventActor:
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unsupported type"));
+    }
+
+    #[rstest]
+    fn test_python_self_is_weak() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let instance = py
+                .get_type::<PyDataActor>()
+                .call0()
+                .expect("DataActor should construct");
+            let weakref =
+                PyWeakrefReference::new(&instance).expect("DataActor should be weak-referenceable");
+            assert!(weakref.upgrade().is_some());
+
+            drop(instance);
+
+            // A strong `py_self` would form an untraceable Rust-Python cycle and keep this alive
+            assert!(
+                weakref.upgrade().is_none(),
+                "an unregistered DataActor must be collected once its last Python owner is dropped",
+            );
+        });
     }
 }

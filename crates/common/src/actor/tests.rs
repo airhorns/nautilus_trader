@@ -44,8 +44,8 @@ use nautilus_model::{
         BookAction, BookType, GreeksConvention, OrderSide, OrderType, PositionSide, PriceType,
     },
     identifiers::{
-        AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OptionSeriesId, OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OptionSeriesId,
+        OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
     },
     instruments::{CurrencyPair, Instrument, InstrumentAny, SyntheticInstrument, stubs::*},
     orderbook::{OrderBook, own::OwnOrderBook},
@@ -78,7 +78,6 @@ use crate::{
     cache::Cache,
     clock::{Clock, TestClock},
     component::Component,
-    enums::{ComponentState, ComponentTrigger},
     logging::{logger::LogGuard, logging_is_initialized},
     messages::{
         data::{
@@ -106,6 +105,8 @@ use crate::{
     testing::init_logger_for_testing,
     timer::TimeEvent,
 };
+#[cfg(feature = "live")]
+use crate::{live::runner::replace_system_command_sender, messages::SystemCommand};
 
 /// Minimal custom data type for actor tests.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -216,32 +217,7 @@ struct TestDataActor {
 
 #[derive(Debug)]
 struct FacadeOnlyActor {
-    state: ComponentState,
     started: bool,
-}
-
-impl Component for FacadeOnlyActor {
-    fn component_id(&self) -> ComponentId {
-        ComponentId::new("FacadeOnlyActor")
-    }
-
-    fn state(&self) -> ComponentState {
-        self.state
-    }
-
-    fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
-        self.state = self.state.transition(&trigger)?;
-        Ok(())
-    }
-
-    fn register(
-        &mut self,
-        _trader_id: TraderId,
-        _clock: Rc<RefCell<dyn Clock>>,
-        _cache: Rc<RefCell<Cache>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 impl DataActor for FacadeOnlyActor {
@@ -553,14 +529,11 @@ fn register_data_actor(
 
 #[rstest]
 fn test_data_actor_facade_behavior_does_not_require_native_core_access() {
-    fn assert_data_actor<T: DataActor + Component>() {}
+    fn assert_data_actor<T: DataActor>() {}
 
     assert_data_actor::<FacadeOnlyActor>();
 
-    let mut actor = FacadeOnlyActor {
-        state: ComponentState::PreInitialized,
-        started: false,
-    };
+    let mut actor = FacadeOnlyActor { started: false };
 
     DataActor::on_start(&mut actor).unwrap();
     let state = DataActor::on_save(&actor).unwrap();
@@ -581,6 +554,15 @@ fn test_nautilus_actor_macro_custom_field_generates_native_core_access() {
 
     assert_eq!(DataActorNative::core(&actor).actor_id(), actor_id);
     assert_eq!(DataActorNative::core_mut(&mut actor).actor_id(), actor_id);
+}
+
+#[rstest]
+fn test_data_actor_default_actor_id_is_the_type_name() {
+    let first = TestDataActor::new(DataActorConfig::default());
+    let second = TestDataActor::new(DataActorConfig::default());
+
+    assert_eq!(first.actor_id(), ActorId::from("DataActor"));
+    assert_eq!(second.actor_id(), ActorId::from("DataActor"));
 }
 
 #[rstest]
@@ -4249,6 +4231,32 @@ fn test_socket_state_changed_reaches_typed_subscriber(
 
     let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     assert_eq!(actor.received_socket_state_changes, vec![event]);
+}
+
+#[cfg(feature = "live")]
+#[rstest]
+fn test_reconnect_socket_enqueues_typed_command(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_command_sender(system_tx);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor
+        .reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+        .expect("valid reconnect command");
+    drop(actor);
+
+    let SystemCommand::ReconnectSocket(command) =
+        system_rx.try_recv().expect("reconnect command queued");
+
+    assert_eq!(command.trader_id, trader_id);
+    assert_eq!(command.client_id, ClientId::from("POLYMARKET"));
+    assert_eq!(command.endpoint.as_str(), "polymarket-market-streams");
+    assert_eq!(command.ts_init, UnixNanos::default());
 }
 
 #[rstest]

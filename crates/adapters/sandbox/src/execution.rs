@@ -40,7 +40,7 @@ use nautilus_common::{
     },
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UnixNanos, WeakCell, datetime::NANOSECONDS_IN_SECOND};
+use nautilus_core::{Params, UnixNanos, WeakCell, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
     matching_engine::OrderMatchingEngine,
@@ -51,7 +51,7 @@ use nautilus_model::{
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
     enums::OmsType,
     events::{OrderEventAny, PositionEvent},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -76,8 +76,17 @@ struct SandboxInner {
     cache: Rc<RefCell<Cache>>,
     /// The sandbox configuration.
     config: SandboxExecutionClientConfig,
+    /// Shared fill-model handle for every matching engine on this client.
+    fill_model: FillModelHandle,
     /// Matching engines per instrument.
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
+    /// Last trade tick processed per instrument.
+    ///
+    /// Order submission primes a newly started sandbox from the shared cache. The cache retains
+    /// the last trade tick, which is a consumptive event and must never be replayed for every
+    /// subsequent submission: doing so can fill an order against a trade which occurred before
+    /// that order existed.
+    last_processed_trade_ids: AHashMap<InstrumentId, TradeId>,
     /// Next raw ID assigned to a matching engine.
     next_engine_raw_id: u32,
     /// Current account balances.
@@ -176,7 +185,7 @@ impl SandboxInner {
 
         if !self.matching_engines.contains_key(&instrument_id) {
             let engine_config = self.config.to_matching_engine_config();
-            let fill_model = FillModelHandle::default();
+            let fill_model = self.fill_model.clone();
             let fee_model = self
                 .config
                 .fee_model
@@ -245,6 +254,8 @@ impl SandboxInner {
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
                 engine.process_trade_tick(trade);
             }
+            self.last_processed_trade_ids
+                .insert(instrument_id, trade.trade_id);
         }
     }
 
@@ -364,6 +375,7 @@ impl SandboxInner {
         }
 
         self.matching_engines.remove(&instrument_id);
+        self.last_processed_trade_ids.remove(&instrument_id);
         self.cache
             .borrow_mut()
             .purge_instrument_skip_order_guard(instrument_id);
@@ -468,11 +480,18 @@ impl SandboxExecutionClient {
             balances.insert(money.currency.code.to_string(), *money);
         }
 
+        let fill_model = config
+            .fill_model
+            .clone()
+            .map(FillModelHandle::from)
+            .unwrap_or_default();
         let inner = Rc::new(RefCell::new(SandboxInner {
             clock: clock.clone(),
             cache: cache.clone(),
             config: config.clone(),
+            fill_model,
             matching_engines: AHashMap::new(),
+            last_processed_trade_ids: AHashMap::new(),
             next_engine_raw_id: 0,
             balances,
             event_handler: None,
@@ -804,6 +823,9 @@ impl SandboxExecutionClient {
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_trade_tick(trade);
         }
+        inner
+            .last_processed_trade_ids
+            .insert(instrument_id, trade.trade_id);
         Ok(())
     }
 
@@ -855,6 +877,7 @@ impl SandboxExecutionClient {
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
+        inner.last_processed_trade_ids.clear();
 
         inner.balances.clear();
         for money in &self.config.starting_balances {
@@ -927,11 +950,12 @@ impl ExecutionClient for SandboxExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         let ts_init = self.clock.borrow().timestamp_ns();
         let state = self
             .factory
-            .generate_account_state(balances, margins, reported, ts_event, ts_init);
+            .generate_account_state(balances, margins, reported, ts_event, ts_init, info);
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);
         self.sync_cached_account_config()?;
@@ -997,7 +1021,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
         let balances = self.get_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
-        self.generate_account_state(balances, vec![], false, ts_event)?;
+        self.generate_account_state(balances, vec![], false, ts_event, None)?;
 
         self.core.borrow().set_connected();
         log::info!(
@@ -1040,6 +1064,11 @@ impl ExecutionClient for SandboxExecutionClient {
 
         // Update matching engine with latest market data from cache
         let cache = self.cache.borrow();
+        let cached_trade = cache.trade(&instrument_id).filter(|trade| {
+            self.config.trade_execution
+                && inner.last_processed_trade_ids.get(&instrument_id) != Some(&trade.trade_id)
+                && check_trade_or_drop("cached trade tick", trade, &instrument)
+        });
 
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             if let Some(quote) = cache.quote(&instrument_id)
@@ -1048,12 +1077,14 @@ impl ExecutionClient for SandboxExecutionClient {
                 engine.process_quote_tick(quote);
             }
 
-            if self.config.trade_execution
-                && let Some(trade) = cache.trade(&instrument_id)
-                && check_trade_or_drop("cached trade tick", trade, &instrument)
-            {
+            if let Some(trade) = cached_trade {
                 engine.process_trade_tick(trade);
             }
+        }
+        if let Some(trade) = cached_trade {
+            inner
+                .last_processed_trade_ids
+                .insert(instrument_id, trade.trade_id);
         }
         drop(cache);
 
@@ -1105,6 +1136,12 @@ impl ExecutionClient for SandboxExecutionClient {
 
                 // Update with latest market data
                 let cache = self.cache.borrow();
+                let cached_trade = cache.trade(&instrument_id).filter(|trade| {
+                    self.config.trade_execution
+                        && inner.last_processed_trade_ids.get(&instrument_id)
+                            != Some(&trade.trade_id)
+                        && check_trade_or_drop("cached trade tick", trade, &instrument)
+                });
 
                 if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
                     if let Some(quote) = cache.quote(&instrument_id)
@@ -1113,12 +1150,14 @@ impl ExecutionClient for SandboxExecutionClient {
                         engine.process_quote_tick(quote);
                     }
 
-                    if self.config.trade_execution
-                        && let Some(trade) = cache.trade(&instrument_id)
-                        && check_trade_or_drop("cached trade tick", trade, &instrument)
-                    {
+                    if let Some(trade) = cached_trade {
                         engine.process_trade_tick(trade);
                     }
+                }
+                if let Some(trade) = cached_trade {
+                    inner
+                        .last_processed_trade_ids
+                        .insert(instrument_id, trade.trade_id);
                 }
                 drop(cache);
 
@@ -1196,7 +1235,7 @@ impl ExecutionClient for SandboxExecutionClient {
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
         let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
-        self.generate_account_state(balances, vec![], false, ts_event)?;
+        self.generate_account_state(balances, vec![], false, ts_event, None)?;
         Ok(())
     }
 

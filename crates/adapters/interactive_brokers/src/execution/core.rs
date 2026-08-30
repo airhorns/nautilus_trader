@@ -67,10 +67,10 @@ use nautilus_common::{
     msgbus::{send_account_state, switchboard::MessagingSwitchboard},
 };
 use nautilus_core::{
-    UUID4, UnixNanos,
+    Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
@@ -108,7 +108,7 @@ use crate::{
         parse::{ib_contract_to_instrument_id_simple, is_spread_instrument_id},
         shared_client::SharedClientHandle,
     },
-    config::InteractiveBrokersExecClientConfig,
+    config::InteractiveBrokersExecutionClientConfig,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
@@ -124,7 +124,7 @@ pub struct InteractiveBrokersExecutionClient {
     /// Core execution client functionality.
     core: ExecutionClientCore,
     /// Configuration for the client.
-    config: InteractiveBrokersExecClientConfig,
+    config: InteractiveBrokersExecutionClientConfig,
     /// Instrument provider.
     instrument_provider: Arc<InteractiveBrokersInstrumentProvider>,
     /// Connection state.
@@ -274,7 +274,7 @@ impl InteractiveBrokersExecutionClient {
     /// Returns an error if client creation fails.
     pub fn new(
         mut core: ExecutionClientCore,
-        config: InteractiveBrokersExecClientConfig,
+        config: InteractiveBrokersExecutionClientConfig,
         instrument_provider: Arc<InteractiveBrokersInstrumentProvider>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -500,6 +500,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         let factory = OrderEventFactory::new(
             self.core.trader_id,
@@ -513,6 +514,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             reported,
             ts_event,
             get_atomic_clock_realtime().get_time_ns(),
+            info,
         );
         get_exec_event_sender()
             .send(ExecutionEvent::Account(state))
@@ -690,7 +692,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         match crate::execution::account::subscribe_account_summary(&client_for_account, account_id)
             .await
         {
-            Ok((balances, margins)) => {
+            Ok((balances, margins, info)) => {
                 tracing::debug!(
                     "Received account summary: {} balances, {} margins",
                     balances.len(),
@@ -701,7 +703,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                 if let Err(e) = ExecutionClient::generate_account_state(
                     self, balances, margins, true, // reported
-                    ts_event,
+                    ts_event, info,
                 ) {
                     tracing::warn!("Failed to generate account state: {}", e);
                 }
@@ -1320,7 +1322,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .await;
 
             match result {
-                Ok(Ok((balances, margins))) => {
+                Ok(Ok((balances, margins, info))) => {
                     let ts_event = clock.get_time_ns();
                     let ts_now = clock.get_time_ns();
 
@@ -1334,7 +1336,8 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         ts_event,
                         ts_now,
                         base_currency,
-                    );
+                    )
+                    .with_info(info);
 
                     let endpoint = MessagingSwitchboard::portfolio_update_account();
                     send_account_state(endpoint, &account_state);
@@ -2163,6 +2166,22 @@ impl InteractiveBrokersExecutionClient {
             error,
             ibapi::Error::InvalidArgument(_) | ibapi::Error::ServerVersion(_, _, _)
         )
+    }
+
+    fn classify_order_submit_error(error: &ibapi::Error) -> CommandFailure {
+        let reason = error.to_string();
+
+        if Self::is_definitive_order_submit_error(error) {
+            CommandFailure::not_sent(reason)
+        } else if matches!(
+            error,
+            ibapi::Error::Notice(notice)
+                if notice.category() == ibapi::NoticeCategory::OrderRejection
+        ) {
+            CommandFailure::venue_rejected(reason)
+        } else {
+            CommandFailure::ambiguous(reason)
+        }
     }
 
     async fn handle_cancel_all_orders_async(

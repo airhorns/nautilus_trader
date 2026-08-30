@@ -18,12 +18,13 @@
 use nautilus_core::serialization::deserialize_empty_string_as_none;
 use rust_decimal::Decimal;
 use serde::{
-    Deserialize, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{
         DeserializeSeed, MapAccess, Visitor,
         value::{BorrowedStrDeserializer, MapAccessDeserializer},
     },
 };
+use serde_json::value::RawValue;
 use ustr::Ustr;
 
 use crate::common::{
@@ -37,6 +38,57 @@ use crate::common::{
         serialize_decimal_as_str, serialize_optional_decimal_as_str,
     },
 };
+
+/// A user-channel order status and its optional venue reason suffix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolymarketUserOrderStatus {
+    pub status: PolymarketOrderStatus,
+    pub reason: Option<String>,
+}
+
+impl PolymarketUserOrderStatus {
+    pub(crate) fn new(status: PolymarketOrderStatus, reason: Option<&str>) -> Self {
+        Self {
+            status,
+            reason: reason
+                .filter(|reason| !reason.trim().is_empty())
+                .map(str::to_string),
+        }
+    }
+}
+
+impl From<PolymarketOrderStatus> for PolymarketUserOrderStatus {
+    fn from(status: PolymarketOrderStatus) -> Self {
+        Self::new(status, None)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolymarketUserOrderStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+
+        PolymarketOrderStatus::parse_wire(&raw)
+            .map(|(status, reason)| Self::new(status, reason))
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!("Unknown PolymarketOrderStatus: {raw}"))
+            })
+    }
+}
+
+impl Serialize for PolymarketUserOrderStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.reason.as_deref() {
+            Some(reason) => serializer.serialize_str(&format!("{}_{reason}", self.status)),
+            None => self.status.serialize(serializer),
+        }
+    }
+}
 
 /// A user order status update from the WebSocket user channel.
 ///
@@ -58,7 +110,7 @@ pub struct PolymarketUserOrder {
     pub price: String,
     pub side: PolymarketOrderSide,
     pub size_matched: String,
-    pub status: Option<PolymarketOrderStatus>,
+    pub status: Option<PolymarketUserOrderStatus>,
     pub timestamp: String,
     #[serde(rename = "type")]
     pub event_type: PolymarketEventType,
@@ -115,6 +167,14 @@ pub struct PolymarketBookSnapshot {
     pub timestamp: String,
     #[serde(default)]
     pub hash: Option<String>,
+    #[serde(default)]
+    pub min_order_size: Option<String>,
+    #[serde(default)]
+    pub tick_size: Option<String>,
+    #[serde(default)]
+    pub neg_risk: Option<bool>,
+    #[serde(default)]
+    pub last_trade_price: Option<String>,
 }
 
 /// A single price change entry within a quotes message.
@@ -253,7 +313,7 @@ pub struct PolymarketMarketResolved {
 /// A best bid/ask notification from the WebSocket market channel.
 ///
 /// Only received when `subscribe_new_markets` is enabled.
-/// Data is already covered by existing PriceChange/Book handlers.
+/// The data adapter emits these events as quote ticks for active quote subscriptions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolymarketBestBidAsk {
     pub market: Ustr,
@@ -510,11 +570,38 @@ impl UserWsMessage {
 
     /// Parses a batch of user-channel JSON messages.
     ///
+    /// Elements carrying an unrecognized `event_type` are skipped so that a single unknown
+    /// message cannot discard the valid `order` and `trade` messages batched alongside it.
+    ///
     /// # Errors
     ///
     /// Returns [`serde_json::Error`] when `text` is not a valid user-message batch.
     pub fn parse_batch(text: &str) -> serde_json::Result<Vec<Self>> {
-        serde_json::from_str(text)
+        /// Reads only the tag, to classify an element before deserializing it.
+        #[derive(Deserialize)]
+        struct EventTypeTag {
+            event_type: Option<String>,
+        }
+
+        // Elements stay raw so the derived impl parses each one and rejects a duplicated
+        // `event_type`; `serde_json::Value` would silently keep the last occurrence.
+        let elements: Vec<&RawValue> = serde_json::from_str(text)?;
+        let mut messages = Vec::with_capacity(elements.len());
+        let mut skipped = 0usize;
+
+        for element in elements {
+            let tag: EventTypeTag = serde_json::from_str(element.get())?;
+            match tag.event_type.as_deref() {
+                Some(event_type) if !matches!(event_type, "order" | "trade") => skipped += 1,
+                _ => messages.push(serde_json::from_str(element.get())?),
+            }
+        }
+
+        if skipped > 0 {
+            log::debug!("Skipped {skipped} user WS message(s) with an unrecognized event_type");
+        }
+
+        Ok(messages)
     }
 
     fn parse_reordered(text: &str) -> serde_json::Result<Self> {
@@ -543,8 +630,16 @@ struct UserWsTag {
 pub enum PolymarketWsMessage {
     Market(MarketWsMessage),
     User(UserWsMessage),
+    /// Emitted for an application-level market-channel `PONG`.
+    TransportHeartbeat {
+        /// Epoch of the WebSocket connection which received the heartbeat.
+        connection_epoch: u64,
+    },
     /// Emitted when the underlying WebSocket reconnects.
-    Reconnected,
+    Reconnected {
+        /// Epoch assigned to the replacement WebSocket connection.
+        connection_epoch: u64,
+    },
 }
 
 /// Auth payload embedded in user-channel subscribe messages.
@@ -558,25 +653,29 @@ pub struct PolymarketWsAuth {
 
 /// Initial market-channel subscribe request sent for a fresh WebSocket session.
 ///
-/// Wire format: `{"assets_ids": [...], "type": "market"}`
-/// When `custom_feature_enabled` is true, enables new market and market resolved events.
+/// Wire format: `{"assets_ids": [...], "type": "market", "initial_dump": true}`
+/// When `custom_feature_enabled` is true, enables new-market, market-resolved, and best-bid/ask
+/// events.
 #[derive(Debug, Serialize)]
 pub struct MarketInitialSubscribeRequest {
     pub assets_ids: Vec<String>,
     #[serde(rename = "type")]
     pub msg_type: &'static str,
+    pub initial_dump: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub custom_feature_enabled: bool,
 }
 
 /// Incremental market-channel subscribe request sent after the initial session subscribe.
 ///
-/// Wire format: `{"assets_ids": [...], "operation": "subscribe"}`
-/// When `custom_feature_enabled` is true, enables new market and market resolved events.
+/// Wire format: `{"assets_ids": [...], "operation": "subscribe", "initial_dump": true}`
+/// When `custom_feature_enabled` is true, enables new-market, market-resolved, and best-bid/ask
+/// events.
 #[derive(Debug, Serialize)]
 pub struct MarketSubscribeRequest {
     pub assets_ids: Vec<String>,
     pub operation: &'static str,
+    pub initial_dump: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub custom_feature_enabled: bool,
 }
@@ -592,12 +691,10 @@ pub struct MarketUnsubscribeRequest {
 
 /// User-channel subscribe request sent on connect.
 ///
-/// Wire format: `{"auth": {...}, "markets": [], "assets_ids": [], "type": "user"}`
+/// Wire format: `{"auth": {...}, "type": "user"}`
 #[derive(Debug, Serialize)]
 pub struct UserSubscribeRequest {
     pub auth: PolymarketWsAuth,
-    pub markets: Vec<String>,
-    pub assets_ids: Vec<String>,
     #[serde(rename = "type")]
     pub msg_type: &'static str,
 }
@@ -612,6 +709,30 @@ mod tests {
         PolymarketOrderType, PolymarketOutcome, PolymarketTradeStatus,
     };
 
+    #[rstest]
+    fn user_subscribe_request_matches_all_markets_wire_format() {
+        let request = UserSubscribeRequest {
+            auth: PolymarketWsAuth {
+                api_key: "fixture-key".to_string(),
+                secret: "fixture-secret".to_string(),
+                passphrase: "fixture-passphrase".to_string(),
+            },
+            msg_type: "user",
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "auth": {
+                    "apiKey": "fixture-key",
+                    "secret": "fixture-secret",
+                    "passphrase": "fixture-passphrase",
+                },
+                "type": "user",
+            }),
+        );
+    }
+
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let path = format!("test_data/{filename}");
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
@@ -621,6 +742,26 @@ mod tests {
     fn load_text(filename: &str) -> String {
         let path = format!("test_data/{filename}");
         std::fs::read_to_string(path).expect("Failed to read test data")
+    }
+
+    /// An `auto_redeem` user-channel event as observed from the venue, which is undocumented and
+    /// not modelled by [`UserWsMessage`].
+    fn auto_redeem_element() -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "auto_redeem",
+            "proxy_wallet": "0x0000000000000000000000000000000000000000",
+            "txn_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "amount": "70",
+            "condition_id": "0xb88862256916cb0c82e72667bd43f3e6cfe94cd7d5cda0bf763ec82394021e07",
+            "question": "Bitcoin Up or Down - August 17, 9:35AM-9:40AM ET",
+            "slug": "btc-updown-5m-1786973700",
+            "neg_risk": false,
+            "timestamp": "1786974414920",
+            "position_id": "",
+            "outcome_index": 0,
+            "legs": 0,
+            "owner": "00000000-0000-0000-0000-000000000000",
+        })
     }
 
     #[rstest]
@@ -637,10 +778,11 @@ mod tests {
         assert_eq!(snap.bids[0].size, "500.0");
         assert_eq!(snap.asks[0].price, "0.53");
         assert_eq!(snap.timestamp, "1703875200000");
-        assert_eq!(
-            snap.hash.as_deref(),
-            Some("655a38d4977427b086c25b985993691b753ed166")
-        );
+        assert!(snap.hash.is_none());
+        assert!(snap.min_order_size.is_none());
+        assert!(snap.tick_size.is_none());
+        assert!(snap.neg_risk.is_none());
+        assert!(snap.last_trade_price.is_none());
     }
 
     #[rstest]
@@ -685,6 +827,10 @@ mod tests {
         let trade: PolymarketTrade = load("ws_last_trade_missing_transaction_hash.json");
 
         assert!(snap.hash.is_none());
+        assert!(snap.min_order_size.is_none());
+        assert!(snap.tick_size.is_none());
+        assert!(snap.neg_risk.is_none());
+        assert!(snap.last_trade_price.is_none());
         assert!(trade.transaction_hash.is_none());
     }
 
@@ -702,7 +848,10 @@ mod tests {
         let order: PolymarketUserOrder = load("ws_user_order_placement.json");
 
         assert_eq!(order.event_type, PolymarketEventType::Placement);
-        assert_eq!(order.status, Some(PolymarketOrderStatus::Live));
+        assert_eq!(
+            order.status.as_ref().map(|status| status.status),
+            Some(PolymarketOrderStatus::Live)
+        );
         assert_eq!(order.side, PolymarketOrderSide::Buy);
         assert_eq!(order.order_type, Some(PolymarketOrderType::GTC));
         assert_eq!(order.outcome, Some(PolymarketOutcome::yes()));
@@ -729,8 +878,28 @@ mod tests {
         let order: PolymarketUserOrder = load("ws_user_order_cancellation.json");
 
         assert_eq!(order.event_type, PolymarketEventType::Cancellation);
-        assert_eq!(order.status, Some(PolymarketOrderStatus::Canceled));
+        assert_eq!(
+            order.status.as_ref().map(|status| status.status),
+            Some(PolymarketOrderStatus::Canceled)
+        );
         assert_eq!(order.size_matched, "0.0");
+    }
+
+    #[rstest]
+    fn test_user_order_status_preserves_rejection_reason() {
+        let raw = "UNMATCHED_invalid post-only order: order crosses book";
+        let status: PolymarketUserOrderStatus =
+            serde_json::from_str(&format!("\"{raw}\"")).unwrap();
+
+        assert_eq!(status.status, PolymarketOrderStatus::Unmatched);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("invalid post-only order: order crosses book")
+        );
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            format!("\"{raw}\"")
+        );
     }
 
     /// Repro for issue #3987: venue cancels a FOK order with a status field
@@ -744,7 +913,17 @@ mod tests {
             panic!("Expected UserWsMessage::Order");
         };
         assert_eq!(order.event_type, PolymarketEventType::Cancellation);
-        assert_eq!(order.status, Some(PolymarketOrderStatus::Canceled));
+        assert_eq!(
+            order.status.as_ref().map(|status| status.status),
+            Some(PolymarketOrderStatus::Canceled)
+        );
+        assert_eq!(
+            order
+                .status
+                .as_ref()
+                .and_then(|status| status.reason.as_deref()),
+            Some("order couldn't be fully filled. FOK orders are fully filled or killed.")
+        );
         assert_eq!(order.order_type, Some(PolymarketOrderType::FOK));
         assert_eq!(order.size_matched, "");
         assert_eq!(order.created_at.as_deref(), Some(""));
@@ -927,7 +1106,10 @@ mod tests {
         assert_eq!(order.price, "0.01");
         assert_eq!(order.side, PolymarketOrderSide::Buy);
         assert_eq!(order.size_matched, "");
-        assert_eq!(order.status, Some(PolymarketOrderStatus::Canceled));
+        assert_eq!(
+            order.status.as_ref().map(|status| status.status),
+            Some(PolymarketOrderStatus::Canceled)
+        );
         assert_eq!(order.timestamp, "1786179547007");
         assert_eq!(order.event_type, PolymarketEventType::Cancellation);
     }
@@ -1077,6 +1259,52 @@ mod tests {
         let text = serde_json::to_string(&value).expect("user batch fixture should serialize");
 
         assert!(UserWsMessage::parse_batch(&text).is_err());
+    }
+
+    /// A duplicated `event_type` is malformed and must be rejected, matching
+    /// [`UserWsMessage::parse`].
+    #[rstest]
+    fn test_user_ws_message_parse_batch_rejects_duplicate_event_type() {
+        let element = load_text("ws_user_order_msg.json").replacen(
+            r#""event_type": "order""#,
+            r#""event_type": "order", "event_type": "order""#,
+            1,
+        );
+        let text = format!("[{element}]");
+
+        assert!(UserWsMessage::parse_batch(&text).is_err());
+    }
+
+    /// Polymarket emits undocumented user-channel events such as `auto_redeem`, which must not
+    /// discard the `order` and `trade` messages batched alongside them.
+    #[rstest]
+    fn test_user_ws_message_parse_batch_skips_unknown_event_type() {
+        let expected: Vec<UserWsMessage> = load("ws_user_batch_msg.json");
+        let mut value: serde_json::Value = load("ws_user_batch_msg.json");
+        let elements = value
+            .as_array_mut()
+            .expect("user batch fixture should be an array");
+        elements.insert(1, auto_redeem_element());
+        let text = serde_json::to_string(&value).expect("user batch fixture should serialize");
+
+        let actual =
+            UserWsMessage::parse_batch(&text).expect("batch with unknown event_type should parse");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    fn test_user_ws_message_parse_batch_all_unknown_event_types() {
+        let text = serde_json::to_string(&serde_json::Value::Array(vec![
+            auto_redeem_element(),
+            auto_redeem_element(),
+        ]))
+        .expect("unknown batch should serialize");
+
+        let actual =
+            UserWsMessage::parse_batch(&text).expect("batch of unknown event types should parse");
+
+        assert!(actual.is_empty());
     }
 
     #[rstest]

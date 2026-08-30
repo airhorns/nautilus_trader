@@ -34,6 +34,101 @@ Live node lifecycle: instruments and execution state are prepared before strateg
 Cache restoration runs when a backing database is attached and cache loading is enabled. Connection,
 reconciliation, or trader startup failures abort startup and follow the coordinated cleanup path.
 
+## Hosted event loops
+
+Use `run_async()` from Python to run a node on an event loop you already own, such as an ASGI server
+serving a dashboard beside the node. Use `run()` when the node should own the calling thread and
+signal handling.
+
+This lifecycle sketch leaves node configuration and request serving to the application:
+
+```python
+import asyncio
+
+from nautilus_trader.live import LiveNode
+from nautilus_trader.live import LiveNodeHandle
+
+
+async def wait_until_running(
+    handle: LiveNodeHandle,
+    task: asyncio.Task[None],
+) -> None:
+    while not handle.is_running:
+        if task.done():
+            await task
+            raise RuntimeError("LiveNode stopped during startup")
+        await asyncio.sleep(0.01)
+
+
+async def serve_with_node(node: LiveNode) -> None:
+    cache, portfolio, handle = node.cache, node.portfolio, node.handle()
+    run_task: asyncio.Task[None] | None = None
+    service_task: asyncio.Task[None] | None = None
+    try:
+        run_task = asyncio.create_task(node.run_async())
+        await wait_until_running(handle, run_task)
+
+        service_task = asyncio.create_task(serve_requests(cache, portfolio, handle))
+        done, _ = await asyncio.wait(
+            (run_task, service_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if run_task in done:
+            await run_task
+            raise RuntimeError("LiveNode stopped while the service was running")
+        await service_task
+    finally:
+        if service_task is not None and not service_task.done():
+            service_task.cancel()
+            await asyncio.gather(service_task, return_exceptions=True)
+        try:
+            if run_task is not None:
+                handle.stop()
+                await run_task
+        finally:
+            node.dispose()
+```
+
+Both entry points run the same lifecycle, so a hosted node performs the same startup ordering,
+maintenance, reconciliation, and shutdown as an owned one. The mode decides only who owns signal
+handling: a hosted node installs no handlers, leaving `SIGINT` and `SIGTERM` to the host.
+
+`run_async()` returns a coroutine and lends the node to it for the run's duration. Capture `cache`,
+`portfolio`, and `handle()` before starting, because each stays usable while the node runs, whereas
+reading state through the node itself raises until the run returns it. `handle()` is the exception
+and works throughout, since it is how a host stops the node. `is_running` also answers throughout,
+because it reads the same handle. Calling `dispose()` during the run returns without doing anything;
+it does not defer disposal. Call it after the run task finishes to release the node's resources.
+
+`LiveNodeHandle` is safe to call from any thread, including a signal handler. `stop()` requests a
+graceful shutdown and returns immediately, so the awaiting task resolves only once shutdown
+finishes. Cancelling that task requests the same shutdown, waits for it, then re-raises the
+cancellation, which keeps `asyncio.timeout` and task groups behaving as their callers expect.
+
+Compatibility is tested with the default asyncio loop and uvloop. An ASGI lifespan managed by
+Uvicorn can apply the same ownership pattern without transferring signal handling to the node.
+Before an ASGI lifespan reports startup complete, wait until the handle reports `Running` while
+checking whether the run task has failed. Keep supervising the task after startup, and treat
+unexpected completion as a service failure.
+
+While the node is running, it yields to the host loop periodically, so a burst of events cannot
+starve the host's own callbacks. Startup and shutdown drain their queues without yielding, so a
+large instrument load or a shutdown backlog can hold the loop for the length of that drain.
+
+:::warning[One LiveNode per process]
+Run one concurrent `LiveNode` per process. The runner binds its channel senders and message bus into
+thread-local storage, and other runtime state is process-wide. `run_async()` also rejects a second
+hosted node on the same event loop. Run additional nodes in separate processes.
+
+When an ASGI application lifespan constructs the node, run that application with one worker. Do not
+use hot reload for live trading because it restarts the worker and its node. Scale HTTP request
+handling with processes that do not construct a trading node.
+:::
+
+A node configured with a cache database backing is rejected on a host loop. Those backings wait for
+their worker task by blocking the calling thread, which stalls the host loop rather than slowing it.
+Use `run()` for a database-backed node.
+
 ## Configuration
 
 For how config structs handle defaults, `T` vs `Option<T>` semantics, and
@@ -49,8 +144,13 @@ For how submit, modify, and cancel commands resolve, see
 [Command outcomes](execution.md#command-outcomes).
 
 At startup, reconciliation aligns cached order and position state with venue reports before trader
-components start. Continuous checks can then monitor in‑flight orders, open orders, positions, and
+components start. Continuous checks can then monitor in-flight orders, open orders, positions, and
 own order books while the node runs.
+
+When an adapter declares bounded historical reports, startup reconciliation applies their fill
+economics only when the report set and retained state prove a coherent position transition.
+Incomplete or ambiguous history can still recover exact order state without changing positions or
+portfolio economics.
 
 See [Execution reconciliation](reconciliation.md) for configuration, recovery procedures,
 runtime checks, scenarios, and invariants.
@@ -126,7 +226,7 @@ snapshots with saturating deltas. Counters reset when `LiveNode::run` enters ste
 
 `LiveNode` converts runner queue samples into typed state transitions when
 `LiveNodeConfig.queue_monitor` is set. The monitor is disabled by default and publishes no
-queue‑state events while the field is unset.
+queue-state events while the field is unset.
 
 ### Configure thresholds
 
@@ -176,13 +276,13 @@ equal or inverted thresholds.
 ### State transitions
 
 The live runner evaluates the monitor on its 100 ms maintenance tick, after sampling current queue
-depths. Queue depth is a point‑in‑time value. Mean dispatch time uses the messages and dispatch busy
+depths. Queue depth is a point-in-time value. Mean dispatch time uses the messages and dispatch busy
 time accumulated since the previous metrics snapshot.
 
 | Condition    | Measure                                               | `Triggered`                                    | `Cleared`                                    |
 | ------------ | ----------------------------------------------------- | ---------------------------------------------- | -------------------------------------------- |
-| `Backlogged` | Point‑in‑time queue depth.                            | `queue_depth >= queue_depth_trigger`           | `queue_depth <= queue_depth_clear`           |
-| `Slow`       | Per‑channel mean dispatch time for the sample window. | `mean_dispatch_ns >= mean_dispatch_ns_trigger` | `mean_dispatch_ns <= mean_dispatch_ns_clear` |
+| `Backlogged` | Point-in-time queue depth.                            | `queue_depth >= queue_depth_trigger`           | `queue_depth <= queue_depth_clear`           |
+| `Slow`       | Per-channel mean dispatch time for the sample window. | `mean_dispatch_ns >= mean_dispatch_ns_trigger` | `mean_dispatch_ns <= mean_dispatch_ns_clear` |
 
 Each channel tracks `Backlogged` and `Slow` independently. A value between the clear and trigger
 thresholds retains the prior state, so it does not publish another event. If both conditions cross
@@ -199,8 +299,8 @@ crossing, a fresh event ID, and event timestamps.
 
 Actors subscribe with `subscribe_queue_state(...)` and receive events through
 `on_queue_state(...)`. The Python API exposes `SystemChannel`, `QueueCondition`, `QueueState`, and
-`QueueStateChanged` from `nautilus_trader.common`. Publication stays on the in‑process typed message
-bus, and the event has no wire representation for external message‑bus streaming. See
+`QueueStateChanged` from `nautilus_trader.common`. Publication stays on the in-process typed message
+bus, and the event has no wire representation for external message-bus streaming. See
 [Queue pressure state](actors.md#queue-pressure-state) for actor examples.
 
 ## Socket transport state
@@ -208,12 +308,12 @@ bus, and the event has no wire representation for external message‑bus streami
 ### Publication and routing
 
 Actors can observe transport availability for adapters that opt into socket state reporting.
-Binance Futures and Polymarket provide reference implementations. `LiveNode` publishes
-`SocketStateChanged` on `events.system.SocketStateChanged` with the trader ID, client ID, optional
-venue, stable endpoint label, state, fresh event ID, and event timestamps. It sets both timestamps
-from the kernel clock when it handles the transport's neutral state notification. Adapters send the
-notification through the runner's system‑event channel, separately from market data. The internal
-channel is not part of queue‑pressure monitoring.
+`LiveNode` publishes `SocketStateChanged` on `events.system.SocketStateChanged` with the trader ID,
+client ID, optional venue, stable endpoint label, state, fresh event ID, and event timestamps. The
+endpoint label identifies one logical adapter transport without exposing its URL. `LiveNode` sets
+both timestamps from the kernel clock when it handles the transport's neutral state notification.
+Adapters send the notification through the runner's system-event channel, separately from market
+data. The internal channel is not part of queue-pressure monitoring.
 
 ### State semantics
 
@@ -223,14 +323,25 @@ lost. Failed connection and retry attempts do not publish events, and deliberate
 publish a disconnect event. Reconnect exhaustion also adds no event after the transport loss was
 reported.
 
-### Endpoint labels
+Socket state is operational evidence, not an execution-command outcome. A disconnect by itself does
+not reject, cancel, or resolve an in-flight command; stream updates, queries, or reconciliation
+provide that evidence under the [command outcome policy](execution.md#command-outcomes).
 
-Endpoint labels identify a logical adapter stream group without exposing its URL. Multiple sockets
-in a connection pool can share one label, so events report individual transport edges rather than
-aggregate feed availability. The Binance Futures data client uses
-`binance-futures-market-streams` and `binance-futures-public-streams`. Polymarket uses
-`polymarket-market-streams` for pooled CLOB market connections, `polymarket-rtds-streams` for RTDS
-data, and `polymarket-user-streams` for execution events.
+### Dead-peer detection
+
+A connection can stop delivering without closing: a NAT or load balancer drops it with no `FIN` and
+no `RST`, so writes keep succeeding into the send buffer and nothing surfaces the loss. Any transport
+configured with a heartbeat therefore reconnects when no inbound frame of any kind arrives within
+three heartbeat intervals. Sending a heartbeat establishes that the peer answers it, so the interval
+alone is enough to say when silence means the connection is gone. A transport with no heartbeat gets
+no window, because nothing would guarantee the inbound frames needed to keep one open.
+
+That window counts frames rather than data, so a keepalive reply refreshes it and a quiet market
+does not trip it. An adapter that also needs to detect a feed which stopped flowing while the
+transport stays healthy sets a separate idle timeout, which only Text and Binary frames refresh.
+That second window suits a venue which pushes data on a known cadence. Where the venue answers the
+keepalive with a text payload, its reply refreshes the idle timeout exactly like real data does, so
+the window means something only when it sits below the heartbeat interval.
 
 ### Adapter and actor integration
 
@@ -240,8 +351,27 @@ Adapter integrations construct a `SocketStateSink` and pass it through `connect_
 
 Actors subscribe with `subscribe_socket_state(...)` and receive events through
 `on_socket_state(...)`. The Python API exposes `SocketState` and `SocketStateChanged` from
-`nautilus_trader.common`. Delivery stays on the typed in‑process bus; external message‑bus streaming
+`nautilus_trader.common`. Delivery stays on the typed in-process bus; external message-bus streaming
 and wire formats do not expose these events.
+
+### Endpoint reconnect commands
+
+An actor or strategy can call `reconnect_socket(client_id, endpoint)` with an endpoint label from a
+state event. The runner routes the typed command through the kernel and the engine that owns the
+registered endpoint. The engine invokes only that transport's reconnect handle. It does not call
+the containing `DataClient` or `ExecutionClient` disconnect and connect lifecycle.
+
+The API is fire-and-observe. A successful return means the command passed local validation and was
+queued. It does not acknowledge kernel acceptance or completed recovery. An accepted request emits
+`SocketStateChanged` with `SocketState.DISCONNECTED` for the selected endpoint as it enters reconnect
+mode. A later `SocketState.CONNECTED` event reports transport recovery. The transport's normal
+reconnect controller preserves its authentication, subscription replay, and adapter recovery
+behavior.
+
+The kernel logs unknown clients, unsupported clients, unknown or ambiguous endpoints, duplicate
+requests, disconnecting transports, and closed transports. These rejections emit no socket state
+change and do not affect another endpoint. Endpoint labels use identifier characters only and never
+contain raw URLs.
 
 ## Shutdown on error
 
@@ -270,9 +400,10 @@ node/kernel level instead. Shutdown-on-error observes Rust `log` records, not Py
 ## Related guides
 
 - [Execution reconciliation](reconciliation.md) - State recovery and runtime consistency checks.
+- [Python](python.md) - Python ownership, runtime, and public API boundaries.
 - [Configure a live trading node](../how_to/configure_live_trading.md) - Node and engine configuration.
 - [Run live trading with Rust](../how_to/run_rust_live_trading.md) - Rust node setup and venue connection.
 - [Adapters](adapters.md) - Venue connectivity.
 - [Execution](execution.md) - Command outcomes and order execution.
-- [Message bus](message_bus.md) - Typed in‑process publish and subscribe behavior.
+- [Message bus](message_bus.md) - Typed in-process publish and subscribe behavior.
 - [Backtesting](backtesting/) - Testing strategies before deployment.

@@ -16,7 +16,9 @@
 """
 Run a top-of-book imbalance strategy on the Architect AX sandbox.
 
-This example has no claimed alpha and is not intended for production trading.
+Running this example connects to the AX sandbox and places live sandbox orders on
+imbalance triggers. The strategy has no claimed alpha and is not intended for production
+trading.
 
 """
 
@@ -29,10 +31,10 @@ from nautilus_trader.adapters.architect_ax import AX
 from nautilus_trader.adapters.architect_ax import AxDataClientConfig
 from nautilus_trader.adapters.architect_ax import AxDataClientFactory
 from nautilus_trader.adapters.architect_ax import AxEnvironment
-from nautilus_trader.adapters.architect_ax import AxExecClientConfig
+from nautilus_trader.adapters.architect_ax import AxExecutionClientConfig
 from nautilus_trader.adapters.architect_ax import AxExecutionClientFactory
 from nautilus_trader.common import Environment
-from nautilus_trader.config import LiveExecEngineConfig
+from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import AccountId
@@ -41,8 +43,7 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TraderId
 
 
-RUN_NODE = False
-DRY_RUN = False
+DRY_RUN = False  # Set True to log intended trades without submitting orders
 TRADER_ID = TraderId.from_str("TESTER-001")
 ACCOUNT_ID = AccountId.from_str("AX-001")
 STRATEGY_ID = StrategyId.from_str("AX-BOOK-IMBALANCE-001")
@@ -52,19 +53,19 @@ TRIGGER_MIN_SIZE = Decimal(1)
 TRIGGER_IMBALANCE_RATIO = Decimal("0.10")
 MIN_SECONDS_BETWEEN_TRIGGERS = 5.0
 
-SMOKE_API_KEY = "test_key"
-SMOKE_API_SECRET = "test_secret"
-
 
 def main() -> None:
+    """
+    Run the example.
+    """
     node = (
         LiveNode.builder("AX-BOOK-IMBALANCE-001", TRADER_ID, Environment.LIVE)
         .with_exec_engine_config(
-            LiveExecEngineConfig(
+            LiveExecutionEngineConfig(
                 reconciliation_instrument_ids=[str(INSTRUMENT_ID)],
             ),
         )
-        .with_reconciliation(RUN_NODE)
+        .with_reconciliation(reconciliation=True)
         .with_risk_engine_config(LiveRiskEngineConfig(bypass=True))
         .with_timeout_connection(20)
         .with_timeout_reconciliation(10)
@@ -79,11 +80,8 @@ def main() -> None:
         .add_exec_client(
             None,
             AxExecutionClientFactory(),
-            AxExecClientConfig(
-                trader_id=TRADER_ID,
+            AxExecutionClientConfig(
                 account_id=ACCOUNT_ID,
-                api_key=None if RUN_NODE else SMOKE_API_KEY,
-                api_secret=None if RUN_NODE else SMOKE_API_SECRET,
                 environment=AxEnvironment.SANDBOX,
             ),
         )
@@ -103,10 +101,7 @@ def main() -> None:
         ),
     )
 
-    if RUN_NODE:
-        node.run()
-    else:
-        print("Built Architect AX book imbalance node. Set RUN_NODE = True to connect.")
+    node.run()
 
 
 if __name__ == "__main__":

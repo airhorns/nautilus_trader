@@ -25,6 +25,11 @@ pub struct OrderMatchingEngineConfig {
     pub bar_adaptive_high_low_ordering: bool,
     #[builder(default = true)]
     pub trade_execution: bool,
+    #[builder(default = true)]
+    pub book_execution: bool,
+    /// If limit orders should use the current order book for immediate matching on submission.
+    #[builder(default)]
+    pub order_submission_book_execution: bool,
     #[builder(default)]
     pub liquidity_consumption: bool,
     #[builder(default = true)]
@@ -43,6 +48,10 @@ pub struct OrderMatchingEngineConfig {
     pub use_market_order_acks: bool,
     #[builder(default)]
     pub queue_position: bool,
+    /// Conservative multiplier applied only to a resting order's observed
+    /// quantity ahead. This does not change executable order-book liquidity.
+    #[builder(default = 1)]
+    pub queue_position_multiplier: u32,
     #[builder(default)]
     pub oto_full_trigger: bool,
     pub price_protection_points: Option<u32>,
@@ -66,6 +75,8 @@ mod tests {
         assert!(config.bar_execution);
         assert!(!config.bar_adaptive_high_low_ordering);
         assert!(config.trade_execution);
+        assert!(config.book_execution);
+        assert!(!config.order_submission_book_execution);
         assert!(!config.liquidity_consumption);
         assert!(config.reject_stop_orders);
         assert!(config.support_gtd_orders);
@@ -75,6 +86,7 @@ mod tests {
         assert!(config.use_reduce_only);
         assert!(!config.use_market_order_acks);
         assert!(!config.queue_position);
+        assert_eq!(config.queue_position_multiplier, 1);
         assert!(!config.oto_full_trigger);
         assert_eq!(config.price_protection_points, None);
     }
