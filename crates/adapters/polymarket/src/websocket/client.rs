@@ -42,9 +42,11 @@ use crate::common::{
 };
 
 // The venue counts only the `PING` text frame, not protocol ping frames, and
-// closes with `1008 no ping received` otherwise. Cadence per venue docs:
+// closes with `1008 no ping received` otherwise. The venue requires a ping at
+// least every ten seconds, while a one-second cadence also gives consumers a
+// useful liveness signal for quiet prediction markets:
 // https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
-const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+const POLYMARKET_HEARTBEAT_SECS: u64 = 1;
 
 // Prediction markets go quiet for long stretches, so liveness is the venue
 // still sending frames, not data arriving. A data-silence timer cannot serve:
@@ -905,7 +907,7 @@ mod tests {
         let user_debug = format!("{user:?}");
         let assert_common = |config: &WebSocketConfig| {
             assert_eq!(config.headers, Vec::<(String, String)>::new());
-            assert_eq!(config.heartbeat_interval_secs, Some(10));
+            assert_eq!(config.heartbeat_interval_secs, Some(1));
             assert_eq!(config.heartbeat_payload.as_deref(), Some("PING"));
             assert_eq!(config.connect_timeout_ms, Some(15_000));
             assert_eq!(config.reconnect_delay_initial_ms, Some(250));
@@ -913,6 +915,7 @@ mod tests {
             assert_eq!(config.reconnect_backoff_factor, Some(2.0));
             assert_eq!(config.reconnect_jitter_ms, Some(200));
             assert_eq!(config.reconnect_max_attempts, None);
+            assert_eq!(config.heartbeat_timeout_secs, Some(3));
             // No data-silence timer: `PONG` arrives as a text frame and would
             // refresh it, so liveness rests on the heartbeat timeout instead.
             assert_eq!(config.idle_timeout_ms, None);
