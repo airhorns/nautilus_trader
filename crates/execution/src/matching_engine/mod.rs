@@ -2262,12 +2262,24 @@ impl OrderMatchingEngine {
         self.last_trade_size = Some(trade.size);
         self.trade_consumption = 0;
 
-        if self.config.liquidity_consumption && self.book_type != BookType::L1_MBP {
+        // Some MBP feeds publish the post-trade depth image before the corresponding
+        // trade tick. In that ordering the newer book has already capped both
+        // available liquidity and every resting order's queue-ahead position. Do not
+        // consume either a second time when the delayed trade arrives.
+        let book_already_reflects_trade =
+            self.book_type != BookType::L1_MBP && self.book.ts_last > trade.ts_event;
+
+        if self.config.liquidity_consumption
+            && self.book_type != BookType::L1_MBP
+            && !book_already_reflects_trade
+        {
             self.seed_trade_consumption(price_raw, trade.size.raw, trade.ts_event, aggressor_side);
         }
 
         self.resolve_pending_on_trade(price_raw);
-        self.decrement_queue_on_trade(price_raw, trade.size.raw, aggressor_side);
+        if !book_already_reflects_trade {
+            self.decrement_queue_on_trade(price_raw, trade.size.raw, aggressor_side);
+        }
 
         self.iterate(trade.ts_init, aggressor_side);
 

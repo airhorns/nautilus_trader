@@ -11405,6 +11405,49 @@ fn test_l2_queue_position_update_caps_queue(
 }
 
 #[rstest]
+fn test_l2_queue_position_delayed_trade_after_newer_book_does_not_double_advance(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let (mut engine, _cache, handler) =
+        get_trade_driven_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // This newer depth update has already reflected eight shares leaving the
+    // level and capped our queue from ten shares to two.
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Update, "2.000", 3);
+
+    // The corresponding older trade arrives later. It must not consume the
+    // remaining two shares of queue again or fill our order.
+    let delayed_trade = TradeTick::new(
+        instrument_id,
+        Price::from("100.00"),
+        Quantity::from("8.000"),
+        AggressorSide::Buy,
+        TradeId::new("delayed"),
+        UnixNanos::from(2u64),
+        UnixNanos::from(4u64),
+    );
+    engine.process_trade_tick(&delayed_trade);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "a delayed trade already reflected by newer depth must not advance queue twice",
+    );
+
+    // A genuinely newer trade exactly clears the remaining queue, and only a
+    // subsequent excess print reaches our order.
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "queue-clear", 5);
+    assert_eq!(get_fill_quantities(&handler), Vec::<Quantity>::new());
+    process_buyer_trade(&mut engine, instrument_id, "1.000", "fill", 6);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("1.000")]);
+}
+
+#[rstest]
 fn test_l3_queue_position_stranger_size_decrease_advances_queue_by_difference(
     account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
