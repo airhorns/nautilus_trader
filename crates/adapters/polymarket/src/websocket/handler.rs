@@ -250,7 +250,9 @@ impl FeedHandler {
     fn parse_messages(&self, text: &str) -> Vec<PolymarketWsMessage> {
         // When `subscribe_new_markets` is enabled, Polymarket's WSS periodically
         // sends the plain-text string "NO NEW ASSETS" as a heartbeat/ack.
-        if text == "NO NEW ASSETS" {
+        // It also acknowledges the required application-level `PING` heartbeat
+        // with a plain-text `PONG`. Neither control message is market data.
+        if matches!(text, "NO NEW ASSETS" | "PONG") {
             return vec![];
         }
 
@@ -476,6 +478,17 @@ mod tests {
         assert_eq!(trade.size, "25.0");
         assert_eq!(trade.timestamp, "1703875202000");
         assert!(trade.transaction_hash.is_none());
+    }
+
+    #[rstest]
+    #[case(WsChannel::Market, "PONG")]
+    #[case(WsChannel::Market, "NO NEW ASSETS")]
+    #[case(WsChannel::User, "PONG")]
+    fn test_parse_control_text_is_not_market_data(
+        #[case] channel: WsChannel,
+        #[case] text: &str,
+    ) {
+        assert!(feed_handler(channel).parse_messages(text).is_empty());
     }
 
     #[rstest]

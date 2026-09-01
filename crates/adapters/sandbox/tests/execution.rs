@@ -40,10 +40,13 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
+    data::{
+        Bar, BarType, BookOrder, Data, InstrumentClose, InstrumentStatus, OrderBookDelta,
+        OrderBookDeltas, QuoteTick, TradeTick,
+    },
     enums::{
-        AccountType, AggressorSide, BookType, InstrumentCloseType, MarketStatusAction, OmsType,
-        OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, AggressorSide, BookAction, BookType, InstrumentCloseType, MarketStatusAction,
+        OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::{AccountState, OrderEventAny, OrderFilled, PositionClosed, PositionEvent},
     identifiers::{
@@ -109,6 +112,9 @@ fn create_config(
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,
+        book_execution: true,
+        liquidity_consumption: false,
+        queue_position: false,
         reject_stop_orders: true,
         support_gtd_orders: true,
         support_contingent_orders: true,
@@ -865,6 +871,8 @@ fn test_config_builder_with_overrides(trader_id: TraderId, account_id: AccountId
         .frozen_account(true)
         .bar_execution(false)
         .trade_execution(true)
+        .liquidity_consumption(true)
+        .queue_position(true)
         .build();
 
     assert_eq!(config.base_currency, Some(usd));
@@ -875,14 +883,23 @@ fn test_config_builder_with_overrides(trader_id: TraderId, account_id: AccountId
     assert!(config.frozen_account);
     assert!(!config.bar_execution);
     assert!(config.trade_execution);
+    assert!(config.liquidity_consumption);
+    assert!(config.queue_position);
 }
 
 #[rstest]
 fn test_config_to_matching_engine_config(config: SandboxExecutionClientConfig) {
+    let config = SandboxExecutionClientConfig {
+        liquidity_consumption: true,
+        queue_position: true,
+        ..config
+    };
     let engine_config = config.to_matching_engine_config();
 
     assert!(!engine_config.bar_execution);
     assert!(!engine_config.trade_execution);
+    assert!(engine_config.liquidity_consumption);
+    assert!(engine_config.queue_position);
     assert!(engine_config.reject_stop_orders);
     assert!(engine_config.support_gtd_orders);
     assert!(engine_config.support_contingent_orders);
@@ -1954,6 +1971,9 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             frozen_account: false,
             bar_execution: false,
             trade_execution: false,
+            book_execution: true,
+            liquidity_consumption: false,
+            queue_position: false,
             reject_stop_orders: true,
             support_gtd_orders: true,
             support_contingent_orders: true,
@@ -2526,6 +2546,164 @@ fn test_message_handler_drops_precision_mismatched_trade(
 }
 
 #[rstest]
+fn test_order_submission_does_not_replay_cached_trade(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let instrument_id = instrument.id();
+    let mut context =
+        create_test_context_with(trader_id, account_id, instrument_id.venue, |config| {
+            config.book_type = BookType::L2_MBP;
+            config.trade_execution = true;
+            config.liquidity_consumption = true;
+            config.queue_position = true;
+        });
+    context
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument)
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    context.client.start().unwrap();
+
+    let book = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("1000.00"),
+                    Quantity::from("1.000"),
+                    1,
+                ),
+                0,
+                1,
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("1010.00"),
+                    Quantity::from("1.000"),
+                    2,
+                ),
+                0,
+                2,
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ),
+        ],
+    );
+    context.client.process_order_book_deltas(&book).unwrap();
+
+    // This trade occurs before either order exists. It remains the latest trade in the shared
+    // cache, but it must be consumed by the matching engine exactly once.
+    let trade = TradeTick::new(
+        instrument_id,
+        Price::from("1000.00"),
+        Quantity::from("10.000"),
+        AggressorSide::Seller,
+        TradeId::new("PRE-ORDER-TRADE"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    context.cache.borrow_mut().add_trade(trade).unwrap();
+    context.client.process_trade_tick(&trade).unwrap();
+
+    let resting_buy = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1000.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("RESTING-BUY"))
+        .submit(true)
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(
+            resting_buy.clone(),
+            None,
+            Some(context.client.client_id()),
+            false,
+        )
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &resting_buy,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(2),
+        ))
+        .unwrap();
+    let first_events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        OrderEventAny::Accepted(accepted)
+            if accepted.client_order_id == resting_buy.client_order_id()
+    )));
+    assert!(
+        !first_events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Filled(fill) if fill.client_order_id == resting_buy.client_order_id()
+        )),
+        "unexpected first-submission fill events: {first_events:?}"
+    );
+
+    // A later submission for the same instrument used to replay PRE-ORDER-TRADE and fill the
+    // resting buy even though no new market-data event had occurred.
+    let probe_sell = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .price(Price::from("1010.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("PROBE-SELL"))
+        .submit(true)
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(
+            probe_sell.clone(),
+            None,
+            Some(context.client.client_id()),
+            false,
+        )
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &probe_sell,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::from(3),
+        ))
+        .unwrap();
+    let second_events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert!(!second_events.iter().any(|event| matches!(
+        event,
+        OrderEventAny::Filled(fill) if fill.client_order_id == resting_buy.client_order_id()
+    )));
+
+    context.client.stop().unwrap();
+}
+
+#[rstest]
 fn test_process_bar_disabled(test_context: TestContext, instrument: InstrumentAny) {
     use nautilus_model::data::{Bar, BarType};
 
@@ -2869,6 +3047,9 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,
+        book_execution: true,
+        liquidity_consumption: false,
+        queue_position: false,
         reject_stop_orders: true,
         support_gtd_orders: true,
         support_contingent_orders: true,

@@ -38,7 +38,11 @@ use crate::common::{
     urls::{clob_ws_market_url, clob_ws_user_url},
 };
 
-const POLYMARKET_HEARTBEAT_SECS: u64 = 30;
+// The CLOB market and user channels require the application text message
+// `PING` every ten seconds. An RFC WebSocket ping control frame does not
+// satisfy this protocol-level heartbeat.
+const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+const POLYMARKET_HEARTBEAT_MESSAGE: &str = "PING";
 
 /// Polymarket WebSocket channel: market data or authenticated user data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +344,7 @@ impl PolymarketWebSocketClient {
             url: self.url.clone(),
             headers: vec![],
             heartbeat: Some(POLYMARKET_HEARTBEAT_SECS),
-            heartbeat_msg: None,
+            heartbeat_msg: Some(POLYMARKET_HEARTBEAT_MESSAGE.to_string()),
             reconnect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
@@ -531,17 +535,20 @@ impl PolymarketWebSocketClient {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, sync::Arc};
 
     use axum::{
         Router,
-        extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        extract::{
+            State,
+            ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        },
         response::Response,
         routing::get,
     };
     use nautilus_network::{
         RECONNECTED,
-        websocket::{TransportBackend, WebSocketConfig, proxy::ProxyUrl},
+        websocket::{TransportBackend, WebSocketClient, WebSocketConfig, proxy::ProxyUrl},
     };
     use rstest::rstest;
 
@@ -572,6 +579,50 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         addr
+    }
+
+    type HeartbeatSender = Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>;
+
+    async fn handle_heartbeat_upgrade(
+        ws: WebSocketUpgrade,
+        State(sender): State<HeartbeatSender>,
+    ) -> Response {
+        ws.on_upgrade(move |socket| handle_heartbeat_socket(socket, sender))
+    }
+
+    async fn handle_heartbeat_socket(mut socket: WebSocket, sender: HeartbeatSender) {
+        while let Some(Ok(message)) = socket.recv().await {
+            if let AxumWsMessage::Text(text) = message {
+                if let Some(sender) = sender.lock().await.take() {
+                    let _ = sender.send(text.to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    async fn start_heartbeat_test_server() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat websocket server");
+        let addr = listener.local_addr().expect("heartbeat websocket address");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let state = Arc::new(tokio::sync::Mutex::new(Some(sender)));
+        let router = Router::new()
+            .route("/ws", get(handle_heartbeat_upgrade))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("heartbeat websocket server failed");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        (addr, receiver)
     }
 
     #[rstest]
@@ -610,6 +661,38 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test]
+    async fn configured_heartbeat_writes_application_ping_text() {
+        let (addr, heartbeat) = start_heartbeat_test_server().await;
+        let adapter = PolymarketWebSocketClient::new_market(
+            Some(format!("ws://{addr}/ws")),
+            false,
+            TransportBackend::Tungstenite,
+        );
+        let mut config = adapter.websocket_config();
+        // Preserve the production payload while shortening only the fixture cadence.
+        config.heartbeat = Some(1);
+        let client = WebSocketClient::connect(
+            config,
+            Some(Arc::new(|_| {})),
+            None,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("connect heartbeat websocket client");
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(2), heartbeat)
+            .await
+            .expect("wait for application heartbeat")
+            .expect("heartbeat server sender dropped");
+
+        assert_eq!(message, super::POLYMARKET_HEARTBEAT_MESSAGE);
+        client.disconnect().await;
+    }
+
+    #[rstest]
     fn proxy_url_is_retained_for_market_and_user_clients() {
         const MARKET_PROXY: &str = "http://market-user:market-proxy-secret@127.0.0.1:18086";
         const USER_PROXY: &str = "https://user-user:user-proxy-secret@127.0.0.1:18087";
@@ -638,7 +721,10 @@ mod tests {
         let assert_common = |config: &WebSocketConfig| {
             assert_eq!(config.headers, Vec::<(String, String)>::new());
             assert_eq!(config.heartbeat, Some(super::POLYMARKET_HEARTBEAT_SECS));
-            assert_eq!(config.heartbeat_msg, None);
+            assert_eq!(
+                config.heartbeat_msg.as_deref(),
+                Some(super::POLYMARKET_HEARTBEAT_MESSAGE)
+            );
             assert_eq!(config.reconnect_timeout_ms, Some(15_000));
             assert_eq!(config.reconnect_delay_initial_ms, Some(250));
             assert_eq!(config.reconnect_delay_max_ms, Some(5_000));
